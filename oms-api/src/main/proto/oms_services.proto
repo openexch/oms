@@ -1,0 +1,118 @@
+syntax = "proto3";
+package com.openexchange.oms.grpc;
+option java_package = "com.openexchange.oms.grpc";
+option java_multiple_files = true;
+
+service OrderService {
+    rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+    rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+    rpc GetOrder(GetOrderRequest) returns (OrderResponse);
+    rpc StreamOrders(StreamRequest) returns (stream OrderUpdate);
+    rpc StreamExecutions(StreamRequest) returns (stream ExecutionReport);
+}
+
+service AccountService {
+    rpc GetBalances(GetBalancesRequest) returns (BalancesResponse);
+    rpc StreamBalances(StreamRequest) returns (stream BalanceUpdate);
+}
+
+message CreateOrderRequest {
+    int64 user_id = 1;
+    int32 market_id = 2;
+    string side = 3;
+    string order_type = 4;
+    string time_in_force = 5;
+    double price = 6;
+    double quantity = 7;
+    double stop_price = 8;
+    double trailing_delta = 9;
+    double display_quantity = 10;
+    int64 expires_at_ms = 11;
+    string client_order_id = 12;
+}
+
+message CreateOrderResponse {
+    bool accepted = 1;
+    int64 oms_order_id = 2;
+    string status = 3;
+    string reject_reason = 4;
+}
+
+message CancelOrderRequest {
+    int64 oms_order_id = 1;
+}
+
+message CancelOrderResponse {
+    bool accepted = 1;
+    int64 oms_order_id = 2;
+    string message = 3;
+}
+
+message GetOrderRequest {
+    int64 oms_order_id = 1;
+}
+
+message OrderResponse {
+    int64 oms_order_id = 1;
+    int64 cluster_order_id = 2;
+    string client_order_id = 3;
+    int64 user_id = 4;
+    int32 market_id = 5;
+    string side = 6;
+    string order_type = 7;
+    string time_in_force = 8;
+    double price = 9;
+    double quantity = 10;
+    double filled_qty = 11;
+    double remaining_qty = 12;
+    double stop_price = 13;
+    string status = 14;
+    string reject_reason = 15;
+    int64 created_at_ms = 16;
+    int64 updated_at_ms = 17;
+}
+
+message StreamRequest {
+    int64 user_id = 1;
+}
+
+message OrderUpdate {
+    string event_type = 1;
+    OrderResponse order = 2;
+}
+
+message ExecutionReport {
+    int64 trade_id = 1;
+    int64 oms_order_id = 2;
+    int64 cluster_order_id = 3;
+    int64 user_id = 4;
+    int32 market_id = 5;
+    string side = 6;
+    double price = 7;
+    double quantity = 8;
+    bool is_maker = 9;
+    int64 executed_at_ms = 10;
+}
+
+message GetBalancesRequest {
+    int64 user_id = 1;
+}
+
+message BalancesResponse {
+    int64 user_id = 1;
+    repeated AssetBalance assets = 2;
+}
+
+message AssetBalance {
+    string asset = 1;
+    int32 asset_id = 2;
+    double available = 3;
+    double locked = 4;
+    double total = 5;
+}
+
+message BalanceUpdate {
+    string event_type = 1;
+    int64 user_id = 2;
+    repeated AssetBalance assets = 3;
+}
