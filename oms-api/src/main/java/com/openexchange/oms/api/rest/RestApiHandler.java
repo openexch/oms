@@ -47,6 +47,12 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         String uri = request.uri();
         HttpMethod method = request.method();
 
+        // CORS preflight
+        if (method == HttpMethod.OPTIONS) {
+            sendCorsPreflightResponse(ctx);
+            return;
+        }
+
         try {
             if (uri.equals("/api/v1/health") && method == HttpMethod.GET) {
                 handleHealth(ctx);
@@ -280,7 +286,22 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status, content);
         response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json");
         response.headers().set(HttpHeaderNames.CONTENT_LENGTH, bytes.length);
+        addCorsHeaders(response);
         ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+    }
+
+    private void sendCorsPreflightResponse(ChannelHandlerContext ctx) {
+        FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.NO_CONTENT);
+        addCorsHeaders(response);
+        response.headers().set(HttpHeaderNames.CONTENT_LENGTH, 0);
+        ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+    }
+
+    private static void addCorsHeaders(FullHttpResponse response) {
+        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, DELETE, OPTIONS");
+        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type");
+        response.headers().set("Access-Control-Allow-Private-Network", "true");
     }
 
     private static String escapeJson(String s) {
