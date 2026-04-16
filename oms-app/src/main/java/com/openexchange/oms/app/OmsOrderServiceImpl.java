@@ -14,6 +14,7 @@ import com.openexchange.oms.ledger.LedgerEntry;
 import com.openexchange.oms.ledger.LedgerService;
 import com.openexchange.oms.risk.RiskEngine;
 import com.openexchange.oms.risk.RiskResult;
+import org.checkerframework.checker.nullness.qual.NonNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,11 +36,16 @@ public class OmsOrderServiceImpl implements OrderService {
     private final BalanceStore balanceStore;
     private final OmsEgressAdapter egressAdapter;
     private final SnowflakeIdGenerator idGenerator;
+    private final OmsMarketDataProvider marketDataProvider;
+
+    // Slippage multiplier for market buy hold estimation (5% above best ask)
+    private static final double MARKET_BUY_SLIPPAGE = 1.05;
 
     public OmsOrderServiceImpl(OmsCoreEngine coreEngine, RiskEngine riskEngine,
                                 LedgerService ledgerService, ClusterClient clusterClient,
                                 BalanceStore balanceStore, OmsEgressAdapter egressAdapter,
-                                SnowflakeIdGenerator idGenerator) {
+                                SnowflakeIdGenerator idGenerator,
+                                OmsMarketDataProvider marketDataProvider) {
         this.coreEngine = coreEngine;
         this.riskEngine = riskEngine;
         this.ledgerService = ledgerService;
@@ -47,6 +53,7 @@ public class OmsOrderServiceImpl implements OrderService {
         this.balanceStore = balanceStore;
         this.egressAdapter = egressAdapter;
         this.idGenerator = idGenerator;
+        this.marketDataProvider = marketDataProvider;
     }
 
     @Override
@@ -122,15 +129,20 @@ public class OmsOrderServiceImpl implements OrderService {
                 return CreateOrderResponse.accepted(order.getOmsOrderId(), order.getStatus().name());
             }
 
-            // 7. Build and submit to cluster
-            com.match.infrastructure.generated.OrderType sbeOrderType = mapOrderType(orderType);
-            com.match.infrastructure.generated.OrderSide sbeOrderSide = mapOrderSide(side);
-            long totalPrice = FixedPoint.multiply(order.getPrice(), order.getQuantity());
+            // 6b. For market buy orders, estimate price from best ask for hold calculation
+            if (orderType == OmsOrderType.MARKET && side == OrderSide.BUY) {
+                long bestAsk = marketDataProvider.getBestAsk(order.getMarketId());
+                if (bestAsk <= 0) {
+                    lcm.onHoldFailed(order.getOmsOrderId(), "No liquidity (no best ask)");
+                    return CreateOrderResponse.rejected("No liquidity available for market buy");
+                }
+                // Use best ask with slippage buffer as the estimated price for holding
+                long estimatedPrice = (long) (bestAsk * MARKET_BUY_SLIPPAGE);
+                order.setPrice(estimatedPrice);
+            }
 
-            OrderSubmission submission = OrderSubmission.createOrder(
-                    order.getUserId(), order.getMarketId(),
-                    order.getPrice(), order.getQuantity(), totalPrice,
-                    sbeOrderType, sbeOrderSide, order.getOmsOrderId());
+            // 7. Build and submit to cluster
+            OrderSubmission submission = getOrderSubmission(orderType, side, order);
 
             boolean enqueued = clusterClient.submitOrder(submission);
             if (!enqueued) {
@@ -148,6 +160,17 @@ public class OmsOrderServiceImpl implements OrderService {
         } catch (IllegalArgumentException e) {
             return CreateOrderResponse.rejected(e.getMessage());
         }
+    }
+
+    private static @NonNull OrderSubmission getOrderSubmission(OmsOrderType orderType, OrderSide side, OmsOrder order) {
+        com.match.infrastructure.generated.OrderType sbeOrderType = mapOrderType(orderType);
+        com.match.infrastructure.generated.OrderSide sbeOrderSide = mapOrderSide(side);
+        long totalPrice = FixedPoint.multiply(order.getPrice(), order.getQuantity());
+
+        return OrderSubmission.createOrder(
+                order.getUserId(), order.getMarketId(),
+                order.getPrice(), order.getQuantity(), totalPrice,
+                sbeOrderType, sbeOrderSide, order.getOmsOrderId());
     }
 
     @Override
@@ -172,6 +195,13 @@ public class OmsOrderServiceImpl implements OrderService {
             OrderSubmission cancelSubmission = OrderSubmission.cancelOrder(
                     order.getUserId(), order.getClusterOrderId(), order.getMarketId());
             clusterClient.submitOrder(cancelSubmission);
+        } else if (order.getStatus() == OmsOrderStatus.PENDING_NEW
+                || order.getStatus() == OmsOrderStatus.NEW
+                || order.getStatus() == OmsOrderStatus.PARTIALLY_FILLED) {
+            // clusterOrderId not yet received from egress — order is in-flight
+            log.warn("Cancel requested but clusterOrderId not yet assigned for omsOrderId={}, status={}",
+                    omsOrderId, order.getStatus());
+            return CancelOrderResponse.rejected("Order is in-flight, please retry shortly");
         }
 
         return CancelOrderResponse.accepted(omsOrderId);

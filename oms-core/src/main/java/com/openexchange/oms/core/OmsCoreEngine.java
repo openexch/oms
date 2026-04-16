@@ -2,13 +2,14 @@ package com.openexchange.oms.core;
 
 import com.openexchange.oms.common.domain.*;
 import com.openexchange.oms.common.enums.*;
+import java.util.ArrayList;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Central coordination engine — the "brain" of the OMS.
  * Runs on the OMS Core Thread (single-writer principle).
- *
+ * <p>
  * Consumes Disruptor events from the Aeron polling thread and orchestrates:
  * - Order lifecycle transitions
  * - Synthetic order trigger evaluation
@@ -153,8 +154,30 @@ public class OmsCoreEngine {
      * Checks all active GTD orders for expiry.
      */
     public void checkGtdExpiry(long nowMs) {
-        // Note: In a real implementation, we'd maintain a priority queue sorted by expiresAtMs
-        // For now, the timer thread calls this and we delegate to lifecycle manager
+        // Collect expired GTD orders (cannot modify map during iteration)
+        ArrayList<Long> expiredIds = new ArrayList<>();
+        lifecycleManager.forEachActiveOrder(order -> {
+            if (order.getTimeInForce() == TimeInForce.GTD
+                    && order.getExpiresAtMs() > 0
+                    && nowMs >= order.getExpiresAtMs()) {
+                expiredIds.add(order.getOmsOrderId());
+            }
+        });
+
+        for (long omsOrderId : expiredIds) {
+            OmsOrder order = lifecycleManager.onExpired(omsOrderId);
+            if (order != null) {
+                // Cancel the order on the cluster if it was submitted
+                if (order.getClusterOrderId() != 0 && clusterSubmitHandler != null) {
+                    clusterSubmitHandler.submitCancel(order.getClusterOrderId(),
+                            order.getUserId(), order.getMarketId());
+                }
+                if (persistenceHandler != null) {
+                    persistenceHandler.persistOrderUpdate(order);
+                }
+                log.info("GTD order expired: omsOrderId={}", omsOrderId);
+            }
+        }
     }
 
     // ==================== Helpers ====================

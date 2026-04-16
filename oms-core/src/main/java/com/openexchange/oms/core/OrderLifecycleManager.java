@@ -9,7 +9,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Manages the lifecycle of all OMS orders.
  * Single-writer: only the OMS Core Thread mutates order state.
- *
+ * <p>
  * State machine transitions:
  *   PENDING_RISK → PENDING_HOLD → PENDING_NEW → NEW → PARTIALLY_FILLED → FILLED
  *   Any active state → CANCELLED / REJECTED / EXPIRED
@@ -119,6 +119,12 @@ public class OrderLifecycleManager {
             return null;
         }
 
+        // Store clusterOrderId on first status update from cluster
+        if (clusterOrderId != 0 && order.getClusterOrderId() == 0) {
+            order.setClusterOrderId(clusterOrderId);
+            byClusterOrderId.put(clusterOrderId, order);
+        }
+
         order.setRemainingQty(remainingQty);
         order.setFilledQty(filledQty);
 
@@ -183,9 +189,8 @@ public class OrderLifecycleManager {
      * Iterate over all active orders. Used for queries.
      */
     public void forEachActiveOrder(java.util.function.Consumer<OmsOrder> consumer) {
-        Long2ObjectHashMap<OmsOrder>.ValueIterator iter = activeOrders.values().iterator();
-        while (iter.hasNext()) {
-            consumer.accept(iter.next());
+        for (OmsOrder omsOrder : activeOrders.values()) {
+            consumer.accept(omsOrder);
         }
     }
 

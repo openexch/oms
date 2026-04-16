@@ -52,6 +52,9 @@ public class OmsEgressAdapter implements EgressListener {
         long bestAsk = 0;
 
         for (BookDeltaDecoder.ChangesDecoder change : decoder.changes()) {
+            // Skip removed levels (quantity=0) — they are not valid best prices
+            if (change.quantity() == 0) continue;
+
             if (change.side() == OrderSide.BID) {
                 if (change.price() > bestBid) {
                     bestBid = change.price();

@@ -128,9 +128,9 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private void handleQueryOrders(ChannelHandlerContext ctx, FullHttpRequest request) throws Exception {
         QueryStringDecoder decoder = new QueryStringDecoder(request.uri());
         String userIdStr = decoder.parameters().containsKey("userId")
-            ? decoder.parameters().get("userId").get(0) : null;
+            ? decoder.parameters().get("userId").getFirst() : null;
         String statusStr = decoder.parameters().containsKey("status")
-            ? decoder.parameters().get("status").get(0) : null;
+            ? decoder.parameters().get("status").getFirst() : null;
 
         if (userIdStr == null) {
             sendResponse(ctx, HttpResponseStatus.BAD_REQUEST, "{\"error\":\"userId required\"}");
@@ -299,7 +299,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
 
     private static void addCorsHeaders(FullHttpResponse response) {
         response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_ORIGIN, "*");
-        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, DELETE, OPTIONS");
+        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, PUT, DELETE, OPTIONS");
         response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type");
         response.headers().set("Access-Control-Allow-Private-Network", "true");
     }

@@ -13,12 +13,17 @@ import com.openexchange.oms.common.domain.Market;
 import com.openexchange.oms.common.domain.OmsOrder;
 import com.openexchange.oms.common.domain.SnowflakeIdGenerator;
 import com.openexchange.oms.common.enums.OrderSide;
+import com.openexchange.oms.common.enums.OmsOrderStatus;
 import com.openexchange.oms.core.OmsCoreEngine;
 import com.openexchange.oms.core.OrderLifecycleManager;
 import com.openexchange.oms.core.SyntheticOrderEngine;
 import com.openexchange.oms.ledger.BalanceStore;
 import com.openexchange.oms.ledger.InMemoryBalanceStore;
 import com.openexchange.oms.ledger.LedgerService;
+import com.openexchange.oms.persistence.PostgresOrderRepository;
+import com.openexchange.oms.persistence.PostgresExecutionRepository;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import com.openexchange.oms.risk.RiskConfig;
 import com.openexchange.oms.risk.RiskConfigManager;
 import com.openexchange.oms.risk.RiskEngine;
@@ -36,7 +41,6 @@ public class OmsApplication {
     private HttpServer httpServer;
     private GrpcServer grpcServer;
     private ClusterClient clusterClient;
-    private Thread pollingThread;
 
     public static void main(String[] args) {
         OmsApplication app = new OmsApplication();
@@ -61,6 +65,26 @@ public class OmsApplication {
         OmsConfig config = OmsConfig.loadDefaults();
         log.info("Configuration loaded: httpPort={}, grpcPort={}, nodeId={}",
                 config.httpPort(), config.grpcPort(), config.nodeId());
+
+        // 1b. Initialize PostgreSQL connection pool (optional — degrades gracefully)
+        HikariDataSource dataSource = null;
+        PostgresOrderRepository orderRepo = null;
+        PostgresExecutionRepository executionRepo = null;
+        try {
+            HikariConfig hikariConfig = new HikariConfig();
+            hikariConfig.setJdbcUrl(config.postgresUrl());
+            hikariConfig.setUsername(config.postgresUser());
+            hikariConfig.setPassword(config.postgresPassword());
+            hikariConfig.setMaximumPoolSize(5);
+            hikariConfig.setMinimumIdle(1);
+            hikariConfig.setConnectionTimeout(5000);
+            dataSource = new HikariDataSource(hikariConfig);
+            orderRepo = new PostgresOrderRepository(dataSource);
+            executionRepo = new PostgresExecutionRepository(dataSource);
+            log.info("PostgreSQL persistence initialized: {}", config.postgresUrl());
+        } catch (Exception e) {
+            log.warn("PostgreSQL not available — running without persistence: {}", e.getMessage());
+        }
 
         // 2. Create balance store (in-memory for phase 4)
         BalanceStore balanceStore = new InMemoryBalanceStore();
@@ -132,18 +156,30 @@ public class OmsApplication {
             }
         });
 
-        // 9. Wire persistence handler (log-only for phase 4)
+        // 9. Wire persistence handler
+        final PostgresOrderRepository finalOrderRepo = orderRepo;
+        final PostgresExecutionRepository finalExecutionRepo = executionRepo;
         coreEngine.setPersistenceHandler(new OmsCoreEngine.PersistenceHandler() {
             @Override
             public void persistOrderUpdate(OmsOrder order) {
-                log.debug("Persist order update: omsOrderId={}, status={}",
-                        order.getOmsOrderId(), order.getStatus());
+                if (finalOrderRepo != null) {
+                    try {
+                        finalOrderRepo.saveOrder(order);
+                    } catch (Exception e) {
+                        log.error("Failed to persist order update: omsOrderId={}", order.getOmsOrderId(), e);
+                    }
+                }
             }
 
             @Override
             public void persistExecution(com.openexchange.oms.common.domain.ExecutionReport report) {
-                log.debug("Persist execution: tradeId={}, omsOrderId={}, qty={}",
-                        report.getTradeId(), report.getOmsOrderId(), report.getQuantity());
+                if (finalExecutionRepo != null) {
+                    try {
+                        finalExecutionRepo.saveExecution(report);
+                    } catch (Exception e) {
+                        log.error("Failed to persist execution: tradeId={}", report.getTradeId(), e);
+                    }
+                }
             }
         });
 
@@ -203,7 +239,7 @@ public class OmsApplication {
         });
 
         // Start polling thread (daemon)
-        pollingThread = new Thread(clusterClient::startPolling, "oms-cluster-poll");
+        Thread pollingThread = new Thread(clusterClient::startPolling, "oms-cluster-poll");
         pollingThread.setDaemon(true);
         pollingThread.start();
 
@@ -220,12 +256,26 @@ public class OmsApplication {
         lifecycleManager.setStateListener((order, oldStatus, newStatus) -> {
             wsHandler.pushToUser(order.getUserId(), "orders",
                     com.openexchange.oms.api.dto.OrderResponse.fromOrder(order));
+
+            // Release balance hold on cluster-confirmed cancellation or expiry
+            if ((newStatus == OmsOrderStatus.CANCELLED || newStatus == OmsOrderStatus.EXPIRED)
+                    && (oldStatus == OmsOrderStatus.NEW || oldStatus == OmsOrderStatus.PARTIALLY_FILLED)) {
+                ledgerService.releaseForCancel(order);
+                riskEngine.onOrderClosed(order.getUserId());
+            }
+            // Release balance hold on cluster rejection (order had a hold placed)
+            if (newStatus == OmsOrderStatus.REJECTED
+                    && (oldStatus == OmsOrderStatus.NEW || oldStatus == OmsOrderStatus.PARTIALLY_FILLED
+                        || oldStatus == OmsOrderStatus.PENDING_NEW)) {
+                ledgerService.releaseForCancel(order);
+                riskEngine.onOrderClosed(order.getUserId());
+            }
         });
 
         // 12. Order service
         OrderService orderService = new OmsOrderServiceImpl(
                 coreEngine, riskEngine, ledgerService, clusterClient,
-                balanceStore, egressAdapter, idGenerator);
+                balanceStore, egressAdapter, idGenerator, marketDataProvider);
 
         // 13. Admin service
         AdminService adminService = new OmsAdminServiceImpl(configManager, riskEngine);
@@ -240,6 +290,24 @@ public class OmsApplication {
         grpcServer = new GrpcServer(config.grpcPort(), grpcOrderSvc, grpcAccountSvc);
         grpcServer.start();
         log.info("gRPC server started on port {}", config.grpcPort());
+
+        // 16. GTD expiry timer (checks every second)
+        java.util.concurrent.ScheduledExecutorService gtdScheduler =
+                java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "oms-gtd-expiry");
+                    t.setDaemon(true);
+                    return t;
+                });
+        gtdScheduler.scheduleAtFixedRate(
+                () -> {
+                    try {
+                        coreEngine.checkGtdExpiry(System.currentTimeMillis());
+                    } catch (Exception e) {
+                        log.error("GTD expiry check failed", e);
+                    }
+                },
+                1, 1, java.util.concurrent.TimeUnit.SECONDS);
+        log.info("GTD expiry checker started (1s interval)");
 
         log.info("OMS Application started successfully");
     }
