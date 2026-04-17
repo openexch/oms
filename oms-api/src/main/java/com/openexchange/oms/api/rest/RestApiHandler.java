@@ -60,6 +60,8 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
                 handleCreateOrder(ctx, request);
             } else if (uri.startsWith("/api/v1/orders/") && method == HttpMethod.DELETE) {
                 handleCancelOrder(ctx, uri);
+            } else if (uri.startsWith("/api/v1/orders/") && method == HttpMethod.PUT) {
+                handleUpdateOrder(ctx, request, uri);
             } else if (uri.startsWith("/api/v1/orders/") && method == HttpMethod.GET) {
                 handleGetOrder(ctx, uri);
             } else if (uri.startsWith("/api/v1/orders") && method == HttpMethod.GET) {
@@ -90,7 +92,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
 
     private void handleHealth(ChannelHandlerContext ctx) throws Exception {
         ObjectNode health = MAPPER.createObjectNode();
-        health.put("status", "UP");
+        health.put("status", "ok");
         health.put("clusterConnected", orderService.isClusterConnected());
         health.put("activeOrders", orderService.getActiveOrderCount());
         sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(health));
@@ -112,6 +114,27 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         long omsOrderId = Long.parseLong(idStr);
         CancelOrderResponse resp = orderService.cancelOrder(omsOrderId);
         sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
+    }
+
+    private void handleUpdateOrder(ChannelHandlerContext ctx, FullHttpRequest request, String uri) throws Exception {
+        String idStr = uri.substring("/api/v1/orders/".length());
+        long omsOrderId = Long.parseLong(idStr);
+        String body = request.content().toString(StandardCharsets.UTF_8);
+        Map<String, Object> params = MAPPER.readValue(body, Map.class);
+
+        double newPrice = params.containsKey("price") ? ((Number) params.get("price")).doubleValue() : 0;
+        double newQuantity = params.containsKey("quantity") ? ((Number) params.get("quantity")).doubleValue() : 0;
+
+        if (newPrice <= 0 && newQuantity <= 0) {
+            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
+                    "{\"error\":\"At least one of price or quantity must be provided\"}");
+            return;
+        }
+
+        Map<String, Object> result = orderService.updateOrder(omsOrderId, newPrice, newQuantity);
+        HttpResponseStatus status = Boolean.TRUE.equals(result.get("accepted"))
+                ? HttpResponseStatus.OK : HttpResponseStatus.BAD_REQUEST;
+        sendResponse(ctx, status, MAPPER.writeValueAsString(result));
     }
 
     private void handleGetOrder(ChannelHandlerContext ctx, String uri) throws Exception {

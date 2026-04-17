@@ -11,7 +11,8 @@ public final class OrderSubmission {
 
     public enum Type {
         CREATE,
-        CANCEL
+        CANCEL,
+        UPDATE
     }
 
     private final Type type;
@@ -76,6 +77,17 @@ public final class OrderSubmission {
         return new OrderSubmission(
                 Type.CANCEL, userId, marketId, 0L, 0L, 0L,
                 null, null, 0L, orderId);
+    }
+
+    /**
+     * Create an update (cancel-and-replace) order submission.
+     */
+    public static OrderSubmission updateOrder(long userId, long orderId, int marketId,
+                                               long newPrice, long newQuantity,
+                                               OrderType orderType, OrderSide orderSide) {
+        return new OrderSubmission(
+                Type.UPDATE, userId, marketId, newPrice, newQuantity, 0L,
+                orderType, orderSide, 0L, orderId);
     }
 
     public Type getType() {

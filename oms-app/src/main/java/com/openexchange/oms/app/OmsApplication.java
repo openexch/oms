@@ -20,6 +20,8 @@ import com.openexchange.oms.core.SyntheticOrderEngine;
 import com.openexchange.oms.ledger.BalanceStore;
 import com.openexchange.oms.ledger.InMemoryBalanceStore;
 import com.openexchange.oms.ledger.LedgerService;
+import com.openexchange.oms.ledger.RedisBalanceStore;
+import io.lettuce.core.RedisClient;
 import com.openexchange.oms.persistence.PostgresOrderRepository;
 import com.openexchange.oms.persistence.PostgresExecutionRepository;
 import com.zaxxer.hikari.HikariConfig;
@@ -86,9 +88,18 @@ public class OmsApplication {
             log.warn("PostgreSQL not available — running without persistence: {}", e.getMessage());
         }
 
-        // 2. Create balance store (in-memory for phase 4)
-        BalanceStore balanceStore = new InMemoryBalanceStore();
-        log.info("Balance store initialized (in-memory mode)");
+        // 2. Create balance store (Redis if available, otherwise in-memory)
+        BalanceStore balanceStore;
+        try {
+            String redisUri = "redis://" + config.redisHost() + ":" + config.redisPort();
+            RedisClient redisClient = RedisClient.create(redisUri);
+            redisClient.connect().close(); // test connectivity
+            balanceStore = new RedisBalanceStore(redisClient);
+            log.info("Balance store initialized (Redis: {})", redisUri);
+        } catch (Exception e) {
+            log.warn("Redis not available — using in-memory balance store: {}", e.getMessage());
+            balanceStore = new InMemoryBalanceStore();
+        }
 
         // 3. ID generator
         SnowflakeIdGenerator idGenerator = new SnowflakeIdGenerator(config.nodeId());
@@ -251,11 +262,24 @@ public class OmsApplication {
             log.warn("Cluster connection failed at startup (will retry in background): {}", e.getMessage());
         }
 
-        // 11. WebSocket handler and order state listener
+        // 11. WebSocket handler
         WebSocketHandler wsHandler = new WebSocketHandler();
+
+        // 12. Order service
+        OrderService orderService = new OmsOrderServiceImpl(
+                coreEngine, riskEngine, ledgerService, clusterClient,
+                balanceStore, egressAdapter, idGenerator, marketDataProvider);
+
+        // 13. gRPC services (created before state listener so push methods can be called)
+        GrpcOrderService grpcOrderSvc = new GrpcOrderService(orderService);
+        GrpcAccountService grpcAccountSvc = new GrpcAccountService(orderService);
+
+        // 14. Order state listener — pushes to WebSocket + gRPC, handles balance release
         lifecycleManager.setStateListener((order, oldStatus, newStatus) -> {
-            wsHandler.pushToUser(order.getUserId(), "orders",
-                    com.openexchange.oms.api.dto.OrderResponse.fromOrder(order));
+            com.openexchange.oms.api.dto.OrderResponse resp =
+                    com.openexchange.oms.api.dto.OrderResponse.fromOrder(order);
+            wsHandler.pushToUser(order.getUserId(), "orders", resp);
+            grpcOrderSvc.pushOrderUpdate(order.getUserId(), resp);
 
             // Release balance hold on cluster-confirmed cancellation or expiry
             if ((newStatus == OmsOrderStatus.CANCELLED || newStatus == OmsOrderStatus.EXPIRED)
@@ -272,21 +296,14 @@ public class OmsApplication {
             }
         });
 
-        // 12. Order service
-        OrderService orderService = new OmsOrderServiceImpl(
-                coreEngine, riskEngine, ledgerService, clusterClient,
-                balanceStore, egressAdapter, idGenerator, marketDataProvider);
-
-        // 13. Admin service
+        // 15. Admin service
         AdminService adminService = new OmsAdminServiceImpl(configManager, riskEngine);
 
-        // 14. HTTP server
+        // 16. HTTP server
         httpServer = new HttpServer(config.httpPort(), orderService, wsHandler, adminService);
         httpServer.start();
 
-        // 15. gRPC server
-        GrpcOrderService grpcOrderSvc = new GrpcOrderService(orderService);
-        GrpcAccountService grpcAccountSvc = new GrpcAccountService(orderService);
+        // 17. gRPC server
         grpcServer = new GrpcServer(config.grpcPort(), grpcOrderSvc, grpcAccountSvc);
         grpcServer.start();
         log.info("gRPC server started on port {}", config.grpcPort());

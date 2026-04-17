@@ -12,10 +12,14 @@ Order management system that sits between trading clients and the [Match Engine]
 - **Double-entry ledger** — Atomic hold/release/settle with per-user locking and idempotent trade settlement
 - **Synthetic order types** — Stop-loss, stop-limit, trailing stop, and iceberg orders with real-time market data monitoring
 - **Order lifecycle state machine** — Full tracking from submission through risk, hold, cluster acknowledgment, fills, and terminal states
+- **Order modify (cancel-and-replace)** — PUT endpoint for atomic price/quantity updates on active orders
+- **GTD expiry** — Automatic cancellation of Good-Till-Date orders via scheduled timer (1s interval)
 - **Dual API** — REST (Netty HTTP) and gRPC with server-side streaming for orders, executions, and balances
 - **Hot-reloadable risk config** — Update risk parameters per market at runtime via admin API
+- **PostgreSQL persistence** — Orders and executions persisted via HikariCP connection pool (graceful degradation if DB unavailable)
+- **Redis balance store** — Optional Redis-backed balance store via Lettuce with Lua-scripted atomic operations (falls back to in-memory)
 - **Fixed-point arithmetic** — 8-decimal precision (10^8 scaling) throughout, consistent with the match engine
-- **5 market pairs** — BTC, ETH, SOL, XRP, DOGE against USD
+- **5 market pairs** — BTC, ETH, SOL, XRP, DOGE against USD (shared via `MarketInfo` from match-common)
 
 ## Architecture
 
@@ -180,6 +184,7 @@ stub.streamOrders(req, new StreamObserver<OrderUpdate>() {
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/api/v1/orders` | Create order |
+| `PUT` | `/api/v1/orders/{id}` | Update order (cancel-and-replace with new price/quantity) |
 | `DELETE` | `/api/v1/orders/{id}` | Cancel order |
 | `GET` | `/api/v1/orders/{id}` | Get order |
 | `GET` | `/api/v1/orders?userId=X` | Query orders |

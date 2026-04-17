@@ -15,6 +15,8 @@ public interface OrderService {
 
     CancelOrderResponse cancelOrder(long omsOrderId);
 
+    Map<String, Object> updateOrder(long omsOrderId, double newPrice, double newQuantity);
+
     OrderResponse getOrder(long omsOrderId);
 
     List<OrderResponse> queryOrders(long userId, String status);

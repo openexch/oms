@@ -208,6 +208,38 @@ public class OmsOrderServiceImpl implements OrderService {
     }
 
     @Override
+    public Map<String, Object> updateOrder(long omsOrderId, double newPrice, double newQuantity) {
+        OrderLifecycleManager lcm = coreEngine.getLifecycleManager();
+        OmsOrder order = lcm.getOrder(omsOrderId);
+        if (order == null) {
+            return Map.of("accepted", false, "message", "Order not found");
+        }
+        if (order.getStatus().isTerminal()) {
+            return Map.of("accepted", false, "message", "Order is already terminal");
+        }
+        if (order.getClusterOrderId() == 0) {
+            return Map.of("accepted", false, "message", "Order is in-flight, please retry shortly");
+        }
+
+        long price = newPrice > 0 ? FixedPoint.fromDouble(newPrice) : order.getPrice();
+        long quantity = newQuantity > 0 ? FixedPoint.fromDouble(newQuantity) : order.getQuantity();
+
+        com.match.infrastructure.generated.OrderSide sbeOrderSide = mapOrderSide(order.getSide());
+        com.match.infrastructure.generated.OrderType sbeOrderType = mapOrderType(order.getOrderType());
+
+        OrderSubmission submission = OrderSubmission.updateOrder(
+                order.getUserId(), order.getClusterOrderId(), order.getMarketId(),
+                price, quantity, sbeOrderType, sbeOrderSide);
+
+        boolean enqueued = clusterClient.submitOrder(submission);
+        if (!enqueued) {
+            return Map.of("accepted", false, "message", "Order queue full");
+        }
+
+        return Map.of("accepted", true, "omsOrderId", omsOrderId, "message", "Update submitted");
+    }
+
+    @Override
     public OrderResponse getOrder(long omsOrderId) {
         OmsOrder order = coreEngine.getLifecycleManager().getOrder(omsOrderId);
         if (order == null) return null;
