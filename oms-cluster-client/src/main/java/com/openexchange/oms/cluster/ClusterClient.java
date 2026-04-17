@@ -1,5 +1,6 @@
 package com.openexchange.oms.cluster;
 
+import com.match.infrastructure.InfrastructureConstants;
 import com.match.infrastructure.generated.*;
 
 import io.aeron.Publication;
@@ -47,15 +48,16 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
 
     private static final Logger log = LoggerFactory.getLogger(ClusterClient.class);
 
-    // Connection constants
-    private static final long HEARTBEAT_INTERVAL_MS = 100;
+    // Connection constants — heartbeat / reconnect cadence comes from InfrastructureConstants
+    // so the OMS, market gateway, and cluster all share one source of truth.
+    private static final long HEARTBEAT_INTERVAL_MS = InfrastructureConstants.HEARTBEAT_INTERVAL_MS;
     private static final long HEARTBEAT_INTERVAL_NS = TimeUnit.MILLISECONDS.toNanos(HEARTBEAT_INTERVAL_MS);
-    private static final long INITIAL_RECONNECT_BACKOFF_MS = 500;
+    private static final long INITIAL_RECONNECT_BACKOFF_MS = InfrastructureConstants.RECONNECT_COOLDOWN_MS;
     private static final long MAX_RECONNECT_BACKOFF_MS = 4000;
     private static final int MAX_FAILURES_BEFORE_DRIVER_RESET = 3;
     private static final int MAX_STARTUP_RETRIES = 30;
     private static final long STARTUP_RETRY_DELAY_MS = 2000;
-    private static final long STALE_EGRESS_TIMEOUT_MS = 30_000;
+    private static final long STALE_EGRESS_TIMEOUT_MS = InfrastructureConstants.GATEWAY_TIMEOUT_MS;
     private static final long STATS_LOG_INTERVAL_MS = 10_000;
 
     // MPSC queue constants
@@ -78,6 +80,7 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
     private final MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
     private final CreateOrderEncoder createOrderEncoder = new CreateOrderEncoder();
     private final CancelOrderEncoder cancelOrderEncoder = new CancelOrderEncoder();
+    private final UpdateOrderEncoder updateOrderEncoder = new UpdateOrderEncoder();
 
     // SBE heartbeat encoder
     private final UnsafeBuffer heartbeatBuffer = new UnsafeBuffer(
@@ -107,6 +110,37 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
     private volatile long egressMessageCount = 0;
     private volatile long ordersSent = 0;
     private volatile long lastStatsLogMs = 0;
+    /** Counter incremented every time the Aeron error handler fires. */
+    private final java.util.concurrent.atomic.AtomicLong aeronErrorCount = new java.util.concurrent.atomic.AtomicLong();
+
+    // Back-pressure retry tracking (polling-thread only).
+    /** Orders that needed at least one back-pressure retry before succeeding. */
+    private volatile long offerRetriedCount = 0;
+    /** Orders dropped because back-pressure retries were exhausted. */
+    private volatile long offerDroppedCount = 0;
+    /** Orders held over to the next polling iteration (NOT_CONNECTED / CLOSED on offer). */
+    private volatile long offerHeldCount = 0;
+
+    public long getAeronErrorCount() {
+        return aeronErrorCount.get();
+    }
+
+    public long getOfferRetriedCount() { return offerRetriedCount; }
+    public long getOfferDroppedCount() { return offerDroppedCount; }
+    public long getOfferHeldCount() { return offerHeldCount; }
+
+    /** Holds an order between polling iterations when the offer hits NOT_CONNECTED / CLOSED. */
+    private OrderSubmission pendingSubmission;
+    /** Encoded length of {@link #pendingSubmission}, valid only while {@code pendingSubmission != null}. */
+    private int pendingLength;
+
+    /** When > 0, we are inside a leader-transition window — observability only, the pending-submission slot handles in-flight orders. */
+    private volatile long leaderTransitionDeadlineMs = 0;
+    private static final long LEADER_TRANSITION_TIMEOUT_MS = 10_000;
+    /** Number of leader changes observed since startup. */
+    private volatile long leaderChangeCount = 0;
+    public boolean inLeaderTransition() { return System.currentTimeMillis() < leaderTransitionDeadlineMs; }
+    public long getLeaderChangeCount() { return leaderChangeCount; }
     private volatile long lastEgressMessageMs = System.currentTimeMillis();
 
     /**
@@ -126,9 +160,11 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
         final int egressPort = Integer.parseInt(
                 System.getenv().getOrDefault("EGRESS_PORT", "9093"));
 
+        final int portBase = Integer.parseInt(
+                System.getenv().getOrDefault("CLUSTER_PORT_BASE", "9000"));
         final List<String> hostnames = Arrays.asList(clusterAddresses.split(","));
         this.ingressEndpoints = ClusterConfig.ingressEndpoints(
-                hostnames, 9000, ClusterConfig.CLIENT_FACING_PORT_OFFSET);
+                hostnames, portBase, ClusterConfig.CLIENT_FACING_PORT_OFFSET);
         this.egressChannel = "aeron:udp?endpoint=" + egressHost + ":" + egressPort;
 
         log.info("ClusterClient configured: ingress={}, egress={}", ingressEndpoints, egressChannel);
@@ -204,7 +240,21 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                 .threadingMode(ThreadingMode.SHARED)
                 .aeronDirectoryName(dir)
                 .dirDeleteOnStart(true)
-                .dirDeleteOnShutdown(true));
+                .dirDeleteOnShutdown(true)
+                // Match the cluster's buffer sizing so the OMS isn't the throughput bottleneck
+                // during bursts. Values come from match-common InfrastructureConstants.
+                .socketSndbufLength(InfrastructureConstants.SOCKET_BUFFER_LENGTH)
+                .socketRcvbufLength(InfrastructureConstants.SOCKET_BUFFER_LENGTH)
+                .initialWindowLength(InfrastructureConstants.INITIAL_WINDOW_LENGTH)
+                .publicationTermBufferLength(InfrastructureConstants.TERM_BUFFER_LENGTH)
+                .ipcTermBufferLength(InfrastructureConstants.TERM_BUFFER_LENGTH)
+                // Pre-allocate term buffers to avoid page faults on first touch.
+                .termBufferSparseFile(false)
+                // Surface driver errors via SLF4J instead of swallowing them in the cnc file.
+                .errorHandler(t -> {
+                    aeronErrorCount.incrementAndGet();
+                    log.error("Aeron driver error #{}", aeronErrorCount.get(), t);
+                }));
 
         log.info("MediaDriver created: {}", mediaDriver.aeronDirectoryName());
     }
@@ -274,10 +324,16 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
         final AeronCluster.Context clusterCtx = new AeronCluster.Context()
                 .egressListener(this)
                 .egressChannel(egressChannel)
+                // mtu=8k requires loopback or jumbo-frame path (MTU >= 8192). Drop to 1408
+                // (Aeron default) before deploying cluster nodes off 127.0.0.1 without jumbo frames.
                 .ingressChannel("aeron:udp?term-length=16m|mtu=8k")
                 .aeronDirectoryName(mediaDriver.aeronDirectoryName())
                 .ingressEndpoints(ingressEndpoints)
-                .messageTimeoutNs(TimeUnit.SECONDS.toNanos(5));
+                .messageTimeoutNs(TimeUnit.SECONDS.toNanos(5))
+                .errorHandler(t -> {
+                    aeronErrorCount.incrementAndGet();
+                    log.error("AeronCluster error #{}", aeronErrorCount.get(), t);
+                });
 
         this.cluster = AeronCluster.connect(clusterCtx);
         log.info("AeronCluster connected: sessionId={}, leader={}, term={}",
@@ -413,7 +469,7 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                 }
 
                 // Drain order queue: encode and offer submissions from API threads
-                work += drainOrderQueue(currentCluster);
+                work += drainOrderQueue(currentCluster, idleStrategy);
 
                 // Periodic stats and stale egress detection
                 long nowMs = System.currentTimeMillis();
@@ -443,7 +499,10 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
 
     /**
      * Send an SBE-encoded GatewayHeartbeat to the cluster.
-     * This triggers the cluster service to flush queued market data.
+     * <p>This triggers the cluster service to flush queued market data; if too many heartbeats
+     * drop, the cluster declares the gateway dead and the user sees stale data. Bounded retry
+     * for transient back-pressure (~1 ms with the current idle strategy) keeps heartbeat loss
+     * negligible without spending much polling time.
      */
     private void sendHeartbeat(AeronCluster currentCluster) {
         heartbeatEncoder.wrapAndApplyHeader(heartbeatBuffer, 0, heartbeatHeaderEncoder);
@@ -453,34 +512,130 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
 
         int length = MessageHeaderEncoder.ENCODED_LENGTH + heartbeatEncoder.encodedLength();
         long result = currentCluster.offer(heartbeatBuffer, 0, length);
+        for (int attempt = 0; result < 0 && attempt < HEARTBEAT_RETRY_LIMIT; attempt++) {
+            if (result == Publication.NOT_CONNECTED || result == Publication.CLOSED
+                    || result == Publication.MAX_POSITION_EXCEEDED) {
+                break;
+            }
+            // Tiny park; this thread also drives order drain and pollEgress so don't burn budget.
+            java.util.concurrent.locks.LockSupport.parkNanos(10_000); // 10us
+            result = currentCluster.offer(heartbeatBuffer, 0, length);
+        }
         if (result < 0 && heartbeatCount % 100 == 0) {
             log.warn("Heartbeat offer failed: {}", offerResultName(result));
         }
     }
 
+    /** Bounded retry for transient back-pressure on heartbeats. ~10 attempts × 10us = 100us. */
+    private static final int HEARTBEAT_RETRY_LIMIT = 10;
+
     /**
      * Drain the MPSC order queue, encoding each submission and offering to the cluster.
      *
-     * @return the number of orders processed
+     * <p>Back-pressure handling — orders are silent value to the user (HTTP 200 was already
+     * returned by the time we get here), so dropping is not acceptable. Behaviour:
+     * <ul>
+     *   <li>Transient back-pressure ({@code BACK_PRESSURED} / {@code ADMIN_ACTION}) — retry up
+     *       to {@link #OFFER_RETRY_LIMIT} iterations using the polling idle strategy
+     *       (~10 ms total with the current backoff). Most back-pressure clears in microseconds.</li>
+     *   <li>{@code NOT_CONNECTED} / {@code CLOSED} — hold the submission in
+     *       {@link #pendingSubmission} for the next polling iteration. Reconnect logic at the
+     *       top of the polling loop will rebuild the cluster connection; we drain the held
+     *       order on the next pass.</li>
+     *   <li>{@code MAX_POSITION_EXCEEDED} or persistent back-pressure beyond the retry budget
+     *       — drop, increment {@link #offerDroppedCount}, log. This is the only path that
+     *       still loses orders silently and should be rare.</li>
+     * </ul>
+     *
+     * @return the number of orders processed (success + dropped, but not held)
      */
-    private int drainOrderQueue(AeronCluster currentCluster) {
+    private int drainOrderQueue(AeronCluster currentCluster, IdleStrategy idle) {
         int count = 0;
-        OrderSubmission submission;
-        while ((submission = orderQueue.poll()) != null) {
-            try {
-                int length = encodeSubmission(submission);
-                long result = currentCluster.offer(encodeBuffer, 0, length);
-                if (result < 0) {
-                    log.warn("Order offer failed for {}: {}", submission, offerResultName(result));
-                } else {
-                    ordersSent++;
+        while (true) {
+            final OrderSubmission submission;
+            final int length;
+            if (pendingSubmission != null) {
+                submission = pendingSubmission;
+                length = pendingLength;
+            } else {
+                submission = orderQueue.poll();
+                if (submission == null) {
+                    break;
                 }
-                count++;
-            } catch (Exception e) {
-                log.error("Failed to encode/offer order submission: {}", submission, e);
+                try {
+                    length = encodeSubmission(submission);
+                } catch (Exception e) {
+                    log.error("Failed to encode order submission: {}", submission, e);
+                    offerDroppedCount++;
+                    count++;
+                    continue;
+                }
             }
+
+            long result = currentCluster.offer(encodeBuffer, 0, length);
+            if (result >= 0) {
+                pendingSubmission = null;
+                ordersSent++;
+                count++;
+                continue;
+            }
+
+            // Transient back-pressure: retry with polling-thread idle strategy.
+            if (result == Publication.BACK_PRESSURED || result == Publication.ADMIN_ACTION) {
+                long retried = retryOffer(currentCluster, length, idle);
+                if (retried >= 0) {
+                    pendingSubmission = null;
+                    ordersSent++;
+                    offerRetriedCount++;
+                    count++;
+                    continue;
+                }
+                result = retried;
+            }
+
+            // Connection-level error: hold the submission for the next polling iteration so we
+            // don't drop it while the reconnect logic at the top of the loop runs.
+            if (result == Publication.NOT_CONNECTED || result == Publication.CLOSED) {
+                if (pendingSubmission == null) {
+                    pendingSubmission = submission;
+                    pendingLength = length;
+                    offerHeldCount++;
+                }
+                return count;
+            }
+
+            // MAX_POSITION_EXCEEDED or back-pressure that survived all retries — give up on this
+            // submission so we don't head-of-line block subsequent orders behind it.
+            log.warn("Order offer failed for {}: {} (dropped after retries)",
+                    submission, offerResultName(result));
+            offerDroppedCount++;
+            pendingSubmission = null;
+            count++;
         }
         return count;
+    }
+
+    /** Max iterations to retry a back-pressured offer. ~10 ms with the current idle strategy. */
+    private static final int OFFER_RETRY_LIMIT = 100;
+
+    /**
+     * Retry an offer using the polling-thread idle strategy. Bails out early on connection-level
+     * errors so the caller can take the held-pending path.
+     */
+    private long retryOffer(AeronCluster currentCluster, int length, IdleStrategy idle) {
+        idle.reset();
+        for (int i = 0; i < OFFER_RETRY_LIMIT; i++) {
+            long result = currentCluster.offer(encodeBuffer, 0, length);
+            if (result >= 0) {
+                return result;
+            }
+            if (result == Publication.NOT_CONNECTED || result == Publication.CLOSED
+                    || result == Publication.MAX_POSITION_EXCEEDED) {
+                return result;
+            }
+            idle.idle();
+        }
+        return Publication.BACK_PRESSURED;
     }
 
     /**
@@ -489,25 +644,37 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
      * @return the total encoded message length (header + body)
      */
     private int encodeSubmission(OrderSubmission submission) {
-        if (submission.getType() == OrderSubmission.Type.CREATE) {
-            createOrderEncoder.wrapAndApplyHeader(encodeBuffer, 0, headerEncoder);
-            createOrderEncoder
-                    .userId(submission.getUserId())
-                    .price(submission.getPrice())
-                    .quantity(submission.getQuantity())
-                    .totalPrice(submission.getTotalPrice())
-                    .marketId(submission.getMarketId())
-                    .orderType(submission.getOrderType())
-                    .orderSide(submission.getOrderSide())
-                    .omsOrderId(submission.getOmsOrderId());
-            return MessageHeaderEncoder.ENCODED_LENGTH + createOrderEncoder.encodedLength();
-        } else {
-            cancelOrderEncoder.wrapAndApplyHeader(encodeBuffer, 0, headerEncoder);
-            cancelOrderEncoder
-                    .userId(submission.getUserId())
-                    .orderId(submission.getOrderId())
-                    .marketId(submission.getMarketId());
-            return MessageHeaderEncoder.ENCODED_LENGTH + cancelOrderEncoder.encodedLength();
+        switch (submission.getType()) {
+            case CREATE:
+                createOrderEncoder.wrapAndApplyHeader(encodeBuffer, 0, headerEncoder);
+                createOrderEncoder
+                        .userId(submission.getUserId())
+                        .price(submission.getPrice())
+                        .quantity(submission.getQuantity())
+                        .totalPrice(submission.getTotalPrice())
+                        .marketId(submission.getMarketId())
+                        .orderType(submission.getOrderType())
+                        .orderSide(submission.getOrderSide())
+                        .omsOrderId(submission.getOmsOrderId());
+                return MessageHeaderEncoder.ENCODED_LENGTH + createOrderEncoder.encodedLength();
+            case UPDATE:
+                updateOrderEncoder.wrapAndApplyHeader(encodeBuffer, 0, headerEncoder);
+                updateOrderEncoder
+                        .userId(submission.getUserId())
+                        .orderId(submission.getOrderId())
+                        .price(submission.getPrice())
+                        .quantity(submission.getQuantity())
+                        .marketId(submission.getMarketId())
+                        .orderType(submission.getOrderType())
+                        .orderSide(submission.getOrderSide());
+                return MessageHeaderEncoder.ENCODED_LENGTH + updateOrderEncoder.encodedLength();
+            default: // CANCEL
+                cancelOrderEncoder.wrapAndApplyHeader(encodeBuffer, 0, headerEncoder);
+                cancelOrderEncoder
+                        .userId(submission.getUserId())
+                        .orderId(submission.getOrderId())
+                        .marketId(submission.getMarketId());
+                return MessageHeaderEncoder.ENCODED_LENGTH + cancelOrderEncoder.encodedLength();
         }
     }
 
@@ -515,10 +682,13 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
         long egressAgeMs = nowMs - lastEgressMessageMs;
         var sub = currentCluster.egressSubscription();
         log.info("STATS: egress={}, heartbeats={}, ordersSent={}, connected={}, " +
-                        "subConnected={}, images={}, sessionId={}, egressAge={}ms",
+                        "subConnected={}, images={}, sessionId={}, egressAge={}ms, " +
+                        "offerRetried={}, offerHeld={}, offerDropped={}, aeronErrors={}, queueDepth={}",
                 egressMessageCount, heartbeatCount, ordersSent,
                 isConnected(), sub.isConnected(), sub.imageCount(),
-                currentCluster.clusterSessionId(), egressAgeMs);
+                currentCluster.clusterSessionId(), egressAgeMs,
+                offerRetriedCount, offerHeldCount, offerDroppedCount,
+                aeronErrorCount.get(), orderQueue.size());
 
         // Stale egress detection: connected but no data flowing
         if (egressAgeMs > STALE_EGRESS_TIMEOUT_MS && egressMessageCount > 0) {
@@ -711,8 +881,15 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
             long leadershipTermId,
             int leaderMemberId,
             String ingressEndpoints) {
-        log.info("New leader elected: member={}, term={}, ingress={}",
-                leaderMemberId, leadershipTermId, ingressEndpoints);
+        // AeronCluster client handles the ingress publication redirect to the new leader
+        // internally before invoking this callback (it parses the supplied ingressEndpoints,
+        // closes the old publication, and opens a new one). Brief NOT_CONNECTED windows on
+        // offer() during the swap are caught by the pendingSubmission slot in drainOrderQueue.
+        // We just track the transition for observability.
+        leaderTransitionDeadlineMs = System.currentTimeMillis() + LEADER_TRANSITION_TIMEOUT_MS;
+        leaderChangeCount++;
+        log.info("New leader elected: member={}, term={}, ingress={} (transition window {}ms)",
+                leaderMemberId, leadershipTermId, ingressEndpoints, LEADER_TRANSITION_TIMEOUT_MS);
     }
 
     // ==================== Shutdown ====================
