@@ -74,7 +74,7 @@ class OmsOrderServiceImplTest {
 
         orderService = new OmsOrderServiceImpl(
                 coreEngine, riskEngine, ledgerService, clusterClient,
-                balanceStore, egressAdapter, idGenerator);
+                balanceStore, egressAdapter, idGenerator, marketDataProvider);
     }
 
     @Test
