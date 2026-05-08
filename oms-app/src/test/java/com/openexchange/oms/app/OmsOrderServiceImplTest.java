@@ -31,6 +31,7 @@ class OmsOrderServiceImplTest {
     private ClusterClient clusterClient;
     private RiskEngine riskEngine;
     private OmsMarketDataProvider marketDataProvider;
+    private OmsCoreEngine coreEngine;
 
     @BeforeEach
     void setUp() {
@@ -65,7 +66,7 @@ class OmsOrderServiceImplTest {
 
         OrderLifecycleManager lcm = new OrderLifecycleManager();
         SyntheticOrderEngine syntheticEngine = new SyntheticOrderEngine();
-        OmsCoreEngine coreEngine = new OmsCoreEngine(lcm, syntheticEngine);
+        coreEngine = new OmsCoreEngine(lcm, syntheticEngine);
 
         clusterClient = mock(ClusterClient.class);
         when(clusterClient.submitOrder(any(OrderSubmission.class))).thenReturn(true);
@@ -74,7 +75,7 @@ class OmsOrderServiceImplTest {
 
         orderService = new OmsOrderServiceImpl(
                 coreEngine, riskEngine, ledgerService, clusterClient,
-                balanceStore, egressAdapter, idGenerator);
+                balanceStore, egressAdapter, idGenerator, marketDataProvider);
     }
 
     @Test
@@ -131,6 +132,11 @@ class OmsOrderServiceImplTest {
         CreateOrderRequest req = createLimitBuyRequest(1L, 1, 50000.0, 1.0);
         CreateOrderResponse createResp = orderService.createOrder(req);
         assertTrue(createResp.isAccepted());
+
+        // Simulate cluster egress assigning a clusterOrderId; without this the
+        // order is "in-flight" and cancel rejects.
+        coreEngine.getLifecycleManager().onClusterOrderStatus(
+                createResp.getOmsOrderId(), 12345L, 0, FixedPoint.fromDouble(1.0), 0L);
 
         CancelOrderResponse cancelResp = orderService.cancelOrder(createResp.getOmsOrderId());
         assertTrue(cancelResp.isAccepted());

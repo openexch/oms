@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out match (for match-common dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: openexch/match
+          ref: main
+          path: _match
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      - name: Install match-common into local Maven repo
+        run: mvn -B -f _match/pom.xml install -DskipTests -pl match-common -am
+
+      - name: Build and test
+        run: mvn -B clean verify
