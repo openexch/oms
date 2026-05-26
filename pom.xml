@@ -63,7 +63,7 @@
 
         <!-- Testing -->
         <junit.version>5.10.2</junit.version>
-        <mockito.version>5.11.0</mockito.version>
+        <mockito.version>5.23.0</mockito.version>
     </properties>
 
     <dependencyManagement>
