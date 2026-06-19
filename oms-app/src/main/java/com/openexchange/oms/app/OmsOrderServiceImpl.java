@@ -14,7 +14,6 @@ import com.openexchange.oms.ledger.LedgerEntry;
 import com.openexchange.oms.ledger.LedgerService;
 import com.openexchange.oms.risk.RiskEngine;
 import com.openexchange.oms.risk.RiskResult;
-import org.checkerframework.checker.nullness.qual.NonNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -162,7 +161,7 @@ public class OmsOrderServiceImpl implements OrderService {
         }
     }
 
-    private static @NonNull OrderSubmission getOrderSubmission(OmsOrderType orderType, OrderSide side, OmsOrder order) {
+    private static OrderSubmission getOrderSubmission(OmsOrderType orderType, OrderSide side, OmsOrder order) {
         com.match.infrastructure.generated.OrderType sbeOrderType = mapOrderType(orderType);
         com.match.infrastructure.generated.OrderSide sbeOrderSide = mapOrderSide(side);
         long totalPrice = FixedPoint.multiply(order.getPrice(), order.getQuantity());
