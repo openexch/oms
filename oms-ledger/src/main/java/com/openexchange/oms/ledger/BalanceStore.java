@@ -69,8 +69,9 @@ public interface BalanceStore {
      * @param baseAmount   base asset amount (quantity)
      * @param quoteAmount  quote asset amount (price * quantity)
      * @param tradeId      unique trade identifier for idempotency
+     * @return true if the trade was newly applied; false if it was a duplicate (already-seen tradeId)
      */
-    void settle(long buyerUserId, long sellerUserId, int baseAssetId, int quoteAssetId,
+    boolean settle(long buyerUserId, long sellerUserId, int baseAssetId, int quoteAssetId,
                 long baseAmount, long quoteAmount, long tradeId);
 
     /**

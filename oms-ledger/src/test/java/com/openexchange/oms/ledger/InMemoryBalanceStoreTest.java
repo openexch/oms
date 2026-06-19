@@ -109,12 +109,14 @@ class InMemoryBalanceStoreTest {
         store.deposit(sellerUser, baseAsset, baseAmount * 2);
         store.hold(sellerUser, baseAsset, baseAmount, 200L);
 
-        // First settle
-        store.settle(buyerUser, sellerUser, baseAsset, quoteAsset, baseAmount, quoteAmount, 999L);
+        // First settle — newly applied → returns true
+        boolean firstApplied = store.settle(buyerUser, sellerUser, baseAsset, quoteAsset, baseAmount, quoteAmount, 999L);
+        assertTrue(firstApplied);
         long buyerBase = store.getAvailable(buyerUser, baseAsset);
 
-        // Second settle with same tradeId — should be no-op
-        store.settle(buyerUser, sellerUser, baseAsset, quoteAsset, baseAmount, quoteAmount, 999L);
+        // Second settle with same tradeId — duplicate → returns false and is a no-op
+        boolean secondApplied = store.settle(buyerUser, sellerUser, baseAsset, quoteAsset, baseAmount, quoteAmount, 999L);
+        assertFalse(secondApplied);
         assertEquals(buyerBase, store.getAvailable(buyerUser, baseAsset));
     }
 

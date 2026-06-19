@@ -76,11 +76,11 @@ public class InMemoryBalanceStore implements BalanceStore {
     }
 
     @Override
-    public void settle(long buyerUserId, long sellerUserId, int baseAssetId, int quoteAssetId,
+    public boolean settle(long buyerUserId, long sellerUserId, int baseAssetId, int quoteAssetId,
                        long baseAmount, long quoteAmount, long tradeId) {
         if (!processedTradeIds.add(tradeId)) {
             log.debug("Duplicate trade settlement ignored: tradeId={}", tradeId);
-            return;
+            return false;
         }
 
         // Lock both users in consistent order to avoid deadlock
@@ -98,6 +98,7 @@ public class InMemoryBalanceStore implements BalanceStore {
                 getOrCreate(availKey(sellerUserId, quoteAssetId)).addAndGet(quoteAmount);
             }
         }
+        return true;
     }
 
     @Override

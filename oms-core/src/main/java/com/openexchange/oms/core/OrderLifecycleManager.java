@@ -115,7 +115,9 @@ public class OrderLifecycleManager {
             order = byClusterOrderId.get(clusterOrderId);
         }
         if (order == null) {
-            log.warn("Unknown order in status update: omsOrderId={}, clusterOrderId={}", omsOrderId, clusterOrderId);
+            // Common and benign after a leader switchover: the cluster re-delivers egress for orders
+            // already terminal/removed here. Debug (not warn) to avoid log noise.
+            log.debug("Unknown order in status update: omsOrderId={}, clusterOrderId={}", omsOrderId, clusterOrderId);
             return null;
         }
 
@@ -125,21 +127,33 @@ public class OrderLifecycleManager {
             byClusterOrderId.put(clusterOrderId, order);
         }
 
-        order.setRemainingQty(remainingQty);
-        order.setFilledQty(filledQty);
+        // MONOTONIC GUARD: the OrderStatus egress stream is coalesced/lossy and unsequenced, so a
+        // stale/out-of-order update can carry a LOWER filledQty than reality. filledQty is driven
+        // authoritatively by applyFill() from the lossless TradeExecution stream; here we only ever
+        // RAISE it, never let the status stream regress the trade-derived value (the bug #9 fix).
+        long guardedFilled = Math.max(order.getFilledQty(), filledQty);
+        order.setFilledQty(guardedFilled);
+        order.setRemainingQty(Math.max(0, order.getQuantity() - guardedFilled));
 
         switch (status) {
-            case 0: // NEW
-                transition(order, OmsOrderStatus.NEW);
+            case 0: // NEW — do not regress an order already advanced by trade-driven fills
+                if (order.getStatus() != OmsOrderStatus.PARTIALLY_FILLED
+                        && order.getStatus() != OmsOrderStatus.FILLED) {
+                    transition(order, OmsOrderStatus.NEW);
+                }
                 break;
             case 1: // PARTIALLY_FILLED
-                transition(order, OmsOrderStatus.PARTIALLY_FILLED);
+                if (order.getStatus() != OmsOrderStatus.FILLED) {
+                    transition(order, OmsOrderStatus.PARTIALLY_FILLED);
+                }
                 break;
-            case 2: // FILLED
+            case 2: // FILLED — cluster confirms the order left the book fully filled; reconcile to qty
+                order.setFilledQty(order.getQuantity());
+                order.setRemainingQty(0);
                 transition(order, OmsOrderStatus.FILLED);
                 removeOrder(order.getOmsOrderId());
                 break;
-            case 3: // CANCELLED
+            case 3: // CANCELLED — filledQty preserved by the monotonic guard above (do not reset)
                 transition(order, OmsOrderStatus.CANCELLED);
                 removeOrder(order.getOmsOrderId());
                 break;
@@ -149,6 +163,36 @@ public class OrderLifecycleManager {
                 break;
         }
 
+        return order;
+    }
+
+    /**
+     * Apply a trade-derived fill to an order. This is the AUTHORITATIVE source of {@code filledQty},
+     * driven by the lossless TradeExecution egress stream (the cluster OrderStatus stream is
+     * coalesced/lossy and only used as a monotonic backstop in {@link #onClusterOrderStatus}).
+     * <p>
+     * Callers must gate this on the per-tradeId settle() dedup so re-delivered trades (which the
+     * cluster replays on a leader switchover) are not double-counted here.
+     *
+     * @param omsOrderId the order to apply the fill to
+     * @param fillQty    fixed-point fill quantity from this trade
+     * @return the affected order (FILLED orders are returned even though they are removed from the
+     *         active map), or null if the order is unknown or already terminal (safe no-op)
+     */
+    public OmsOrder applyFill(long omsOrderId, long fillQty) {
+        OmsOrder order = activeOrders.get(omsOrderId);
+        if (order == null || order.getStatus().isTerminal()) {
+            return null;
+        }
+        long newFilled = order.getFilledQty() + fillQty;
+        order.setFilledQty(newFilled);
+        order.setRemainingQty(Math.max(0, order.getQuantity() - newFilled));
+        if (newFilled >= order.getQuantity()) {
+            transition(order, OmsOrderStatus.FILLED);
+            removeOrder(omsOrderId);
+        } else {
+            transition(order, OmsOrderStatus.PARTIALLY_FILLED);
+        }
         return order;
     }
 
