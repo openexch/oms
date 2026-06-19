@@ -48,16 +48,24 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
 
     private static final Logger log = LoggerFactory.getLogger(ClusterClient.class);
 
-    // Connection constants — heartbeat / reconnect cadence comes from InfrastructureConstants
+    // Connection constants — keep-alive / reconnect cadence comes from InfrastructureConstants
     // so the OMS, market gateway, and cluster all share one source of truth.
-    private static final long HEARTBEAT_INTERVAL_MS = InfrastructureConstants.HEARTBEAT_INTERVAL_MS;
-    private static final long HEARTBEAT_INTERVAL_NS = TimeUnit.MILLISECONDS.toNanos(HEARTBEAT_INTERVAL_MS);
+    // Protocol-level session keep-alive interval. Handled by the consensus module
+    // without entering the Raft log — unlike the old SBE GatewayHeartbeat offer, which
+    // was logged, replicated, and archived on every send (~10/s of pure idle log churn).
+    // Market-data flushing is driven cluster-side (flush timer + onSessionMessage flush),
+    // so the OMS no longer needs to ping the cluster via ingress to trigger a flush.
+    private static final long KEEPALIVE_INTERVAL_NS =
+            TimeUnit.MILLISECONDS.toNanos(InfrastructureConstants.SESSION_KEEPALIVE_INTERVAL_MS);
     private static final long INITIAL_RECONNECT_BACKOFF_MS = InfrastructureConstants.RECONNECT_COOLDOWN_MS;
     private static final long MAX_RECONNECT_BACKOFF_MS = 4000;
     private static final int MAX_FAILURES_BEFORE_DRIVER_RESET = 3;
     private static final int MAX_STARTUP_RETRIES = 30;
     private static final long STARTUP_RETRY_DELAY_MS = 2000;
-    private static final long STALE_EGRESS_TIMEOUT_MS = InfrastructureConstants.GATEWAY_TIMEOUT_MS;
+    // 30s with no egress = stale → force reconnect. Matches the market gateway's
+    // STALE_EGRESS_TIMEOUT_MS. (Was InfrastructureConstants.GATEWAY_TIMEOUT_MS, removed
+    // from match-common in the loud-limits/keep-alive cleanup; the OMS hadn't caught up.)
+    private static final long STALE_EGRESS_TIMEOUT_MS = 30_000;
     private static final long STATS_LOG_INTERVAL_MS = 10_000;
 
     // MPSC queue constants
@@ -82,12 +90,6 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
     private final CancelOrderEncoder cancelOrderEncoder = new CancelOrderEncoder();
     private final UpdateOrderEncoder updateOrderEncoder = new UpdateOrderEncoder();
 
-    // SBE heartbeat encoder
-    private final UnsafeBuffer heartbeatBuffer = new UnsafeBuffer(
-            new byte[MessageHeaderEncoder.ENCODED_LENGTH + GatewayHeartbeatEncoder.BLOCK_LENGTH]);
-    private final MessageHeaderEncoder heartbeatHeaderEncoder = new MessageHeaderEncoder();
-    private final GatewayHeartbeatEncoder heartbeatEncoder = new GatewayHeartbeatEncoder();
-
     // SBE decoders for egress messages (polling thread only)
     private final MessageHeaderDecoder headerDecoder = new MessageHeaderDecoder();
     private final TradeExecutionBatchDecoder tradeExecutionBatchDecoder = new TradeExecutionBatchDecoder();
@@ -106,7 +108,7 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     // Stats tracking
-    private volatile long heartbeatCount = 0;
+    private volatile long keepAliveCount = 0;
     private volatile long egressMessageCount = 0;
     private volatile long ordersSent = 0;
     private volatile long lastStatsLogMs = 0;
@@ -428,7 +430,7 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
     /**
      * Main polling loop -- SINGLE THREADED as per Aeron best practices.
      *
-     * <p>All operations (pollEgress, heartbeats, order queue drain, offer) happen
+     * <p>All operations (pollEgress, session keep-alive, order queue drain, offer) happen
      * in this thread. Must be called from a dedicated thread. Runs until
      * {@link #stopPolling()} is called.</p>
      */
@@ -439,7 +441,7 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
         }
 
         final IdleStrategy idleStrategy = new BackoffIdleStrategy(1, 1, 1_000, 100_000);
-        long lastHeartbeatNs = System.nanoTime();
+        long lastKeepAliveNs = System.nanoTime();
 
         log.info("Starting single-threaded polling loop (Aeron best practice)");
 
@@ -457,14 +459,20 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                 // Poll egress -- handles leader changes internally
                 int work = currentCluster.pollEgress();
 
-                // Send SBE heartbeat to cluster to trigger market data flush
+                // Protocol-level session keep-alive (single-threaded model). Handled
+                // entirely by the consensus module: never appended to the Raft log,
+                // replicated, or archived — unlike the old SBE GatewayHeartbeat offer.
+                // Market-data flushing is cluster-driven, so no ingress ping is needed.
                 long nowNs = System.nanoTime();
-                if (nowNs - lastHeartbeatNs >= HEARTBEAT_INTERVAL_NS) {
+                if (nowNs - lastKeepAliveNs >= KEEPALIVE_INTERVAL_NS) {
                     if (!currentCluster.isClosed()) {
-                        sendHeartbeat(currentCluster);
+                        boolean sent = currentCluster.sendKeepAlive();
+                        if (!sent && keepAliveCount % 10 == 0) {
+                            log.warn("Session keep-alive failed (back-pressured); will retry next interval");
+                        }
                     }
-                    lastHeartbeatNs = nowNs;
-                    heartbeatCount++;
+                    lastKeepAliveNs = nowNs;
+                    keepAliveCount++;
                     work++;
                 }
 
@@ -497,37 +505,6 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
         running.set(false);
     }
 
-    /**
-     * Send an SBE-encoded GatewayHeartbeat to the cluster.
-     * <p>This triggers the cluster service to flush queued market data; if too many heartbeats
-     * drop, the cluster declares the gateway dead and the user sees stale data. Bounded retry
-     * for transient back-pressure (~1 ms with the current idle strategy) keeps heartbeat loss
-     * negligible without spending much polling time.
-     */
-    private void sendHeartbeat(AeronCluster currentCluster) {
-        heartbeatEncoder.wrapAndApplyHeader(heartbeatBuffer, 0, heartbeatHeaderEncoder);
-        heartbeatEncoder
-                .gatewayId(currentCluster.clusterSessionId())
-                .timestamp(System.currentTimeMillis());
-
-        int length = MessageHeaderEncoder.ENCODED_LENGTH + heartbeatEncoder.encodedLength();
-        long result = currentCluster.offer(heartbeatBuffer, 0, length);
-        for (int attempt = 0; result < 0 && attempt < HEARTBEAT_RETRY_LIMIT; attempt++) {
-            if (result == Publication.NOT_CONNECTED || result == Publication.CLOSED
-                    || result == Publication.MAX_POSITION_EXCEEDED) {
-                break;
-            }
-            // Tiny park; this thread also drives order drain and pollEgress so don't burn budget.
-            java.util.concurrent.locks.LockSupport.parkNanos(10_000); // 10us
-            result = currentCluster.offer(heartbeatBuffer, 0, length);
-        }
-        if (result < 0 && heartbeatCount % 100 == 0) {
-            log.warn("Heartbeat offer failed: {}", offerResultName(result));
-        }
-    }
-
-    /** Bounded retry for transient back-pressure on heartbeats. ~10 attempts × 10us = 100us. */
-    private static final int HEARTBEAT_RETRY_LIMIT = 10;
 
     /**
      * Drain the MPSC order queue, encoding each submission and offering to the cluster.
@@ -681,10 +658,10 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
     private void logStats(AeronCluster currentCluster, long nowMs) {
         long egressAgeMs = nowMs - lastEgressMessageMs;
         var sub = currentCluster.egressSubscription();
-        log.info("STATS: egress={}, heartbeats={}, ordersSent={}, connected={}, " +
+        log.info("STATS: egress={}, keepAlives={}, ordersSent={}, connected={}, " +
                         "subConnected={}, images={}, sessionId={}, egressAge={}ms, " +
                         "offerRetried={}, offerHeld={}, offerDropped={}, aeronErrors={}, queueDepth={}",
-                egressMessageCount, heartbeatCount, ordersSent,
+                egressMessageCount, keepAliveCount, ordersSent,
                 isConnected(), sub.isConnected(), sub.imageCount(),
                 currentCluster.clusterSessionId(), egressAgeMs,
                 offerRetriedCount, offerHeldCount, offerDroppedCount,
