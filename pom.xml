@@ -44,7 +44,7 @@
         <netty.version>4.2.15.Final</netty.version>
 
         <!-- Jackson -->
-        <jackson.version>2.17.0</jackson.version>
+        <jackson.version>2.22.0</jackson.version>
 
         <!-- Redis -->
         <lettuce.version>7.6.0.RELEASE</lettuce.version>
@@ -157,21 +157,16 @@
                 <version>${netty.version}</version>
             </dependency>
 
-            <!-- Jackson -->
+            <!-- Jackson — import the BOM so all jackson artifacts get mutually-compatible versions.
+                 jackson-annotations versions independently from databind/core (e.g. there is no
+                 jackson-annotations 2.22.0), so pinning all three to one ${jackson.version} breaks
+                 resolution. The BOM declares the correct version for each artifact. -->
             <dependency>
-                <groupId>com.fasterxml.jackson.core</groupId>
-                <artifactId>jackson-databind</artifactId>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
                 <version>${jackson.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>com.fasterxml.jackson.core</groupId>
-                <artifactId>jackson-core</artifactId>
-                <version>${jackson.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>com.fasterxml.jackson.core</groupId>
-                <artifactId>jackson-annotations</artifactId>
-                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
 
             <!-- Redis (Lettuce) -->
