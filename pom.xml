@@ -51,7 +51,7 @@
 
         <!-- PostgreSQL -->
         <postgresql.version>42.7.3</postgresql.version>
-        <hikari.version>5.1.0</hikari.version>
+        <hikari.version>7.1.0</hikari.version>
 
         <!-- gRPC -->
         <grpc.version>1.62.2</grpc.version>
