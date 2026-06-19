@@ -85,15 +85,24 @@ public class OmsCoreEngine {
                                   long takerUserId, long makerUserId, long tradePrice,
                                   long tradeQuantity, boolean takerIsBuy,
                                   long takerOmsOrderId, long makerOmsOrderId) {
-        // Settle the trade via ledger
+        // Settle the trade via ledger. settleTrade is idempotent on tradeId: the cluster re-delivers
+        // egress to a client that reconnects across a leader switchover, so the same TradeExecution
+        // can arrive more than once. `applied` is false for a duplicate.
+        boolean applied = true;
         if (settlementHandler != null) {
             long buyerUserId = takerIsBuy ? takerUserId : makerUserId;
             long sellerUserId = takerIsBuy ? makerUserId : takerUserId;
             long buyerOmsOrderId = takerIsBuy ? takerOmsOrderId : makerOmsOrderId;
             long sellerOmsOrderId = takerIsBuy ? makerOmsOrderId : takerOmsOrderId;
 
-            settlementHandler.settleTrade(tradeId, buyerUserId, sellerUserId, marketId,
+            applied = settlementHandler.settleTrade(tradeId, buyerUserId, sellerUserId, marketId,
                 tradePrice, tradeQuantity, buyerOmsOrderId, sellerOmsOrderId);
+        }
+
+        // Duplicate (re-delivered) trade: balances were already applied exactly once by settle().
+        // Do NOT persist a second execution report or double-count filledQty.
+        if (!applied) {
+            return;
         }
 
         // Create execution reports for both taker and maker
@@ -114,8 +123,21 @@ public class OmsCoreEngine {
             }
         }
 
-        // Check if iceberg slice filled
-        OmsOrder takerOrder = lifecycleManager.getOrder(takerOmsOrderId);
+        // Apply the fill to per-order filledQty from the AUTHORITATIVE TradeExecution stream.
+        // (The cluster OrderStatus egress is coalesced/lossy and must not drive filledQty — it is
+        // only a monotonic backstop in OrderLifecycleManager.onClusterOrderStatus.)
+        OmsOrder takerOrder = takerOmsOrderId != 0
+                ? lifecycleManager.applyFill(takerOmsOrderId, tradeQuantity) : null;
+        OmsOrder makerOrder = makerOmsOrderId != 0
+                ? lifecycleManager.applyFill(makerOmsOrderId, tradeQuantity) : null;
+
+        if (persistenceHandler != null) {
+            if (takerOrder != null) persistenceHandler.persistOrderUpdate(takerOrder);
+            if (makerOrder != null) persistenceHandler.persistOrderUpdate(makerOrder);
+        }
+
+        // Check if iceberg slice filled — use the order returned by applyFill, since a FILLED order
+        // is removed from the active map (getOrder would now return null).
         if (takerOrder != null && takerOrder.getOrderType() == OmsOrderType.ICEBERG
             && takerOrder.getStatus() == OmsOrderStatus.FILLED) {
             syntheticEngine.onIcebergSliceFilled(takerOmsOrderId);
@@ -212,7 +234,13 @@ public class OmsCoreEngine {
     // ==================== Handler Interfaces ====================
 
     public interface SettlementHandler {
-        void settleTrade(long tradeId, long buyerUserId, long sellerUserId, int marketId,
+        /**
+         * Settle a trade. Idempotent on tradeId (the cluster re-delivers egress on leader
+         * switchover, so the same trade can arrive more than once).
+         *
+         * @return true if the trade was newly applied; false if it was a duplicate and skipped.
+         */
+        boolean settleTrade(long tradeId, long buyerUserId, long sellerUserId, int marketId,
                         long price, long quantity, long buyerOmsOrderId, long sellerOmsOrderId);
     }
 

@@ -170,7 +170,9 @@ public class LedgerService {
      * @param quantity         execution quantity (fixed-point)
      * @param takerOmsOrderId  taker's OMS order ID
      * @param makerOmsOrderId  maker's OMS order ID
-     * @return ledger entries for both sides of the trade
+     * @return ledger entries for both sides of the trade; an EMPTY list if the trade was a duplicate
+     *         (already-seen tradeId) or had invalid amounts. Callers use emptiness to detect that the
+     *         trade was NOT newly applied and must skip fill/risk side effects.
      */
     public List<LedgerEntry> settleTradeExecution(long tradeId, long buyerUserId, long sellerUserId,
                                                    int marketId, long price, long quantity,
@@ -188,7 +190,14 @@ public class LedgerService {
             return Collections.emptyList();
         }
 
-        balanceStore.settle(buyerUserId, sellerUserId, baseAssetId, quoteAssetId, baseAmount, quoteAmount, tradeId);
+        // Idempotent on tradeId: the cluster re-delivers egress on leader switchover, so the same
+        // trade can arrive more than once. settle() applies it at most once and reports duplicates.
+        boolean applied = balanceStore.settle(buyerUserId, sellerUserId, baseAssetId, quoteAssetId,
+                baseAmount, quoteAmount, tradeId);
+        if (!applied) {
+            log.debug("Duplicate trade ignored (no ledger entries): tradeId={}", tradeId);
+            return Collections.emptyList();
+        }
 
         long now = System.currentTimeMillis();
         List<LedgerEntry> entries = new ArrayList<>(4);

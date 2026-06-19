@@ -183,7 +183,7 @@ public class RedisBalanceStore implements BalanceStore {
     }
 
     @Override
-    public void settle(long buyerUserId, long sellerUserId, int baseAssetId, int quoteAssetId,
+    public boolean settle(long buyerUserId, long sellerUserId, int baseAssetId, int quoteAssetId,
                        long baseAmount, long quoteAmount, long tradeId) {
         if (baseAmount <= 0 || quoteAmount <= 0) {
             throw new IllegalArgumentException(
@@ -210,8 +210,10 @@ public class RedisBalanceStore implements BalanceStore {
         if (result != null && result == 1L) {
             log.debug("Trade settled: tradeId={}, buyer={}, seller={}, base={}:{}, quote={}:{}",
                     tradeId, buyerUserId, sellerUserId, baseAssetId, baseAmount, quoteAssetId, quoteAmount);
+            return true;
         } else {
             log.info("Trade already processed (idempotent no-op): tradeId={}", tradeId);
+            return false;
         }
     }
 

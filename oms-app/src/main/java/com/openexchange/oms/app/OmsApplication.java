@@ -143,14 +143,22 @@ public class OmsApplication {
         // 8. Wire settlement handler
         coreEngine.setSettlementHandler((tradeId, buyerUserId, sellerUserId, marketId,
                                           price, quantity, buyerOmsOrderId, sellerOmsOrderId) -> {
-            ledgerService.settleTradeExecution(tradeId, buyerUserId, sellerUserId,
-                    marketId, price, quantity, buyerOmsOrderId, sellerOmsOrderId);
+            // settleTradeExecution is idempotent on tradeId; an empty result means the trade was a
+            // duplicate (re-delivered on leader switchover) and was NOT newly applied. Skip all
+            // side effects so risk positions / open-order counts / overlock are not double-applied.
+            boolean applied = !ledgerService.settleTradeExecution(tradeId, buyerUserId, sellerUserId,
+                    marketId, price, quantity, buyerOmsOrderId, sellerOmsOrderId).isEmpty();
+            if (!applied) {
+                return false;
+            }
 
             // Update risk engine positions
             riskEngine.onFill(buyerUserId, marketId, OrderSide.BUY, quantity);
             riskEngine.onFill(sellerUserId, marketId, OrderSide.SELL, quantity);
 
-            // Decrement open order counts for filled orders
+            // Decrement open order counts for filled orders. (Note: this runs before applyFill
+            // updates remainingQty in onTradeExecution, so it reflects pre-fill state — open-order
+            // count accuracy is risk bookkeeping, out of scope for the fill-exactness fix.)
             OmsOrder buyerOrder = lifecycleManager.getOrder(buyerOmsOrderId);
             if (buyerOrder != null && buyerOrder.getRemainingQty() == 0) {
                 riskEngine.onOrderClosed(buyerUserId);
@@ -160,11 +168,13 @@ public class OmsApplication {
                 riskEngine.onOrderClosed(sellerUserId);
             }
 
-            // Handle overlock for buy orders
+            // Handle overlock for buy orders (per-fill price-improvement hold release; independent
+            // of remainingQty so ordering vs applyFill does not matter)
             if (buyerOrder != null && buyerOrder.isBuy()) {
                 ledgerService.handleOverlock(buyerOmsOrderId, buyerUserId, marketId,
                         buyerOrder.getPrice(), price, quantity);
             }
+            return true;
         });
 
         // 9. Wire persistence handler

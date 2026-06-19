@@ -147,6 +147,74 @@ class OrderLifecycleManagerTest {
         assertEquals(1, lcm.getActiveOrderCount());
     }
 
+    // ==================== Bug #9: filledQty from TradeExecution ====================
+
+    @Test
+    void testApplyFillAccumulatesAndDrivesStatus() {
+        OmsOrder order = createOrder(30L);   // quantity = 100_000_000
+        lcm.registerOrder(order);
+        lcm.onRiskPassed(order.getOmsOrderId());
+        lcm.onHoldPlaced(order.getOmsOrderId());
+        lcm.onClusterOrderStatus(order.getOmsOrderId(), 530L, 0, 0, 0); // NEW
+
+        OmsOrder afterPartial = lcm.applyFill(order.getOmsOrderId(), 30_000_000L);
+        assertSame(order, afterPartial);
+        assertEquals(OmsOrderStatus.PARTIALLY_FILLED, order.getStatus());
+        assertEquals(30_000_000L, order.getFilledQty());
+        assertEquals(70_000_000L, order.getRemainingQty());
+
+        OmsOrder afterFull = lcm.applyFill(order.getOmsOrderId(), 70_000_000L);
+        assertSame(order, afterFull);                 // returned even though removed
+        assertEquals(OmsOrderStatus.FILLED, order.getStatus());
+        assertEquals(100_000_000L, order.getFilledQty());
+        assertEquals(0L, order.getRemainingQty());
+        assertNull(lcm.getOrder(order.getOmsOrderId())); // removed on FILLED
+    }
+
+    @Test
+    void testApplyFillOnTerminalOrUnknownIsNoOp() {
+        assertNull(lcm.applyFill(999L, 10_000_000L)); // unknown
+        OmsOrder order = createOrder(31L);
+        lcm.registerOrder(order);
+        lcm.onRiskRejected(order.getOmsOrderId(), "x"); // terminal + removed
+        assertNull(lcm.applyFill(order.getOmsOrderId(), 10_000_000L));
+    }
+
+    @Test
+    void testMonotonicGuardRejectsRegressingOrderStatus() {
+        OmsOrder order = createOrder(32L);
+        lcm.registerOrder(order);
+        lcm.onRiskPassed(order.getOmsOrderId());
+        lcm.onHoldPlaced(order.getOmsOrderId());
+        lcm.onClusterOrderStatus(order.getOmsOrderId(), 532L, 0, 0, 0); // NEW
+
+        lcm.applyFill(order.getOmsOrderId(), 60_000_000L);
+        assertEquals(60_000_000L, order.getFilledQty());
+
+        // A stale/coalesced OrderStatus reporting only 20M filled must NOT regress filledQty.
+        lcm.onClusterOrderStatus(order.getOmsOrderId(), 532L, 1, 80_000_000L, 20_000_000L);
+        assertEquals(60_000_000L, order.getFilledQty());
+        assertEquals(40_000_000L, order.getRemainingQty());
+        assertEquals(OmsOrderStatus.PARTIALLY_FILLED, order.getStatus());
+    }
+
+    @Test
+    void testFillBeforeNewDoesNotRegressStatus() {
+        OmsOrder order = createOrder(33L);
+        lcm.registerOrder(order);
+        lcm.onRiskPassed(order.getOmsOrderId());
+        lcm.onHoldPlaced(order.getOmsOrderId());
+
+        // Trade arrives before the cluster NEW status (reordered egress)
+        lcm.applyFill(order.getOmsOrderId(), 40_000_000L);
+        assertEquals(OmsOrderStatus.PARTIALLY_FILLED, order.getStatus());
+
+        // A late NEW status must not regress the order back to NEW
+        lcm.onClusterOrderStatus(order.getOmsOrderId(), 533L, 0, 60_000_000L, 0);
+        assertEquals(OmsOrderStatus.PARTIALLY_FILLED, order.getStatus());
+        assertEquals(40_000_000L, order.getFilledQty()); // monotonic guard preserves it
+    }
+
     private OmsOrder createOrder(long id) {
         OmsOrder order = new OmsOrder();
         order.setOmsOrderId(id);
