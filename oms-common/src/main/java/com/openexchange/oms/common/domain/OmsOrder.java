@@ -38,6 +38,12 @@ public class OmsOrder {
     private OmsOrderStatus status;
     private String rejectReason;
 
+    // === Reconcile ===
+    // True once a cancel has been submitted to the cluster for this order. The post-reconnect
+    // reconcile re-submits cancels for flagged-but-still-active orders whose cancel or terminal
+    // egress was lost at a leader-switchover seam (oms#21) — without touching legitimately-resting orders.
+    private boolean cancelRequested;
+
     // === Ledger ===
     private long holdId;              // Reference to ledger hold
     private long holdAmount;          // Total amount held
@@ -128,6 +134,9 @@ public class OmsOrder {
 
     public long getParentOmsOrderId() { return parentOmsOrderId; }
     public void setParentOmsOrderId(long parentOmsOrderId) { this.parentOmsOrderId = parentOmsOrderId; }
+
+    public boolean isCancelRequested() { return cancelRequested; }
+    public void setCancelRequested(boolean cancelRequested) { this.cancelRequested = cancelRequested; }
 
     public boolean isBuy() { return side == OrderSide.BUY; }
     public boolean isTerminal() { return status != null && status.isTerminal(); }

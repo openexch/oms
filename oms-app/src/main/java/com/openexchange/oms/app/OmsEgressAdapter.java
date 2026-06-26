@@ -99,6 +99,14 @@ public class OmsEgressAdapter implements EgressListener {
     public void onConnected() {
         connected = true;
         log.info("Cluster connection established");
+        // Reconcile any orders whose cancel was lost across a disconnect/reconnect (oms#21).
+        coreEngine.requestReconcile(System.currentTimeMillis());
+    }
+
+    @Override
+    public void onReconnected() {
+        // Leader switchover (session stayed up). Reconcile pending cancels lost at the seam (oms#21).
+        coreEngine.requestReconcile(System.currentTimeMillis());
     }
 
     @Override

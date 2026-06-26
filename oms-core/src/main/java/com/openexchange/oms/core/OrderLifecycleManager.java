@@ -203,6 +203,9 @@ public class OrderLifecycleManager {
         OmsOrder order = activeOrders.get(omsOrderId);
         if (order == null) return null;
         if (order.getStatus().isTerminal()) return null;
+        // Mark cancel-intent so the post-reconnect reconcile can re-submit this cancel if it (or its
+        // terminal egress) is lost at a leader-switchover seam (oms#21).
+        order.setCancelRequested(true);
         return order;
     }
 

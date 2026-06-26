@@ -30,6 +30,14 @@ public class OmsCoreEngine {
     // Pluggable cluster submit handler
     private ClusterSubmitHandler clusterSubmitHandler;
 
+    // Reconcile (post-reconnect / leader-switchover): after a switchover, a cancel or its terminal
+    // egress can be lost at the seam, leaving OMS holding an order it already tried to cancel (oms#21).
+    // On reconnect we re-submit cancels for such orders. Deferred so the cluster's egress redelivery
+    // settles first. Flag set off-thread (polling) and consumed on the GTD timer thread.
+    private volatile boolean reconcilePending = false;
+    private volatile long reconcileDueMs = 0;
+    private static final long RECONCILE_DELAY_MS = 3_000;
+
     public OmsCoreEngine(OrderLifecycleManager lifecycleManager, SyntheticOrderEngine syntheticEngine) {
         this.lifecycleManager = lifecycleManager;
         this.syntheticEngine = syntheticEngine;
@@ -176,6 +184,13 @@ public class OmsCoreEngine {
      * Checks all active GTD orders for expiry.
      */
     public void checkGtdExpiry(long nowMs) {
+        // Run a pending post-reconnect reconcile on this timer thread (state mutation off the
+        // polling thread, same as GTD expiry below).
+        if (reconcilePending && nowMs >= reconcileDueMs) {
+            reconcilePending = false;
+            reconcilePendingCancels();
+        }
+
         // Collect expired GTD orders (cannot modify map during iteration)
         ArrayList<Long> expiredIds = new ArrayList<>();
         lifecycleManager.forEachActiveOrder(order -> {
@@ -202,10 +217,52 @@ public class OmsCoreEngine {
         }
     }
 
+    // ==================== Reconcile ====================
+
+    /**
+     * Signal (from the cluster polling thread) that the session reconnected or the leader changed,
+     * so the core thread should reconcile pending-cancel orders. Deferred by RECONCILE_DELAY_MS to
+     * let the cluster's egress redelivery heal what it can first. Idempotent.
+     */
+    public void requestReconcile(long nowMs) {
+        reconcileDueMs = nowMs + RECONCILE_DELAY_MS;
+        reconcilePending = true;
+        log.info("Reconcile requested (reconnect/leader change); running in ~{}ms", RECONCILE_DELAY_MS);
+    }
+
+    /**
+     * Re-submit cancels for orders that have a cancel pending (cancelRequested) but are still active
+     * in the OMS — their original cancel or its terminal egress was likely lost at a switchover seam.
+     * Safe: only touches orders the user/OMS already asked to cancel (never a legitimately-resting
+     * order), and the cluster now acks cancels of already-gone orders so the hold releases either way.
+     */
+    private void reconcilePendingCancels() {
+        ArrayList<OmsOrder> toRecancel = new ArrayList<>();
+        lifecycleManager.forEachActiveOrder(order -> {
+            if (order.isCancelRequested()
+                    && order.getClusterOrderId() != 0
+                    && (order.getStatus() == OmsOrderStatus.NEW
+                        || order.getStatus() == OmsOrderStatus.PARTIALLY_FILLED)) {
+                toRecancel.add(order);
+            }
+        });
+        if (toRecancel.isEmpty()) return;
+        for (OmsOrder order : toRecancel) {
+            if (clusterSubmitHandler != null) {
+                clusterSubmitHandler.submitCancel(order.getClusterOrderId(), order.getUserId(),
+                        order.getMarketId());
+            }
+        }
+        log.info("Reconcile: re-submitted cancel for {} pending-cancel order(s) after reconnect",
+                toRecancel.size());
+    }
+
     // ==================== Helpers ====================
 
     private void requestCancel(OmsOrder order) {
         if (clusterSubmitHandler != null && order.getClusterOrderId() != 0) {
+            // Mark cancel-intent so the reconcile can re-cancel if this is lost at a switchover seam.
+            order.setCancelRequested(true);
             clusterSubmitHandler.submitCancel(order.getClusterOrderId(), order.getUserId(),
                 order.getMarketId());
         }
