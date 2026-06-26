@@ -34,9 +34,12 @@ public class OmsCoreEngine {
     // egress can be lost at the seam, leaving OMS holding an order it already tried to cancel (oms#21).
     // On reconnect we re-submit cancels for such orders. Deferred so the cluster's egress redelivery
     // settles first. Flag set off-thread (polling) and consumed on the GTD timer thread.
-    private volatile boolean reconcilePending = false;
+    private volatile int reconcileRoundsLeft = 0;
     private volatile long reconcileDueMs = 0;
-    private static final long RECONCILE_DELAY_MS = 3_000;
+    private static final long RECONCILE_DELAY_MS = 3_000;   // initial delay (let egress redelivery settle)
+    private static final long RECONCILE_RETRY_MS = 3_000;   // between retry rounds
+    private static final int RECONCILE_MAX_ROUNDS = 10;     // bound — a re-cancel lost during leader
+                                                            // stabilization is retried until it lands
 
     public OmsCoreEngine(OrderLifecycleManager lifecycleManager, SyntheticOrderEngine syntheticEngine) {
         this.lifecycleManager = lifecycleManager;
@@ -185,10 +188,15 @@ public class OmsCoreEngine {
      */
     public void checkGtdExpiry(long nowMs) {
         // Run a pending post-reconnect reconcile on this timer thread (state mutation off the
-        // polling thread, same as GTD expiry below).
-        if (reconcilePending && nowMs >= reconcileDueMs) {
-            reconcilePending = false;
-            reconcilePendingCancels();
+        // polling thread, same as GTD expiry below). Retries across rounds because a re-cancel can
+        // itself be lost while the just-elected leader is still stabilizing.
+        if (reconcileRoundsLeft > 0 && nowMs >= reconcileDueMs) {
+            int reCancelled = reconcilePendingCancels();
+            reconcileRoundsLeft--;
+            reconcileDueMs = nowMs + RECONCILE_RETRY_MS;
+            if (reCancelled == 0) {
+                reconcileRoundsLeft = 0; // converged — nothing left to reconcile
+            }
         }
 
         // Collect expired GTD orders (cannot modify map during iteration)
@@ -226,8 +234,9 @@ public class OmsCoreEngine {
      */
     public void requestReconcile(long nowMs) {
         reconcileDueMs = nowMs + RECONCILE_DELAY_MS;
-        reconcilePending = true;
-        log.info("Reconcile requested (reconnect/leader change); running in ~{}ms", RECONCILE_DELAY_MS);
+        reconcileRoundsLeft = RECONCILE_MAX_ROUNDS;
+        log.info("Reconcile requested (reconnect/leader change); first round in ~{}ms, up to {} rounds",
+                RECONCILE_DELAY_MS, RECONCILE_MAX_ROUNDS);
     }
 
     /**
@@ -236,7 +245,7 @@ public class OmsCoreEngine {
      * Safe: only touches orders the user/OMS already asked to cancel (never a legitimately-resting
      * order), and the cluster now acks cancels of already-gone orders so the hold releases either way.
      */
-    private void reconcilePendingCancels() {
+    private int reconcilePendingCancels() {
         ArrayList<OmsOrder> toRecancel = new ArrayList<>();
         lifecycleManager.forEachActiveOrder(order -> {
             if (order.isCancelRequested()
@@ -246,15 +255,15 @@ public class OmsCoreEngine {
                 toRecancel.add(order);
             }
         });
-        if (toRecancel.isEmpty()) return;
+        if (toRecancel.isEmpty()) return 0;
         for (OmsOrder order : toRecancel) {
             if (clusterSubmitHandler != null) {
                 clusterSubmitHandler.submitCancel(order.getClusterOrderId(), order.getUserId(),
                         order.getMarketId());
             }
         }
-        log.info("Reconcile: re-submitted cancel for {} pending-cancel order(s) after reconnect",
-                toRecancel.size());
+        log.info("Reconcile: re-submitted cancel for {} pending-cancel order(s)", toRecancel.size());
+        return toRecancel.size();
     }
 
     // ==================== Helpers ====================
