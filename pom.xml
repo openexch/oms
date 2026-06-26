@@ -62,7 +62,7 @@
         <logback.version>1.4.14</logback.version>
 
         <!-- Testing -->
-        <junit.version>6.0.3</junit.version>
+        <junit.version>6.1.0</junit.version>
         <mockito.version>5.23.0</mockito.version>
     </properties>
 
