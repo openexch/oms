@@ -867,6 +867,16 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
         leaderChangeCount++;
         log.info("New leader elected: member={}, term={}, ingress={} (transition window {}ms)",
                 leaderMemberId, leadershipTermId, ingressEndpoints, LEADER_TRANSITION_TIMEOUT_MS);
+
+        // Notify the consumer to reconcile state lost at the switchover seam (e.g. pending cancels).
+        EgressListener listener = egressListener;
+        if (listener != null) {
+            try {
+                listener.onReconnected();
+            } catch (Exception e) {
+                log.error("EgressListener.onReconnected() threw exception", e);
+            }
+        }
     }
 
     // ==================== Shutdown ====================

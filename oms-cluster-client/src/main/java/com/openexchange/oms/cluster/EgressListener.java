@@ -88,4 +88,11 @@ public interface EgressListener {
      * Called when the cluster client loses its connection to the cluster.
      */
     void onDisconnected();
+
+    /**
+     * Called when the cluster session reconnects or the leader changes (switchover). Implementations
+     * should reconcile state that could have been lost at the seam (e.g. re-submit pending cancels).
+     * Default no-op for implementations that don't need it.
+     */
+    default void onReconnected() {}
 }
