@@ -68,12 +68,12 @@ Order management system that sits between trading clients and the [Match Engine]
 | Runtime | Java 21 |
 | Cluster Communication | Aeron Cluster 1.48.1, SBE 1.33.1 |
 | Event Processing | LMAX Disruptor 4.0.0 |
-| HTTP Server | Netty 4.1.100 |
-| gRPC | gRPC Java 1.62.2, Protobuf 3.25.3 |
-| Data Structures | Agrona 2.2.2 (zero-allocation maps) |
-| Persistence | PostgreSQL 42.7.3, HikariCP 5.1.0 |
-| Caching | Lettuce (Redis) 6.3.2 |
-| Serialization | Jackson 2.17.0 |
+| HTTP Server | Netty 4.2 |
+| gRPC | gRPC Java 1.82, Protobuf 4.35 |
+| Data Structures | Agrona 2.4 (zero-allocation maps) |
+| Persistence | PostgreSQL JDBC 42.7, HikariCP 7.1 |
+| Caching | Lettuce (Redis) 7.6 |
+| Serialization | Jackson 2.22 |
 | Build | Maven 3+ |
 
 ## Quick Start
@@ -86,7 +86,14 @@ Order management system that sits between trading clients and the [Match Engine]
 
 ### Build & Run
 
+OMS depends on `com.match:match-common`, which is not published to Maven
+Central; install it into your local repository from a sibling checkout of
+[match](https://github.com/openexch/match) first.
+
 ```bash
+# One-time: install match-common from the match repo
+mvn -f ../match/pom.xml install -DskipTests -pl match-common -am
+
 # Build all modules
 mvn clean package -DskipTests
 
@@ -97,7 +104,18 @@ mvn test
 java -jar oms-app/target/oms-app-1.0-SNAPSHOT.jar
 ```
 
-The OMS starts with sensible defaults — HTTP on port 8080, gRPC on port 9090, in-memory balance store.
+The OMS starts with sensible defaults: HTTP on port 8080, gRPC on port 9090, in-memory balance store.
+
+For durable persistence, create the database and apply the schema before
+starting (the OMS does not auto-migrate; without a reachable PostgreSQL it
+runs in-memory only):
+
+```bash
+createdb -U postgres oms
+psql -U postgres -d oms -v ON_ERROR_STOP=1 \
+  -f oms-persistence/src/main/resources/db/migration/V001__init_schema.sql
+export OMS_POSTGRES_PASSWORD=...   # no default; required for persistence
+```
 
 ## Project Structure
 
