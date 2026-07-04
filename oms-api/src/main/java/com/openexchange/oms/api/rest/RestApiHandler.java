@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.openexchange.oms.api.AdminService;
 import com.openexchange.oms.api.OrderService;
+import com.openexchange.oms.api.audit.AuditLog;
 import com.openexchange.oms.api.auth.Authorizer;
 import com.openexchange.oms.api.auth.HttpAuthHandler;
 import com.openexchange.oms.api.auth.Principal;
@@ -34,24 +35,36 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private static final Logger log = LoggerFactory.getLogger(RestApiHandler.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** FixedPoint.fromDouble saturates around 9.2e10; reject sooner at the edge. */
+    private static final double MAX_MONEY_INPUT = 9e10;
+
     private final OrderService orderService;
     private final AdminService adminService;
     private final Authorizer authorizer;
+    private final CorsPolicy corsPolicy;
+    private final AuditLog auditLog;
+
+    // One request per connection (every response closes); set in channelRead0.
+    private String requestOrigin;
 
     public RestApiHandler(OrderService orderService) {
-        this(orderService, null, new RoleBasedAuthorizer());
+        this(orderService, null, new RoleBasedAuthorizer(), CorsPolicy.fromSpec(""), AuditLog.disabled());
     }
 
-    public RestApiHandler(OrderService orderService, AdminService adminService, Authorizer authorizer) {
+    public RestApiHandler(OrderService orderService, AdminService adminService, Authorizer authorizer,
+                          CorsPolicy corsPolicy, AuditLog auditLog) {
         this.orderService = orderService;
         this.adminService = adminService;
         this.authorizer = authorizer;
+        this.corsPolicy = corsPolicy;
+        this.auditLog = auditLog;
     }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
         String uri = request.uri();
         HttpMethod method = request.method();
+        requestOrigin = request.headers().get(HttpHeaderNames.ORIGIN);
 
         // CORS preflight
         if (method == HttpMethod.OPTIONS) {
@@ -132,6 +145,26 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         return false;
     }
 
+    /** Extract a numeric body field; null when absent or not a number. */
+    private static Double num(Map<String, Object> body, String key) {
+        Object value = body.get(key);
+        return value instanceof Number n ? n.doubleValue() : null;
+    }
+
+    /** Positive, finite, and small enough for FixedPoint — money/quantity edge check. */
+    private static boolean validMoney(double value) {
+        return Double.isFinite(value) && value > 0 && value <= MAX_MONEY_INPUT;
+    }
+
+    /** Zero (= unset) or a valid money value — for optional numeric order fields. */
+    private static boolean validOptionalMoney(double value) {
+        return value == 0 || validMoney(value);
+    }
+
+    private void audit(ChannelHandlerContext ctx, String action, String resource, boolean success, String detail) {
+        auditLog.record(principal(ctx), action, resource, success, detail);
+    }
+
     private void handleHealth(ChannelHandlerContext ctx) throws Exception {
         ObjectNode health = MAPPER.createObjectNode();
         health.put("status", "ok");
@@ -149,16 +182,40 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         Principal p = principal(ctx);
         long userId = p == null ? req.getUserId() : p.resolveUserId(req.getUserId());
         if (!canActAs(ctx, userId)) {
+            audit(ctx, "order.create", "user:" + userId, false, "forbidden");
             sendForbidden(ctx, userId);
             return;
         }
         req.setUserId(userId);
 
+        // Edge validation (oms#37): risk checks ranges downstream, but malformed
+        // input (JSON 1e999 = Infinity, overlong ids) must die at the edge.
+        String invalid = validateCreateOrder(req);
+        if (invalid != null) {
+            audit(ctx, "order.create", "user:" + userId, false, invalid);
+            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST, "{\"error\":\"" + escapeJson(invalid) + "\"}");
+            return;
+        }
+
         CreateOrderResponse resp = orderService.createOrder(req);
 
+        audit(ctx, "order.create", "user:" + userId, resp.isAccepted(),
+                resp.isAccepted() ? "omsOrderId=" + resp.getOmsOrderId() : resp.getRejectReason());
         HttpResponseStatus status = resp.isAccepted()
             ? HttpResponseStatus.CREATED : HttpResponseStatus.BAD_REQUEST;
         sendResponse(ctx, status, MAPPER.writeValueAsString(resp));
+    }
+
+    private static String validateCreateOrder(CreateOrderRequest req) {
+        if (req.getClientOrderId() != null && req.getClientOrderId().length() > 64) {
+            return "clientOrderId too long (max 64)";
+        }
+        if (!validMoney(req.getQuantity())) return "quantity must be a positive finite number";
+        if (!validOptionalMoney(req.getPrice())) return "price must be a positive finite number";
+        if (!validOptionalMoney(req.getStopPrice())) return "stopPrice must be a positive finite number";
+        if (!validOptionalMoney(req.getTrailingDelta())) return "trailingDelta must be a positive finite number";
+        if (!validOptionalMoney(req.getDisplayQuantity())) return "displayQuantity must be a positive finite number";
+        return null;
     }
 
     private void handleCancelOrder(ChannelHandlerContext ctx, String uri) throws Exception {
@@ -166,6 +223,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         long omsOrderId = Long.parseLong(idStr);
         if (deniedOrderAccess(ctx, omsOrderId)) return;
         CancelOrderResponse resp = orderService.cancelOrder(omsOrderId);
+        audit(ctx, "order.cancel", "order:" + omsOrderId, resp.isAccepted(), resp.getMessage());
         sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
     }
 
@@ -176,18 +234,27 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         String body = request.content().toString(StandardCharsets.UTF_8);
         Map<String, Object> params = MAPPER.readValue(body, Map.class);
 
-        double newPrice = params.containsKey("price") ? ((Number) params.get("price")).doubleValue() : 0;
-        double newQuantity = params.containsKey("quantity") ? ((Number) params.get("quantity")).doubleValue() : 0;
+        Double priceParam = num(params, "price");
+        Double quantityParam = num(params, "quantity");
+        double newPrice = priceParam != null ? priceParam : 0;
+        double newQuantity = quantityParam != null ? quantityParam : 0;
 
         if (newPrice <= 0 && newQuantity <= 0) {
             sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
                     "{\"error\":\"At least one of price or quantity must be provided\"}");
             return;
         }
+        if (!validOptionalMoney(newPrice) || !validOptionalMoney(newQuantity)) {
+            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
+                    "{\"error\":\"price/quantity must be positive finite numbers\"}");
+            return;
+        }
 
         Map<String, Object> result = orderService.updateOrder(omsOrderId, newPrice, newQuantity);
-        HttpResponseStatus status = Boolean.TRUE.equals(result.get("accepted"))
-                ? HttpResponseStatus.OK : HttpResponseStatus.BAD_REQUEST;
+        boolean accepted = Boolean.TRUE.equals(result.get("accepted"));
+        audit(ctx, "order.update", "order:" + omsOrderId, accepted,
+                "price=" + newPrice + " quantity=" + newQuantity);
+        HttpResponseStatus status = accepted ? HttpResponseStatus.OK : HttpResponseStatus.BAD_REQUEST;
         sendResponse(ctx, status, MAPPER.writeValueAsString(result));
     }
 
@@ -249,11 +316,21 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         String body = request.content().toString(StandardCharsets.UTF_8);
         Map<String, Object> req = MAPPER.readValue(body, Map.class);
 
-        int assetId = ((Number) req.get("assetId")).intValue();
-        double amount = ((Number) req.get("amount")).doubleValue();
+        Double assetIdParam = num(req, "assetId");
+        Double amountParam = num(req, "amount");
+        if (assetIdParam == null || amountParam == null || !validMoney(amountParam)
+                || assetIdParam != Math.floor(assetIdParam) || assetIdParam < 1 || assetIdParam > 1_000_000) {
+            audit(ctx, "account.deposit", "user:" + userId, false, "invalid input");
+            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
+                    "{\"error\":\"assetId (positive integer) and amount (positive finite number) required\"}");
+            return;
+        }
+        int assetId = assetIdParam.intValue();
+        double amount = amountParam;
         long fpAmount = com.match.domain.FixedPoint.fromDouble(amount);
 
         orderService.deposit(userId, assetId, fpAmount);
+        audit(ctx, "account.deposit", "user:" + userId, true, "assetId=" + assetId + " amount=" + amount);
 
         ObjectNode resp = MAPPER.createObjectNode();
         resp.put("success", true);
@@ -273,12 +350,22 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         String body = request.content().toString(StandardCharsets.UTF_8);
         Map<String, Object> req = MAPPER.readValue(body, Map.class);
 
-        int assetId = ((Number) req.get("assetId")).intValue();
-        double amount = ((Number) req.get("amount")).doubleValue();
+        Double assetIdParam = num(req, "assetId");
+        Double amountParam = num(req, "amount");
+        if (assetIdParam == null || amountParam == null || !validMoney(amountParam)
+                || assetIdParam != Math.floor(assetIdParam) || assetIdParam < 1 || assetIdParam > 1_000_000) {
+            audit(ctx, "account.withdraw", "user:" + userId, false, "invalid input");
+            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
+                    "{\"error\":\"assetId (positive integer) and amount (positive finite number) required\"}");
+            return;
+        }
+        int assetId = assetIdParam.intValue();
+        double amount = amountParam;
         long fpAmount = com.match.domain.FixedPoint.fromDouble(amount);
 
         try {
             orderService.withdraw(userId, assetId, fpAmount);
+            audit(ctx, "account.withdraw", "user:" + userId, true, "assetId=" + assetId + " amount=" + amount);
             ObjectNode resp = MAPPER.createObjectNode();
             resp.put("success", true);
             resp.put("userId", userId);
@@ -286,6 +373,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
             resp.put("amount", amount);
             sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
         } catch (IllegalStateException e) {
+            audit(ctx, "account.withdraw", "user:" + userId, false, e.getMessage());
             sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
                 "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
         }
@@ -339,6 +427,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         Map<String, Object> fields = MAPPER.readValue(body, Map.class);
 
         adminService.updateRiskConfig(marketId, fields);
+        audit(ctx, "admin.risk.update", "market:" + marketId, true, String.valueOf(fields.keySet()));
 
         ObjectNode resp = MAPPER.createObjectNode();
         resp.put("success", true);
@@ -363,9 +452,10 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         } else if ("reset".equals(action)) {
             adminService.resetCircuitBreaker(marketId);
         } else {
-            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST, "{\"error\":\"Unknown action: " + action + "\"}");
+            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST, "{\"error\":\"Unknown action: " + escapeJson(action) + "\"}");
             return;
         }
+        audit(ctx, "admin.circuit-breaker", "market:" + marketId, true, action);
 
         ObjectNode resp = MAPPER.createObjectNode();
         resp.put("success", true);
@@ -380,22 +470,15 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status, content);
         response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json");
         response.headers().set(HttpHeaderNames.CONTENT_LENGTH, bytes.length);
-        addCorsHeaders(response);
+        corsPolicy.apply(requestOrigin, response);
         ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
     }
 
     private void sendCorsPreflightResponse(ChannelHandlerContext ctx) {
         FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.NO_CONTENT);
-        addCorsHeaders(response);
+        corsPolicy.apply(requestOrigin, response);
         response.headers().set(HttpHeaderNames.CONTENT_LENGTH, 0);
         ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
-    }
-
-    private static void addCorsHeaders(FullHttpResponse response) {
-        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_ORIGIN, "*");
-        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, PUT, DELETE, OPTIONS");
-        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, X-API-Key");
-        response.headers().set("Access-Control-Allow-Private-Network", "true");
     }
 
     private static String escapeJson(String s) {

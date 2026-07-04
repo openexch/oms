@@ -245,7 +245,15 @@ All configuration via environment variables with sensible defaults:
 | `OMS_AUTH_MODE` | `api-key` | Auth provider: `api-key`, `jwt`, or `dev` (see below) |
 | `OMS_API_KEYS` | _(empty)_ | Inline API keys: `key:userId[:ROLE1\|ROLE2];...` |
 | `OMS_API_KEYS_FILE` | _(empty)_ | API-key file, one `key:userId[:roles]` entry per line, `#` comments |
-| `OMS_JWT_SECRET` | _(empty)_ | HS256 secret, required when `OMS_AUTH_MODE=jwt` |
+| `OMS_JWT_SECRET` | _(empty)_ | HS256 secret, required when `OMS_AUTH_MODE=jwt` (`_FILE` variant supported) |
+| `OMS_CORS_ORIGINS` | _(empty)_ | CORS allowlist (comma-separated origins, or `*`); empty = no CORS headers |
+| `OMS_AUDIT_LOG` | `oms-audit.log` | Append-only JSONL audit log of order/account/admin mutations; `off` disables |
+
+Note on secrets (oms#37): `OMS_POSTGRES_PASSWORD` has **no default** (the old
+`oms/oms` default is gone — unset means Postgres auth fails and the OMS runs
+without persistence). `OMS_POSTGRES_PASSWORD_FILE` and `OMS_JWT_SECRET_FILE`
+read the value from a file for secret-store integration. TLS terminates at a
+reverse proxy: see `docs/deploy-tls.md`.
 
 ## Authentication & Authorization (oms#36)
 

@@ -53,7 +53,8 @@ class RestApiHandlerAuthTest {
     private EmbeddedChannel channel() {
         return new EmbeddedChannel(
                 new HttpAuthHandler(PROVIDER),
-                new RestApiHandler(orderService, adminService, new RoleBasedAuthorizer()));
+                new RestApiHandler(orderService, adminService, new RoleBasedAuthorizer(),
+                        CorsPolicy.fromSpec(""), com.openexchange.oms.api.audit.AuditLog.disabled()));
     }
 
     private static FullHttpRequest request(HttpMethod method, String uri, String body, String apiKey) {
@@ -83,7 +84,8 @@ class RestApiHandlerAuthTest {
     @Test
     void createOrderDerivesUserIdFromPrincipalWhenAbsent() {
         when(orderService.createOrder(any())).thenReturn(CreateOrderResponse.accepted(1, "NEW"));
-        exchange(request(HttpMethod.POST, "/api/v1/orders", "{\"marketId\":1}", "userA-key"));
+        exchange(request(HttpMethod.POST, "/api/v1/orders",
+                "{\"marketId\":1,\"side\":\"BUY\",\"orderType\":\"LIMIT\",\"price\":100,\"quantity\":1}", "userA-key"));
 
         ArgumentCaptor<CreateOrderRequest> captor = ArgumentCaptor.forClass(CreateOrderRequest.class);
         verify(orderService).createOrder(captor.capture());
