@@ -236,12 +236,30 @@ public class OmsApplication {
 
             @Override
             public void persistExecution(com.openexchange.oms.common.domain.ExecutionReport report) {
-                if (finalExecutionRepo != null) {
+                if (finalExecutionRepo == null) {
+                    return;
+                }
+                try {
+                    finalExecutionRepo.saveExecution(report);
+                } catch (Exception e) {
+                    // FK race (oms#23): an instant crossing fill reaches here
+                    // before the order row's FIRST upsert (order persists ride
+                    // later lifecycle events), so the executions FK fails and
+                    // the GROUND-TRUTH ledger row was silently lost — the
+                    // oms#41 failover E2E measured 232 lost rows in one run.
+                    // Upsert the order row, then retry the execution once.
+                    Exception failure = e;
                     try {
-                        finalExecutionRepo.saveExecution(report);
-                    } catch (Exception e) {
-                        log.error("Failed to persist execution: tradeId={}", report.getTradeId(), e);
+                        OmsOrder order = lifecycleManager.getOrder(report.getOmsOrderId());
+                        if (finalOrderRepo != null && order != null) {
+                            finalOrderRepo.saveOrder(order);
+                            finalExecutionRepo.saveExecution(report);
+                            return;
+                        }
+                    } catch (Exception retry) {
+                        failure = retry;
                     }
+                    log.error("Failed to persist execution: tradeId={}", report.getTradeId(), failure);
                 }
             }
         });
@@ -474,6 +492,11 @@ public class OmsApplication {
                         coreEngine.checkGtdExpiry(System.currentTimeMillis());
                     } catch (Exception e) {
                         log.error("GTD expiry check failed", e);
+                    }
+                    try {
+                        egressAdapter.sweepStaleOrphans(); // oms#41: reconcile lost in-flight orders
+                    } catch (Exception e) {
+                        log.error("Stale-orphan sweep failed", e);
                     }
                 },
                 1, 1, java.util.concurrent.TimeUnit.SECONDS);
