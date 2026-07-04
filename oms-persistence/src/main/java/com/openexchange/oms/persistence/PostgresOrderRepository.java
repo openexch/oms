@@ -65,6 +65,15 @@ public class PostgresOrderRepository {
             ORDER BY created_at DESC LIMIT ? OFFSET ?
             """;
 
+    private static final String SELECT_BY_USER = """
+            SELECT oms_order_id, cluster_order_id, client_order_id, user_id, market_id,
+                side, order_type, time_in_force, price, quantity, filled_qty, remaining_qty,
+                stop_price, trailing_delta, display_quantity, status, reject_reason, hold_amount,
+                expires_at, created_at, updated_at
+            FROM orders WHERE user_id = ?
+            ORDER BY created_at DESC LIMIT ? OFFSET ?
+            """;
+
     private static final String SELECT_OPEN_ORDERS = """
             SELECT oms_order_id, cluster_order_id, client_order_id, user_id, market_id,
                 side, order_type, time_in_force, price, quantity, filled_qty, remaining_qty,
@@ -172,6 +181,26 @@ public class PostgresOrderRepository {
         } catch (SQLException e) {
             log.error("Failed to find orders userId={} status={}", userId, status, e);
             throw new PersistenceException("Failed to find orders by user and status", e);
+        }
+    }
+
+    /**
+     * Returns orders for a user across all statuses, newest first, with
+     * pagination — the order-history read (oms#40).
+     */
+    public List<OmsOrder> findByUser(long userId, int limit, int offset) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(SELECT_BY_USER)) {
+
+            ps.setLong(1, userId);
+            ps.setInt(2, limit);
+            ps.setInt(3, offset);
+
+            return collectOrders(ps);
+
+        } catch (SQLException e) {
+            log.error("Failed to find orders userId={}", userId, e);
+            throw new PersistenceException("Failed to find orders by user", e);
         }
     }
 

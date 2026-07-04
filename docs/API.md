@@ -52,6 +52,7 @@ Every non-2xx response has the shape:
 | 403 | `FORBIDDEN` | Authenticated but not allowed (foreign user, missing ADMIN role) |
 | 404 | `NOT_FOUND` | Unknown route, order, or market. Foreign order ids also return 404 (not probeable) |
 | 503 | `ADMIN_UNAVAILABLE` | Admin subsystem not wired in this deployment |
+| 503 | `UNAVAILABLE` | Required subsystem down (e.g. history reads while running without persistence) |
 | 500 | `INTERNAL` | Unhandled server error |
 
 Order **rejections** are not HTTP errors: `POST /orders` returns
@@ -68,6 +69,21 @@ Known gap: orders rejected by the matching engine itself (off-tick price,
 out-of-range price, book full) currently surface as a terminal `REJECTED`
 status with an **empty** rejectReason — the cluster egress does not carry
 the reason yet (openexch/match#64).
+
+### clientOrderId idempotency
+
+`clientOrderId` (optional, ≤64 chars) is a caller-chosen idempotency key,
+scoped **per user across their ACTIVE orders**:
+
+- A `POST /orders` whose `clientOrderId` matches one of the caller's active
+  orders creates nothing and returns `200` (not `201`) with
+  `duplicate: true` and the existing order's `omsOrderId`/`status`, so a
+  retried request after a lost response is safe.
+- Once that order is terminal (`FILLED`/`CANCELLED`/`REJECTED`/`EXPIRED`),
+  the id may be reused; rejected submissions release it immediately.
+- The dedupe window survives OMS restarts (the index is rebuilt from
+  persisted open orders), but uniqueness is not enforced against terminal
+  history.
 
 ### Market price rules
 
@@ -100,11 +116,14 @@ request/response schemas.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/v1/orders` | Create order → `201` CreateOrderResponse / `400` with rejectReason |
+| `POST` | `/api/v1/orders` | Create order → `201` CreateOrderResponse / `200` `duplicate:true` / `400` with rejectReason |
 | `PUT` | `/api/v1/orders/{omsOrderId}` | Cancel-and-replace price/quantity |
 | `DELETE` | `/api/v1/orders/{omsOrderId}` | Cancel order |
-| `GET` | `/api/v1/orders/{omsOrderId}` | Get order (active orders only) |
-| `GET` | `/api/v1/orders?status=` | Query the principal's ACTIVE orders (full history: oms#40) |
+| `GET` | `/api/v1/orders/{omsOrderId}` | Get order (terminal orders served from persistence) |
+| `GET` | `/api/v1/orders?status=` | Query the principal's ACTIVE orders (a terminal `status=` is served from persistence) |
+| `GET` | `/api/v1/orders/history?status=&limit=&offset=` | Order history, newest first (Postgres; `limit` ≤1000, default 100) |
+| `GET` | `/api/v1/executions?limit=&offset=` | Fill history, newest first (`tradeId`/`omsOrderId` as strings) |
+| `GET` | `/api/v1/positions` | Net base quantity per market, aggregated from executions (signed decimal string) |
 | `GET` | `/api/v1/accounts/{userId}` | Balances (decimal strings) |
 | `POST` | `/api/v1/accounts/{userId}/deposit` | Credit balance (`{assetId, amount}`) |
 | `POST` | `/api/v1/accounts/{userId}/withdraw` | Debit balance; `400 REJECTED` when exceeding available |
@@ -128,10 +147,11 @@ Channels `executions`/`balances` are declared but not yet pushed.
 
 ## gRPC (`:9090`)
 
-`OrderService`: CreateOrder, CancelOrder, GetOrder, StreamOrders,
-StreamExecutions. `AccountService`: GetBalances, StreamBalances. Money =
-decimal strings, ids = int64, auth via metadata `authorization: Bearer ...`.
-See `oms_services.proto`.
+`OrderService`: CreateOrder, CancelOrder, GetOrder, GetOrderHistory,
+GetTrades, StreamOrders, StreamExecutions. `AccountService`: GetBalances,
+StreamBalances. Money = decimal strings, ids = int64, auth via metadata
+`authorization: Bearer ...`. History RPCs return `UNAVAILABLE` when the OMS
+runs without persistence. See `oms_services.proto`.
 
 ## Market-data plane (match-gateway, `ws://:8081/ws`)
 

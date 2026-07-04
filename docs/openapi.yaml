@@ -46,6 +46,14 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/CreateOrderResponse" }
+        "200":
+          description: >
+            clientOrderId already names one of the caller's active orders:
+            nothing created; body carries duplicate=true and the existing
+            order's omsOrderId/status (oms#40)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateOrderResponse" }
         "400":
           description: Rejected (business) or invalid input
           content:
@@ -56,6 +64,7 @@ paths:
                   - $ref: "#/components/schemas/Error"
     get:
       summary: Query the principal's ACTIVE orders
+      description: A terminal status= filter is served from persistence (oms#40)
       parameters:
         - name: status
           in: query
@@ -66,12 +75,81 @@ paths:
           schema: { type: integer, format: int64 }
       responses:
         "200":
-          description: Active orders (full history is oms#40)
+          description: Matching orders
           content:
             application/json:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/OrderResponse" }
+  /api/v1/orders/history:
+    get:
+      summary: Order history, newest first (Postgres-backed, survives restarts)
+      parameters:
+        - name: status
+          in: query
+          description: Filter to one status; absent = all
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 1000 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+        - name: userId
+          in: query
+          description: Only honored when the principal may act as this user
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/OrderResponse" }
+        "400": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/v1/executions:
+    get:
+      summary: Execution (fill) history, newest first
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 1000 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+        - name: userId
+          in: query
+          description: Only honored when the principal may act as this user
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Executions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ExecutionResponse" }
+        "400": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /api/v1/positions:
+    get:
+      summary: Net position per market, aggregated from the executions ledger
+      parameters:
+        - name: userId
+          in: query
+          description: Only honored when the principal may act as this user
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Non-zero net positions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PositionResponse" }
+        "503": { $ref: "#/components/responses/Unavailable" }
   /api/v1/orders/{omsOrderId}:
     parameters:
       - name: omsOrderId
@@ -79,7 +157,7 @@ paths:
         required: true
         schema: { $ref: "#/components/schemas/Id" }
     get:
-      summary: Get order (active orders only)
+      summary: Get order (terminal orders served from persistence)
       responses:
         "200":
           description: Order
@@ -240,6 +318,11 @@ components:
           type: string
           nullable: true
           description: One of the fixed vocabulary in docs/API.md when accepted=false
+        duplicate:
+          type: boolean
+          description: >
+            True when clientOrderId already named an active order (oms#40);
+            omsOrderId/status describe the existing order
     OrderResponse:
       type: object
       properties:
@@ -256,10 +339,32 @@ components:
         filledQty: { $ref: "#/components/schemas/Money" }
         remainingQty: { $ref: "#/components/schemas/Money" }
         stopPrice: { $ref: "#/components/schemas/Money" }
-        status: { type: string, enum: [PENDING_RISK, PENDING_HOLD, PENDING_NEW, PENDING_TRIGGER, NEW, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED] }
+        status: { type: string, enum: [PENDING_RISK, PENDING_HOLD, PENDING_NEW, PENDING_TRIGGER, NEW, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED, EXPIRED] }
         rejectReason: { type: string, nullable: true }
         createdAtMs: { type: integer, format: int64 }
         updatedAtMs: { type: integer, format: int64 }
+    ExecutionResponse:
+      type: object
+      properties:
+        tradeId: { $ref: "#/components/schemas/Id" }
+        omsOrderId: { $ref: "#/components/schemas/Id" }
+        userId: { type: integer, format: int64 }
+        marketId: { type: integer }
+        side: { type: string, enum: [BUY, SELL] }
+        price: { $ref: "#/components/schemas/Money" }
+        quantity: { $ref: "#/components/schemas/Money" }
+        maker: { type: boolean }
+        executedAtMs: { type: integer, format: int64 }
+    PositionResponse:
+      type: object
+      properties:
+        userId: { type: integer, format: int64 }
+        marketId: { type: integer }
+        netQuantity:
+          type: string
+          pattern: '^-?\d+(\.\d{1,8})?$'
+          description: Signed exact decimal; negative means net sold
+          example: "-0.10000000"
     MoneyMovement:
       type: object
       required: [assetId, amount]
@@ -273,7 +378,7 @@ components:
         error: { type: string }
         code:
           type: string
-          enum: [VALIDATION, UNAUTHORIZED, FORBIDDEN, NOT_FOUND, REJECTED, ADMIN_UNAVAILABLE, INTERNAL]
+          enum: [VALIDATION, UNAUTHORIZED, FORBIDDEN, NOT_FOUND, REJECTED, ADMIN_UNAVAILABLE, UNAVAILABLE, INTERNAL]
   responses:
     Validation:
       description: Invalid input
@@ -287,6 +392,11 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
     NotFound:
       description: Not found (includes foreign order ids — not probeable)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unavailable:
+      description: OMS is running without persistence; history reads unavailable
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }

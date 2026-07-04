@@ -71,6 +71,19 @@ class RestApiHandlerValidationTest {
     }
 
     @Test
+    void depositAcceptsAssetIdZeroUsd() {
+        // Asset ids are 0-based (USD=0); the oms#37 lower bound of 1 broke
+        // USD deposits until oms#40. Negative stays rejected.
+        assertEquals(HttpResponseStatus.OK,
+                exchange(HttpMethod.POST, "/api/v1/accounts/1/deposit",
+                        "{\"assetId\":0,\"amount\":\"100\"}").status());
+        verify(orderService).deposit(1L, 0, 10_000_000_000L);
+        assertEquals(HttpResponseStatus.BAD_REQUEST,
+                exchange(HttpMethod.POST, "/api/v1/accounts/1/deposit",
+                        "{\"assetId\":-1,\"amount\":\"100\"}").status());
+    }
+
+    @Test
     void withdrawRejectsFractionalAssetId() {
         assertEquals(HttpResponseStatus.BAD_REQUEST,
                 exchange(HttpMethod.POST, "/api/v1/accounts/1/withdraw",

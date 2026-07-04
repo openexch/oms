@@ -26,6 +26,17 @@ public class OrderLifecycleManager {
     // Index by clusterOrderId for egress correlation
     private final Long2ObjectHashMap<OmsOrder> byClusterOrderId = new Long2ObjectHashMap<>();
 
+    // clientOrderId idempotency index (oms#40): "<userId>:<clientOrderId>" →
+    // omsOrderId, ACTIVE orders only (entries leave with removeOrder, so a
+    // clientOrderId becomes reusable once its order is terminal). Concurrent:
+    // the duplicate check runs on Netty I/O threads before registration.
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> byClientOrderId =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static String clientKey(long userId, String clientOrderId) {
+        return userId + ":" + clientOrderId;
+    }
+
     // Listener for state transitions
     private OrderStateListener stateListener;
 
@@ -40,6 +51,7 @@ public class OrderLifecycleManager {
         order.setStatus(OmsOrderStatus.PENDING_RISK);
         order.setCreatedAtMs(System.currentTimeMillis());
         activeOrders.put(order.getOmsOrderId(), order);
+        indexClientOrderId(order);
         log.debug("Order registered: omsOrderId={}, type={}, side={}",
             order.getOmsOrderId(), order.getOrderType(), order.getSide());
     }
@@ -53,6 +65,30 @@ public class OrderLifecycleManager {
         activeOrders.put(order.getOmsOrderId(), order);
         if (order.getClusterOrderId() != 0) {
             byClusterOrderId.put(order.getClusterOrderId(), order);
+        }
+        indexClientOrderId(order);
+    }
+
+    /**
+     * The omsOrderId of the caller's ACTIVE order carrying this clientOrderId,
+     * or 0 when none — the idempotency lookup (oms#40).
+     */
+    public long findActiveByClientOrderId(long userId, String clientOrderId) {
+        Long omsOrderId = byClientOrderId.get(clientKey(userId, clientOrderId));
+        return omsOrderId != null ? omsOrderId : 0;
+    }
+
+    private void indexClientOrderId(OmsOrder order) {
+        if (order.getClientOrderId() == null || order.getClientOrderId().isEmpty()) {
+            return;
+        }
+        Long prior = byClientOrderId.putIfAbsent(
+                clientKey(order.getUserId(), order.getClientOrderId()), order.getOmsOrderId());
+        if (prior != null && prior != order.getOmsOrderId()) {
+            // Lost the race with a concurrent submit that passed the duplicate
+            // check in the same window; keep the first claim (best-effort dedupe).
+            log.warn("clientOrderId collision: userId={} clientOrderId={} kept omsOrderId={} dropped {}",
+                    order.getUserId(), order.getClientOrderId(), prior, order.getOmsOrderId());
         }
     }
 
@@ -267,6 +303,12 @@ public class OrderLifecycleManager {
         OmsOrder removed = activeOrders.remove(omsOrderId);
         if (removed != null && removed.getClusterOrderId() != 0) {
             byClusterOrderId.remove(removed.getClusterOrderId());
+        }
+        if (removed != null && removed.getClientOrderId() != null && !removed.getClientOrderId().isEmpty()) {
+            // Value-guarded: never evict a mapping this order lost to a
+            // collision (see indexClientOrderId).
+            byClientOrderId.remove(
+                    clientKey(removed.getUserId(), removed.getClientOrderId()), removed.getOmsOrderId());
         }
     }
 }

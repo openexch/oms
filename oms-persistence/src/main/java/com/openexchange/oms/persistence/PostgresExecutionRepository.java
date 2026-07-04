@@ -44,6 +44,15 @@ public class PostgresExecutionRepository {
             HAVING SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) <> 0
             """;
 
+    private static final String AGGREGATE_POSITIONS_FOR_USER = """
+            SELECT user_id, market_id,
+                   SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) AS net_quantity
+            FROM executions
+            WHERE user_id = ?
+            GROUP BY user_id, market_id
+            HAVING SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) <> 0
+            """;
+
     private final HikariDataSource dataSource;
 
     public PostgresExecutionRepository(HikariDataSource dataSource) {
@@ -154,6 +163,30 @@ public class PostgresExecutionRepository {
         } catch (SQLException e) {
             log.error("Failed to aggregate positions from executions", e);
             throw new PersistenceException("Failed to aggregate positions", e);
+        }
+    }
+
+    /**
+     * Net position per market for one user, replayed from the executions
+     * ledger — the positions history read (oms#40). Zero nets are omitted.
+     */
+    public List<PositionAggregate> aggregatePositionsForUser(long userId) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(AGGREGATE_POSITIONS_FOR_USER)) {
+
+            ps.setLong(1, userId);
+            try (ResultSet rs = ps.executeQuery()) {
+                List<PositionAggregate> results = new ArrayList<>();
+                while (rs.next()) {
+                    results.add(new PositionAggregate(
+                            rs.getLong("user_id"), rs.getInt("market_id"), rs.getLong("net_quantity")));
+                }
+                return results;
+            }
+
+        } catch (SQLException e) {
+            log.error("Failed to aggregate positions for userId={}", userId, e);
+            throw new PersistenceException("Failed to aggregate positions for user", e);
         }
     }
 

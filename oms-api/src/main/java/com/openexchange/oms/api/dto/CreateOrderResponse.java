@@ -14,12 +14,21 @@ public class CreateOrderResponse {
     private long omsOrderId;
     private String status;
     private String rejectReason;
+    // True when this clientOrderId already names an active order (oms#40):
+    // no new order was created; omsOrderId/status describe the existing one.
+    private boolean duplicate;
 
     public static CreateOrderResponse accepted(long omsOrderId, String status) {
         CreateOrderResponse r = new CreateOrderResponse();
         r.accepted = true;
         r.omsOrderId = omsOrderId;
         r.status = status;
+        return r;
+    }
+
+    public static CreateOrderResponse duplicate(long omsOrderId, String status) {
+        CreateOrderResponse r = accepted(omsOrderId, status);
+        r.duplicate = true;
         return r;
     }
 
@@ -42,4 +51,7 @@ public class CreateOrderResponse {
 
     public String getRejectReason() { return rejectReason; }
     public void setRejectReason(String rejectReason) { this.rejectReason = rejectReason; }
+
+    public boolean isDuplicate() { return duplicate; }
+    public void setDuplicate(boolean duplicate) { this.duplicate = duplicate; }
 }

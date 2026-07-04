@@ -189,6 +189,113 @@ class OmsOrderServiceImplTest {
         assertEquals("Invalid marketId", resp.getRejectReason());
     }
 
+    // ---- clientOrderId idempotency (oms#40) ----
+
+    @Test
+    void testDuplicateClientOrderIdReturnsExistingOrder() {
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        CreateOrderRequest req = createLimitBuyRequest(1L, 1, 50000.0, 1.0);
+        req.setClientOrderId("my-order-1");
+        CreateOrderResponse first = orderService.createOrder(req);
+        assertTrue(first.isAccepted());
+        assertFalse(first.isDuplicate());
+
+        CreateOrderRequest retry = createLimitBuyRequest(1L, 1, 50000.0, 1.0);
+        retry.setClientOrderId("my-order-1");
+        CreateOrderResponse second = orderService.createOrder(retry);
+
+        assertTrue(second.isAccepted());
+        assertTrue(second.isDuplicate(), "retry with same clientOrderId must not create a new order");
+        assertEquals(first.getOmsOrderId(), second.getOmsOrderId());
+        verify(clusterClient, times(1)).submitOrder(any(OrderSubmission.class));
+    }
+
+    @Test
+    void testClientOrderIdReusableAfterTerminal() {
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        CreateOrderRequest req = createLimitBuyRequest(1L, 1, 50000.0, 1.0);
+        req.setClientOrderId("my-order-2");
+        CreateOrderResponse first = orderService.createOrder(req);
+        assertTrue(first.isAccepted());
+
+        // Cluster cancels the order → terminal → the id is free again
+        coreEngine.getLifecycleManager().onClusterOrderStatus(
+                first.getOmsOrderId(), 12345L, 3, 0L, 0L);
+
+        CreateOrderRequest again = createLimitBuyRequest(1L, 1, 50000.0, 1.0);
+        again.setClientOrderId("my-order-2");
+        CreateOrderResponse second = orderService.createOrder(again);
+
+        assertTrue(second.isAccepted());
+        assertFalse(second.isDuplicate(), "terminal order releases its clientOrderId");
+        assertNotEquals(first.getOmsOrderId(), second.getOmsOrderId());
+    }
+
+    @Test
+    void testClientOrderIdScopedPerUser() {
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+        balanceStore.deposit(2L, 0, FixedPoint.fromDouble(1000000.0));
+
+        CreateOrderRequest u1 = createLimitBuyRequest(1L, 1, 50000.0, 1.0);
+        u1.setClientOrderId("shared-id");
+        CreateOrderRequest u2 = createLimitBuyRequest(2L, 1, 50000.0, 1.0);
+        u2.setClientOrderId("shared-id");
+
+        CreateOrderResponse r1 = orderService.createOrder(u1);
+        CreateOrderResponse r2 = orderService.createOrder(u2);
+
+        assertTrue(r1.isAccepted());
+        assertTrue(r2.isAccepted());
+        assertFalse(r2.isDuplicate(), "clientOrderId namespace is per-user");
+        assertNotEquals(r1.getOmsOrderId(), r2.getOmsOrderId());
+    }
+
+    @Test
+    void testRejectedOrderReleasesClientOrderId() {
+        // First attempt fails on balance (no deposit yet)
+        CreateOrderRequest req = createLimitBuyRequest(1L, 1, 50000.0, 1.0);
+        req.setClientOrderId("retry-after-reject");
+        CreateOrderResponse rejected = orderService.createOrder(req);
+        assertFalse(rejected.isAccepted());
+
+        // Funded retry with the same id must go through as a NEW order
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+        CreateOrderRequest retry = createLimitBuyRequest(1L, 1, 50000.0, 1.0);
+        retry.setClientOrderId("retry-after-reject");
+        CreateOrderResponse accepted = orderService.createOrder(retry);
+
+        assertTrue(accepted.isAccepted());
+        assertFalse(accepted.isDuplicate());
+    }
+
+    @Test
+    void testOverlongClientOrderIdRejected() {
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+        CreateOrderRequest req = createLimitBuyRequest(1L, 1, 50000.0, 1.0);
+        req.setClientOrderId("x".repeat(65));
+        CreateOrderResponse resp = orderService.createOrder(req);
+        assertFalse(resp.isAccepted());
+        verify(clusterClient, never()).submitOrder(any());
+    }
+
+    // ---- history reads without persistence (oms#40) ----
+
+    @Test
+    void testHistoryUnavailableWithoutPersistence() {
+        assertThrows(IllegalStateException.class, () -> orderService.getOrderHistory(1L, null, 100, 0));
+        assertThrows(IllegalStateException.class, () -> orderService.getExecutions(1L, 100, 0));
+        assertThrows(IllegalStateException.class, () -> orderService.getPositions(1L));
+    }
+
+    @Test
+    void testQueryOrdersTerminalStatusWithoutPersistenceIsEmpty() {
+        // Terminal statuses never live in the active map; without Postgres the
+        // query degrades to the pre-oms#40 behavior (empty), not an error.
+        assertTrue(orderService.queryOrders(1L, "FILLED").isEmpty());
+    }
+
     private CreateOrderRequest createLimitBuyRequest(long userId, int marketId, double price, double qty) {
         CreateOrderRequest req = new CreateOrderRequest();
         req.setUserId(userId);

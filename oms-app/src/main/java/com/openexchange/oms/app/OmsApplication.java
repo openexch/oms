@@ -374,6 +374,7 @@ public class OmsApplication {
                 coreEngine, riskEngine, ledgerService, clusterClient,
                 balanceStore, egressAdapter, idGenerator, marketDataProvider);
         orderServiceImpl.setMeterRegistry(meterRegistry);
+        orderServiceImpl.setRepositories(orderRepo, executionRepo); // history reads (oms#40)
         OrderService orderService = orderServiceImpl;
 
         // 12b. Operational gauges (oms#38)
