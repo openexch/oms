@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package com.openexchange.oms.app;
 
 import com.match.infrastructure.generated.BookDeltaDecoder;

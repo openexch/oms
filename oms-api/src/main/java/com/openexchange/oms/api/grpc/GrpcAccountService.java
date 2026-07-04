@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package com.openexchange.oms.api.grpc;
 
 import com.openexchange.oms.api.OrderService;

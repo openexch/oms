@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package com.openexchange.oms.core;
 
 import com.match.domain.FixedPoint;
