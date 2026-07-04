@@ -55,9 +55,9 @@ public class GrpcAccountService extends AccountServiceGrpc.AccountServiceImplBas
                         builder.addAssets(AssetBalance.newBuilder()
                                 .setAsset(String.valueOf(assetMap.get("asset")))
                                 .setAssetId(((Number) assetMap.get("assetId")).intValue())
-                                .setAvailable(((Number) assetMap.get("available")).doubleValue())
-                                .setLocked(((Number) assetMap.get("locked")).doubleValue())
-                                .setTotal(((Number) assetMap.get("total")).doubleValue())
+                                .setAvailable(String.valueOf(assetMap.get("available")))
+                                .setLocked(String.valueOf(assetMap.get("locked")))
+                                .setTotal(String.valueOf(assetMap.get("total")))
                                 .build());
                     }
                 }

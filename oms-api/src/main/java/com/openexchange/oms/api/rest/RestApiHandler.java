@@ -38,8 +38,19 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private static final Logger log = LoggerFactory.getLogger(RestApiHandler.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** FixedPoint.fromDouble saturates around 9.2e10; reject sooner at the edge. */
-    private static final double MAX_MONEY_INPUT = 9e10;
+    /** Money bound: 9e10 units in 8-dp fixed-point; the representable ceiling is ~9.22e10. */
+    private static final long MAX_MONEY_FP = 9_000_000_000_000_000_000L;
+
+    // Machine-readable error codes — the frozen error contract (oms#39):
+    // every non-2xx body is {"error": <human text>, "code": <one of these>}.
+    // Business rejections additionally carry rejectReason (RiskRejectReason).
+    static final String ERR_VALIDATION = "VALIDATION";
+    static final String ERR_UNAUTHORIZED = "UNAUTHORIZED";
+    static final String ERR_FORBIDDEN = "FORBIDDEN";
+    static final String ERR_NOT_FOUND = "NOT_FOUND";
+    static final String ERR_REJECTED = "REJECTED";
+    static final String ERR_ADMIN_UNAVAILABLE = "ADMIN_UNAVAILABLE";
+    static final String ERR_INTERNAL = "INTERNAL";
 
     private final OrderService orderService;
     private final AdminService adminService;
@@ -120,7 +131,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
             } else if (uri.startsWith("/api/v1/admin/")) {
                 Principal principal = principal(ctx);
                 if (principal == null || !authorizer.allow(principal, Authorizer.ACTION_ADMIN, method + " " + uri)) {
-                    sendResponse(ctx, HttpResponseStatus.FORBIDDEN, "{\"error\":\"Admin role required\"}");
+                    sendError(ctx, HttpResponseStatus.FORBIDDEN, ERR_FORBIDDEN, "Admin role required");
                 } else if (uri.startsWith("/api/v1/admin/risk/circuit-breaker/") && method == HttpMethod.POST) {
                     handleCircuitBreaker(ctx, uri);
                 } else if (uri.startsWith("/api/v1/admin/risk/config/") && method == HttpMethod.PUT) {
@@ -128,15 +139,14 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
                 } else if (uri.startsWith("/api/v1/admin/risk/config") && method == HttpMethod.GET) {
                     handleGetRiskConfig(ctx, uri);
                 } else {
-                    sendResponse(ctx, HttpResponseStatus.NOT_FOUND, "{\"error\":\"Not Found\"}");
+                    sendError(ctx, HttpResponseStatus.NOT_FOUND, ERR_NOT_FOUND, "Not Found");
                 }
             } else {
-                sendResponse(ctx, HttpResponseStatus.NOT_FOUND, "{\"error\":\"Not Found\"}");
+                sendError(ctx, HttpResponseStatus.NOT_FOUND, ERR_NOT_FOUND, "Not Found");
             }
         } catch (Exception e) {
             log.error("Error handling request: {} {}", method, uri, e);
-            sendResponse(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR,
-                "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
+            sendError(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, ERR_INTERNAL, e.getMessage());
         }
     }
 
@@ -187,8 +197,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     }
 
     private void sendForbidden(ChannelHandlerContext ctx, long userId) {
-        sendResponse(ctx, HttpResponseStatus.FORBIDDEN,
-                "{\"error\":\"Forbidden: cannot act as user " + userId + "\"}");
+        sendError(ctx, HttpResponseStatus.FORBIDDEN, ERR_FORBIDDEN, "Forbidden: cannot act as user " + userId);
     }
 
     /**
@@ -199,25 +208,48 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private boolean deniedOrderAccess(ChannelHandlerContext ctx, long omsOrderId) {
         OrderResponse existing = orderService.getOrder(omsOrderId);
         if (existing != null && !canActAs(ctx, existing.getUserId())) {
-            sendResponse(ctx, HttpResponseStatus.NOT_FOUND, "{\"error\":\"Order not found\"}");
+            sendError(ctx, HttpResponseStatus.NOT_FOUND, ERR_NOT_FOUND, "Order not found");
             return true;
         }
         return false;
     }
 
-    /** Extract a numeric body field; null when absent or not a number. */
-    private static Double num(Map<String, Object> body, String key) {
-        Object value = body.get(key);
-        return value instanceof Number n ? n.doubleValue() : null;
+    /**
+     * Extract a money field from a JSON body as 8-dp fixed-point (oms#39):
+     * decimal STRING = canonical, exact; JSON number = deprecated legacy path
+     * (rounded via the double). Returns null when absent or JSON null.
+     *
+     * @throws IllegalArgumentException on a malformed or out-of-range value
+     */
+    private static Long money(com.fasterxml.jackson.databind.JsonNode body, String key) {
+        com.fasterxml.jackson.databind.JsonNode node = body.get(key);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (node.isTextual()) {
+            try {
+                return com.match.domain.FixedPoint.parse(node.textValue());
+            } catch (NumberFormatException | com.match.domain.FixedPoint.OverflowException e) {
+                throw new IllegalArgumentException(key + " must be a decimal string with at most 8 fractional digits");
+            }
+        }
+        if (node.isNumber()) {
+            double d = node.doubleValue();
+            if (!Double.isFinite(d)) {
+                throw new IllegalArgumentException(key + " must be finite");
+            }
+            return com.match.domain.FixedPoint.fromDouble(d);
+        }
+        throw new IllegalArgumentException(key + " must be a decimal string");
     }
 
-    /** Positive, finite, and small enough for FixedPoint — money/quantity edge check. */
-    private static boolean validMoney(double value) {
-        return Double.isFinite(value) && value > 0 && value <= MAX_MONEY_INPUT;
+    /** Positive and inside the money bound — fixed-point edge check. */
+    private static boolean validMoney(long value) {
+        return value > 0 && value <= MAX_MONEY_FP;
     }
 
-    /** Zero (= unset) or a valid money value — for optional numeric order fields. */
-    private static boolean validOptionalMoney(double value) {
+    /** Zero (= unset) or a valid money value — for optional order fields. */
+    private static boolean validOptionalMoney(long value) {
         return value == 0 || validMoney(value);
     }
 
@@ -235,7 +267,14 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
 
     private void handleCreateOrder(ChannelHandlerContext ctx, FullHttpRequest request) throws Exception {
         String body = request.content().toString(StandardCharsets.UTF_8);
-        CreateOrderRequest req = MAPPER.readValue(body, CreateOrderRequest.class);
+        CreateOrderRequest req;
+        try {
+            req = MAPPER.readValue(body, CreateOrderRequest.class);
+        } catch (java.io.IOException e) {
+            // Malformed JSON or a bad money string from FixedPointJson: caller error
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, rootMessage(e));
+            return;
+        }
 
         // Identity comes from the principal; a caller-supplied userId is only
         // honored when the principal may act as that user (0 = unspecified).
@@ -253,7 +292,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         String invalid = validateCreateOrder(req);
         if (invalid != null) {
             audit(ctx, "order.create", "user:" + userId, false, invalid);
-            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST, "{\"error\":\"" + escapeJson(invalid) + "\"}");
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, invalid);
             return;
         }
 
@@ -279,11 +318,11 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         if (req.getClientOrderId() != null && req.getClientOrderId().length() > 64) {
             return "clientOrderId too long (max 64)";
         }
-        if (!validMoney(req.getQuantity())) return "quantity must be a positive finite number";
-        if (!validOptionalMoney(req.getPrice())) return "price must be a positive finite number";
-        if (!validOptionalMoney(req.getStopPrice())) return "stopPrice must be a positive finite number";
-        if (!validOptionalMoney(req.getTrailingDelta())) return "trailingDelta must be a positive finite number";
-        if (!validOptionalMoney(req.getDisplayQuantity())) return "displayQuantity must be a positive finite number";
+        if (!validMoney(req.getQuantity())) return "quantity must be a positive decimal";
+        if (!validOptionalMoney(req.getPrice())) return "price must be a positive decimal";
+        if (!validOptionalMoney(req.getStopPrice())) return "stopPrice must be a positive decimal";
+        if (!validOptionalMoney(req.getTrailingDelta())) return "trailingDelta must be a positive decimal";
+        if (!validOptionalMoney(req.getDisplayQuantity())) return "displayQuantity must be a positive decimal";
         return null;
     }
 
@@ -301,28 +340,35 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         long omsOrderId = Long.parseLong(idStr);
         if (deniedOrderAccess(ctx, omsOrderId)) return;
         String body = request.content().toString(StandardCharsets.UTF_8);
-        Map<String, Object> params = MAPPER.readValue(body, Map.class);
-
-        Double priceParam = num(params, "price");
-        Double quantityParam = num(params, "quantity");
-        double newPrice = priceParam != null ? priceParam : 0;
-        double newQuantity = quantityParam != null ? quantityParam : 0;
+        long newPrice;
+        long newQuantity;
+        try {
+            com.fasterxml.jackson.databind.JsonNode params = MAPPER.readTree(body);
+            Long priceParam = money(params, "price");
+            Long quantityParam = money(params, "quantity");
+            newPrice = priceParam != null ? priceParam : 0;
+            newQuantity = quantityParam != null ? quantityParam : 0;
+        } catch (IllegalArgumentException | java.io.IOException e) {
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, rootMessage(e));
+            return;
+        }
 
         if (newPrice <= 0 && newQuantity <= 0) {
-            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
-                    "{\"error\":\"At least one of price or quantity must be provided\"}");
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION,
+                    "At least one of price or quantity must be provided");
             return;
         }
         if (!validOptionalMoney(newPrice) || !validOptionalMoney(newQuantity)) {
-            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
-                    "{\"error\":\"price/quantity must be positive finite numbers\"}");
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION,
+                    "price/quantity must be positive decimals");
             return;
         }
 
         Map<String, Object> result = orderService.updateOrder(omsOrderId, newPrice, newQuantity);
         boolean accepted = Boolean.TRUE.equals(result.get("accepted"));
         audit(ctx, "order.update", "order:" + omsOrderId, accepted,
-                "price=" + newPrice + " quantity=" + newQuantity);
+                "price=" + com.match.domain.FixedPoint.format(newPrice)
+                + " quantity=" + com.match.domain.FixedPoint.format(newQuantity));
         HttpResponseStatus status = accepted ? HttpResponseStatus.OK : HttpResponseStatus.BAD_REQUEST;
         sendResponse(ctx, status, MAPPER.writeValueAsString(result));
     }
@@ -332,7 +378,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         long omsOrderId = Long.parseLong(idStr);
         OrderResponse resp = orderService.getOrder(omsOrderId);
         if (resp == null || !canActAs(ctx, resp.getUserId())) {
-            sendResponse(ctx, HttpResponseStatus.NOT_FOUND, "{\"error\":\"Order not found\"}");
+            sendError(ctx, HttpResponseStatus.NOT_FOUND, ERR_NOT_FOUND, "Order not found");
         } else {
             sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
         }
@@ -347,7 +393,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
 
         Principal p = principal(ctx);
         if (userIdStr == null && p == null) {
-            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST, "{\"error\":\"userId required\"}");
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, "userId required");
             return;
         }
 
@@ -375,77 +421,85 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(balances));
     }
 
-    @SuppressWarnings("unchecked")
     private void handleDeposit(ChannelHandlerContext ctx, String uri, FullHttpRequest request) throws Exception {
         long userId = extractAccountUserId(uri);
         if (!canActAs(ctx, userId)) {
             sendForbidden(ctx, userId);
             return;
         }
-        String body = request.content().toString(StandardCharsets.UTF_8);
-        Map<String, Object> req = MAPPER.readValue(body, Map.class);
-
-        Double assetIdParam = num(req, "assetId");
-        Double amountParam = num(req, "amount");
-        if (assetIdParam == null || amountParam == null || !validMoney(amountParam)
-                || assetIdParam != Math.floor(assetIdParam) || assetIdParam < 1 || assetIdParam > 1_000_000) {
-            audit(ctx, "account.deposit", "user:" + userId, false, "invalid input");
-            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
-                    "{\"error\":\"assetId (positive integer) and amount (positive finite number) required\"}");
+        long[] parsed = parseAssetAmount(ctx, request, "account.deposit", userId);
+        if (parsed == null) {
             return;
         }
-        int assetId = assetIdParam.intValue();
-        double amount = amountParam;
-        long fpAmount = com.match.domain.FixedPoint.fromDouble(amount);
+        int assetId = (int) parsed[0];
+        long fpAmount = parsed[1];
 
         orderService.deposit(userId, assetId, fpAmount);
-        audit(ctx, "account.deposit", "user:" + userId, true, "assetId=" + assetId + " amount=" + amount);
-
-        ObjectNode resp = MAPPER.createObjectNode();
-        resp.put("success", true);
-        resp.put("userId", userId);
-        resp.put("assetId", assetId);
-        resp.put("amount", amount);
-        sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
+        String amountStr = com.match.domain.FixedPoint.format(fpAmount);
+        audit(ctx, "account.deposit", "user:" + userId, true, "assetId=" + assetId + " amount=" + amountStr);
+        sendResponse(ctx, HttpResponseStatus.OK,
+                MAPPER.writeValueAsString(moneyMovementResponse(userId, assetId, amountStr)));
     }
 
-    @SuppressWarnings("unchecked")
     private void handleWithdraw(ChannelHandlerContext ctx, String uri, FullHttpRequest request) throws Exception {
         long userId = extractAccountUserId(uri);
         if (!canActAs(ctx, userId)) {
             sendForbidden(ctx, userId);
             return;
         }
-        String body = request.content().toString(StandardCharsets.UTF_8);
-        Map<String, Object> req = MAPPER.readValue(body, Map.class);
-
-        Double assetIdParam = num(req, "assetId");
-        Double amountParam = num(req, "amount");
-        if (assetIdParam == null || amountParam == null || !validMoney(amountParam)
-                || assetIdParam != Math.floor(assetIdParam) || assetIdParam < 1 || assetIdParam > 1_000_000) {
-            audit(ctx, "account.withdraw", "user:" + userId, false, "invalid input");
-            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
-                    "{\"error\":\"assetId (positive integer) and amount (positive finite number) required\"}");
+        long[] parsed = parseAssetAmount(ctx, request, "account.withdraw", userId);
+        if (parsed == null) {
             return;
         }
-        int assetId = assetIdParam.intValue();
-        double amount = amountParam;
-        long fpAmount = com.match.domain.FixedPoint.fromDouble(amount);
+        int assetId = (int) parsed[0];
+        long fpAmount = parsed[1];
+        String amountStr = com.match.domain.FixedPoint.format(fpAmount);
 
         try {
             orderService.withdraw(userId, assetId, fpAmount);
-            audit(ctx, "account.withdraw", "user:" + userId, true, "assetId=" + assetId + " amount=" + amount);
-            ObjectNode resp = MAPPER.createObjectNode();
-            resp.put("success", true);
-            resp.put("userId", userId);
-            resp.put("assetId", assetId);
-            resp.put("amount", amount);
-            sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
+            audit(ctx, "account.withdraw", "user:" + userId, true, "assetId=" + assetId + " amount=" + amountStr);
+            sendResponse(ctx, HttpResponseStatus.OK,
+                    MAPPER.writeValueAsString(moneyMovementResponse(userId, assetId, amountStr)));
         } catch (IllegalStateException e) {
             audit(ctx, "account.withdraw", "user:" + userId, false, e.getMessage());
-            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST,
-                "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_REJECTED, e.getMessage());
         }
+    }
+
+    /**
+     * Shared deposit/withdraw body parsing: {"assetId": int, "amount": money}.
+     * Amount follows the money() rules (decimal string canonical, number
+     * deprecated). Returns {assetId, fixedPointAmount}, or null after having
+     * sent the 400.
+     */
+    private long[] parseAssetAmount(ChannelHandlerContext ctx, FullHttpRequest request,
+                                    String auditAction, long userId) throws Exception {
+        String body = request.content().toString(StandardCharsets.UTF_8);
+        try {
+            com.fasterxml.jackson.databind.JsonNode req = MAPPER.readTree(body);
+            com.fasterxml.jackson.databind.JsonNode assetNode = req.get("assetId");
+            Long amount = money(req, "amount");
+            if (assetNode == null || !assetNode.isNumber() || !assetNode.canConvertToExactIntegral()
+                    || assetNode.asInt() < 1 || assetNode.asInt() > 1_000_000
+                    || amount == null || !validMoney(amount)) {
+                throw new IllegalArgumentException(
+                        "assetId (positive integer) and amount (positive decimal string) required");
+            }
+            return new long[]{assetNode.asInt(), amount};
+        } catch (IllegalArgumentException | java.io.IOException e) {
+            audit(ctx, auditAction, "user:" + userId, false, "invalid input");
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, rootMessage(e));
+            return null;
+        }
+    }
+
+    private ObjectNode moneyMovementResponse(long userId, int assetId, String amountStr) {
+        ObjectNode resp = MAPPER.createObjectNode();
+        resp.put("success", true);
+        resp.put("userId", userId);
+        resp.put("assetId", assetId);
+        resp.put("amount", amountStr);
+        return resp;
     }
 
     private long extractAccountUserId(String uri) {
@@ -464,7 +518,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
 
     private void handleGetRiskConfig(ChannelHandlerContext ctx, String uri) throws Exception {
         if (adminService == null) {
-            sendResponse(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, "{\"error\":\"Admin not available\"}");
+            sendError(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, ERR_ADMIN_UNAVAILABLE, "Admin not available");
             return;
         }
 
@@ -476,7 +530,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
             int marketId = Integer.parseInt(idStr);
             var config = adminService.getRiskConfig(marketId);
             if (config == null) {
-                sendResponse(ctx, HttpResponseStatus.NOT_FOUND, "{\"error\":\"Market not configured\"}");
+                sendError(ctx, HttpResponseStatus.NOT_FOUND, ERR_NOT_FOUND, "Market not configured");
             } else {
                 sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(config));
             }
@@ -486,7 +540,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     @SuppressWarnings("unchecked")
     private void handleUpdateRiskConfig(ChannelHandlerContext ctx, String uri, FullHttpRequest request) throws Exception {
         if (adminService == null) {
-            sendResponse(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, "{\"error\":\"Admin not available\"}");
+            sendError(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, ERR_ADMIN_UNAVAILABLE, "Admin not available");
             return;
         }
 
@@ -506,7 +560,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
 
     private void handleCircuitBreaker(ChannelHandlerContext ctx, String uri) throws Exception {
         if (adminService == null) {
-            sendResponse(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, "{\"error\":\"Admin not available\"}");
+            sendError(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, ERR_ADMIN_UNAVAILABLE, "Admin not available");
             return;
         }
 
@@ -521,7 +575,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         } else if ("reset".equals(action)) {
             adminService.resetCircuitBreaker(marketId);
         } else {
-            sendResponse(ctx, HttpResponseStatus.BAD_REQUEST, "{\"error\":\"Unknown action: " + escapeJson(action) + "\"}");
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, "Unknown action: " + action);
             return;
         }
         audit(ctx, "admin.circuit-breaker", "market:" + marketId, true, action);
@@ -553,6 +607,22 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private static String escapeJson(String s) {
         if (s == null) return "null";
         return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    /** The frozen error shape (oms#39): {"error": <human text>, "code": <ERR_*>}. */
+    private void sendError(ChannelHandlerContext ctx, HttpResponseStatus status, String code, String message) {
+        sendResponse(ctx, status,
+                "{\"error\":\"" + escapeJson(message) + "\",\"code\":\"" + code + "\"}");
+    }
+
+    /** Innermost cause message — Jackson wraps ours in layers of paths/locations. */
+    private static String rootMessage(Throwable t) {
+        Throwable root = t;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        String m = root.getMessage();
+        return m != null ? m : "malformed request body";
     }
 
     @Override

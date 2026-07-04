@@ -96,12 +96,14 @@ public class OmsOrderServiceImpl implements OrderService {
             order.setSide(side);
             order.setOrderType(orderType);
             order.setTimeInForce(tif);
-            order.setPrice(FixedPoint.fromDouble(request.getPrice()));
-            order.setQuantity(FixedPoint.fromDouble(request.getQuantity()));
+            // Request money is already exact fixed-point (oms#39): the wire
+            // carries decimal strings, parsed at the Jackson boundary.
+            order.setPrice(request.getPrice());
+            order.setQuantity(request.getQuantity());
             order.setRemainingQty(order.getQuantity());
-            order.setStopPrice(FixedPoint.fromDouble(request.getStopPrice()));
-            order.setTrailingDelta(FixedPoint.fromDouble(request.getTrailingDelta()));
-            order.setDisplayQuantity(FixedPoint.fromDouble(request.getDisplayQuantity()));
+            order.setStopPrice(request.getStopPrice());
+            order.setTrailingDelta(request.getTrailingDelta());
+            order.setDisplayQuantity(request.getDisplayQuantity());
             order.setExpiresAtMs(request.getExpiresAtMs());
             order.setClientOrderId(request.getClientOrderId());
 
@@ -239,7 +241,7 @@ public class OmsOrderServiceImpl implements OrderService {
     }
 
     @Override
-    public Map<String, Object> updateOrder(long omsOrderId, double newPrice, double newQuantity) {
+    public Map<String, Object> updateOrder(long omsOrderId, long newPrice, long newQuantity) {
         OrderLifecycleManager lcm = coreEngine.getLifecycleManager();
         OmsOrder order = lcm.getOrder(omsOrderId);
         if (order == null) {
@@ -252,8 +254,8 @@ public class OmsOrderServiceImpl implements OrderService {
             return Map.of("accepted", false, "message", "Order is in-flight, please retry shortly");
         }
 
-        long price = newPrice > 0 ? FixedPoint.fromDouble(newPrice) : order.getPrice();
-        long quantity = newQuantity > 0 ? FixedPoint.fromDouble(newQuantity) : order.getQuantity();
+        long price = newPrice > 0 ? newPrice : order.getPrice();
+        long quantity = newQuantity > 0 ? newQuantity : order.getQuantity();
 
         com.match.infrastructure.generated.OrderSide sbeOrderSide = mapOrderSide(order.getSide());
         com.match.infrastructure.generated.OrderType sbeOrderType = mapOrderType(order.getOrderType());
@@ -267,7 +269,8 @@ public class OmsOrderServiceImpl implements OrderService {
             return Map.of("accepted", false, "message", "Order queue full");
         }
 
-        return Map.of("accepted", true, "omsOrderId", omsOrderId, "message", "Update submitted");
+        // id as a string, like every DTO (oms#39)
+        return Map.of("accepted", true, "omsOrderId", String.valueOf(omsOrderId), "message", "Update submitted");
     }
 
     @Override
@@ -307,9 +310,10 @@ public class OmsOrderServiceImpl implements OrderService {
                 Map<String, Object> ab = new LinkedHashMap<>();
                 ab.put("asset", asset.name());
                 ab.put("assetId", asset.id());
-                ab.put("available", FixedPoint.toDouble(available));
-                ab.put("locked", FixedPoint.toDouble(locked));
-                ab.put("total", FixedPoint.toDouble(available + locked));
+                // Exact decimal strings on the wire (oms#39)
+                ab.put("available", FixedPoint.format(available));
+                ab.put("locked", FixedPoint.format(locked));
+                ab.put("total", FixedPoint.format(available + locked));
                 assetBalances.add(ab);
             }
         }

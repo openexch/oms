@@ -58,11 +58,12 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
             dto.setSide(request.getSide());
             dto.setOrderType(request.getOrderType());
             dto.setTimeInForce(request.getTimeInForce().isEmpty() ? null : request.getTimeInForce());
-            dto.setPrice(request.getPrice());
-            dto.setQuantity(request.getQuantity());
-            dto.setStopPrice(request.getStopPrice());
-            dto.setTrailingDelta(request.getTrailingDelta());
-            dto.setDisplayQuantity(request.getDisplayQuantity());
+            // Proto money is exact decimal strings (oms#39); "" = unset
+            dto.setPrice(protoMoney(request.getPrice()));
+            dto.setQuantity(protoMoney(request.getQuantity()));
+            dto.setStopPrice(protoMoney(request.getStopPrice()));
+            dto.setTrailingDelta(protoMoney(request.getTrailingDelta()));
+            dto.setDisplayQuantity(protoMoney(request.getDisplayQuantity()));
             dto.setExpiresAtMs(request.getExpiresAtMs());
             dto.setClientOrderId(request.getClientOrderId().isEmpty() ? null : request.getClientOrderId());
 
@@ -81,6 +82,8 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
 
             responseObserver.onNext(grpcResp);
             responseObserver.onCompleted();
+        } catch (io.grpc.StatusRuntimeException e) {
+            responseObserver.onError(e); // e.g. INVALID_ARGUMENT from protoMoney
         } catch (Exception e) {
             log.error("gRPC createOrder failed", e);
             responseObserver.onError(io.grpc.Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
@@ -187,6 +190,19 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
         }
     }
 
+    /** "" = unset (proto3 default); otherwise the exact decimal string. */
+    private static long protoMoney(String s) {
+        if (s == null || s.isEmpty()) {
+            return 0L;
+        }
+        try {
+            return com.match.domain.FixedPoint.parse(s);
+        } catch (NumberFormatException | com.match.domain.FixedPoint.OverflowException e) {
+            throw io.grpc.Status.INVALID_ARGUMENT
+                    .withDescription("invalid money string '" + s + "'").asRuntimeException();
+        }
+    }
+
     private static com.openexchange.oms.grpc.OrderResponse toGrpcOrderResponse(OrderResponse resp) {
         return com.openexchange.oms.grpc.OrderResponse.newBuilder()
                 .setOmsOrderId(resp.getOmsOrderId())
@@ -197,11 +213,11 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
                 .setSide(resp.getSide() != null ? resp.getSide() : "")
                 .setOrderType(resp.getOrderType() != null ? resp.getOrderType() : "")
                 .setTimeInForce(resp.getTimeInForce() != null ? resp.getTimeInForce() : "")
-                .setPrice(resp.getPrice())
-                .setQuantity(resp.getQuantity())
-                .setFilledQty(resp.getFilledQty())
-                .setRemainingQty(resp.getRemainingQty())
-                .setStopPrice(resp.getStopPrice())
+                .setPrice(com.match.domain.FixedPoint.format(resp.getPrice()))
+                .setQuantity(com.match.domain.FixedPoint.format(resp.getQuantity()))
+                .setFilledQty(com.match.domain.FixedPoint.format(resp.getFilledQty()))
+                .setRemainingQty(com.match.domain.FixedPoint.format(resp.getRemainingQty()))
+                .setStopPrice(com.match.domain.FixedPoint.format(resp.getStopPrice()))
                 .setStatus(resp.getStatus() != null ? resp.getStatus() : "")
                 .setRejectReason(resp.getRejectReason() != null ? resp.getRejectReason() : "")
                 .setCreatedAtMs(resp.getCreatedAtMs())

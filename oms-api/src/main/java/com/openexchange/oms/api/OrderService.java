@@ -15,7 +15,8 @@ public interface OrderService {
 
     CancelOrderResponse cancelOrder(long omsOrderId);
 
-    Map<String, Object> updateOrder(long omsOrderId, double newPrice, double newQuantity);
+    /** Prices/quantities are 8-dp fixed-point longs; 0 = keep the current value. */
+    Map<String, Object> updateOrder(long omsOrderId, long newPrice, long newQuantity);
 
     OrderResponse getOrder(long omsOrderId);
 

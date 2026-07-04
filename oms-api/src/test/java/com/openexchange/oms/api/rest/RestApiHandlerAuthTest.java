@@ -126,7 +126,7 @@ class RestApiHandlerAuthTest {
         assertEquals(HttpResponseStatus.NOT_FOUND,
                 exchange(request(HttpMethod.PUT, "/api/v1/orders/55", "{\"price\":2}", "userA-key")).status());
         verify(orderService, never()).cancelOrder(anyLong());
-        verify(orderService, never()).updateOrder(anyLong(), anyDouble(), anyDouble());
+        verify(orderService, never()).updateOrder(anyLong(), anyLong(), anyLong());
     }
 
     @Test

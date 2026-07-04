@@ -109,7 +109,7 @@ public final class HttpAuthHandler extends ChannelInboundHandlerAdapter {
 
     private void sendUnauthorized(ChannelHandlerContext ctx, String origin, String message) {
         String safe = message == null ? "Unauthorized" : message.replace("\\", "\\\\").replace("\"", "\\\"");
-        byte[] body = ("{\"error\":\"" + safe + "\"}").getBytes(StandardCharsets.UTF_8);
+        byte[] body = ("{\"error\":\"" + safe + "\",\"code\":\"UNAUTHORIZED\"}").getBytes(StandardCharsets.UTF_8);
         FullHttpResponse response = new DefaultFullHttpResponse(
                 HttpVersion.HTTP_1_1, HttpResponseStatus.UNAUTHORIZED, Unpooled.wrappedBuffer(body));
         response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json");
