@@ -195,8 +195,9 @@ class OmsOrderServiceImplTest {
         req.setMarketId(marketId);
         req.setSide("BUY");
         req.setOrderType("LIMIT");
-        req.setPrice(price);
-        req.setQuantity(qty);
+        // DTOs carry fixed-point longs now (oms#39)
+        req.setPrice(com.match.domain.FixedPoint.fromDouble(price));
+        req.setQuantity(com.match.domain.FixedPoint.fromDouble(qty));
         return req;
     }
 }

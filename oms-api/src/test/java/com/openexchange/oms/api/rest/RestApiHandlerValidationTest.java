@@ -94,6 +94,6 @@ class RestApiHandlerValidationTest {
     void updateOrderRejectsInfiniteValues() {
         assertEquals(HttpResponseStatus.BAD_REQUEST,
                 exchange(HttpMethod.PUT, "/api/v1/orders/5", "{\"price\":1e999}").status());
-        verify(orderService, never()).updateOrder(anyLong(), anyDouble(), anyDouble());
+        verify(orderService, never()).updateOrder(anyLong(), anyLong(), anyLong());
     }
 }

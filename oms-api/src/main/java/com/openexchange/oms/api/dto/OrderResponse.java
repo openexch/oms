@@ -1,14 +1,21 @@
 package com.openexchange.oms.api.dto;
 
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.fasterxml.jackson.databind.ser.std.ToStringSerializer;
 import com.openexchange.oms.common.domain.OmsOrder;
-import com.match.domain.FixedPoint;
 
 /**
  * Response DTO for order queries.
+ *
+ * Money crosses the wire as exact 8-dp decimal strings, and 64-bit Snowflake
+ * ids as JSON strings (oms#39): JSON numbers round both through IEEE doubles
+ * (JS Number.MAX_SAFE_INTEGER is 2^53-1; trading-ui#25 saw real ids rounded).
  */
 public class OrderResponse {
 
+    @JsonSerialize(using = ToStringSerializer.class)
     private long omsOrderId;
+    @JsonSerialize(using = ToStringSerializer.class)
     private long clusterOrderId;
     private String clientOrderId;
     private long userId;
@@ -16,11 +23,16 @@ public class OrderResponse {
     private String side;
     private String orderType;
     private String timeInForce;
-    private double price;
-    private double quantity;
-    private double filledQty;
-    private double remainingQty;
-    private double stopPrice;
+    @JsonSerialize(using = FixedPointJson.Serializer.class)
+    private long price;
+    @JsonSerialize(using = FixedPointJson.Serializer.class)
+    private long quantity;
+    @JsonSerialize(using = FixedPointJson.Serializer.class)
+    private long filledQty;
+    @JsonSerialize(using = FixedPointJson.Serializer.class)
+    private long remainingQty;
+    @JsonSerialize(using = FixedPointJson.Serializer.class)
+    private long stopPrice;
     private String status;
     private String rejectReason;
     private long createdAtMs;
@@ -36,11 +48,11 @@ public class OrderResponse {
         r.side = order.getSide() != null ? order.getSide().name() : null;
         r.orderType = order.getOrderType() != null ? order.getOrderType().name() : null;
         r.timeInForce = order.getTimeInForce() != null ? order.getTimeInForce().name() : null;
-        r.price = FixedPoint.toDouble(order.getPrice());
-        r.quantity = FixedPoint.toDouble(order.getQuantity());
-        r.filledQty = FixedPoint.toDouble(order.getFilledQty());
-        r.remainingQty = FixedPoint.toDouble(order.getRemainingQty());
-        r.stopPrice = FixedPoint.toDouble(order.getStopPrice());
+        r.price = order.getPrice();
+        r.quantity = order.getQuantity();
+        r.filledQty = order.getFilledQty();
+        r.remainingQty = order.getRemainingQty();
+        r.stopPrice = order.getStopPrice();
         r.status = order.getStatus() != null ? order.getStatus().name() : null;
         r.rejectReason = order.getRejectReason();
         r.createdAtMs = order.getCreatedAtMs();
@@ -57,11 +69,11 @@ public class OrderResponse {
     public String getSide() { return side; }
     public String getOrderType() { return orderType; }
     public String getTimeInForce() { return timeInForce; }
-    public double getPrice() { return price; }
-    public double getQuantity() { return quantity; }
-    public double getFilledQty() { return filledQty; }
-    public double getRemainingQty() { return remainingQty; }
-    public double getStopPrice() { return stopPrice; }
+    public long getPrice() { return price; }
+    public long getQuantity() { return quantity; }
+    public long getFilledQty() { return filledQty; }
+    public long getRemainingQty() { return remainingQty; }
+    public long getStopPrice() { return stopPrice; }
     public String getStatus() { return status; }
     public String getRejectReason() { return rejectReason; }
     public long getCreatedAtMs() { return createdAtMs; }

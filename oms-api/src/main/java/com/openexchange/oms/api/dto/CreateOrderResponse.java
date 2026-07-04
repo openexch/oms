@@ -1,11 +1,16 @@
 package com.openexchange.oms.api.dto;
 
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.fasterxml.jackson.databind.ser.std.ToStringSerializer;
+
 /**
  * Response DTO for order creation.
  */
 public class CreateOrderResponse {
 
     private boolean accepted;
+    // Snowflake id as a JSON string on the wire (oms#39)
+    @JsonSerialize(using = ToStringSerializer.class)
     private long omsOrderId;
     private String status;
     private String rejectReason;

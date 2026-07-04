@@ -1,9 +1,14 @@
 package com.openexchange.oms.api.dto;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 
 /**
  * Request DTO for creating an order.
+ *
+ * Money fields are internal 8-dp fixed-point longs; on the wire they are
+ * exact decimal strings (oms#39). Legacy JSON numbers are still accepted
+ * (deprecated) via {@link FixedPointJson.Deserializer}.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class CreateOrderRequest {
@@ -13,11 +18,16 @@ public class CreateOrderRequest {
     private String side;         // "BUY" or "SELL"
     private String orderType;    // "LIMIT", "MARKET", "STOP_LOSS", "STOP_LIMIT", "TRAILING_STOP", "ICEBERG"
     private String timeInForce;  // "GTC", "GTD", "IOC", "FOK"
-    private double price;
-    private double quantity;
-    private double stopPrice;
-    private double trailingDelta;
-    private double displayQuantity;
+    @JsonDeserialize(using = FixedPointJson.Deserializer.class)
+    private long price;
+    @JsonDeserialize(using = FixedPointJson.Deserializer.class)
+    private long quantity;
+    @JsonDeserialize(using = FixedPointJson.Deserializer.class)
+    private long stopPrice;
+    @JsonDeserialize(using = FixedPointJson.Deserializer.class)
+    private long trailingDelta;
+    @JsonDeserialize(using = FixedPointJson.Deserializer.class)
+    private long displayQuantity;
     private long expiresAtMs;
     private String clientOrderId; // User-supplied idempotency key
 
@@ -36,20 +46,20 @@ public class CreateOrderRequest {
     public String getTimeInForce() { return timeInForce; }
     public void setTimeInForce(String timeInForce) { this.timeInForce = timeInForce; }
 
-    public double getPrice() { return price; }
-    public void setPrice(double price) { this.price = price; }
+    public long getPrice() { return price; }
+    public void setPrice(long price) { this.price = price; }
 
-    public double getQuantity() { return quantity; }
-    public void setQuantity(double quantity) { this.quantity = quantity; }
+    public long getQuantity() { return quantity; }
+    public void setQuantity(long quantity) { this.quantity = quantity; }
 
-    public double getStopPrice() { return stopPrice; }
-    public void setStopPrice(double stopPrice) { this.stopPrice = stopPrice; }
+    public long getStopPrice() { return stopPrice; }
+    public void setStopPrice(long stopPrice) { this.stopPrice = stopPrice; }
 
-    public double getTrailingDelta() { return trailingDelta; }
-    public void setTrailingDelta(double trailingDelta) { this.trailingDelta = trailingDelta; }
+    public long getTrailingDelta() { return trailingDelta; }
+    public void setTrailingDelta(long trailingDelta) { this.trailingDelta = trailingDelta; }
 
-    public double getDisplayQuantity() { return displayQuantity; }
-    public void setDisplayQuantity(double displayQuantity) { this.displayQuantity = displayQuantity; }
+    public long getDisplayQuantity() { return displayQuantity; }
+    public void setDisplayQuantity(long displayQuantity) { this.displayQuantity = displayQuantity; }
 
     public long getExpiresAtMs() { return expiresAtMs; }
     public void setExpiresAtMs(long expiresAtMs) { this.expiresAtMs = expiresAtMs; }
