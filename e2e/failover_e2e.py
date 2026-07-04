@@ -597,24 +597,36 @@ def main():
     # -- Restart the killed node, wait for rejoin. A kill -9 leaves the mark
     #    files' liveness heartbeat fresh for ~10s; restarting inside that
     #    window dies with "active mark file detected" and parks in the
-    #    ShutdownSignalBarrier (the node0-limbo failure mode) — so wait it
-    #    out first and retry with a fresh JVM if an attempt still wedges.
+    #    ShutdownSignalBarrier (the node0-limbo failure mode) — that one
+    #    needs a fresh JVM. Slow log replication does NOT: a CI runner can
+    #    legitimately spend 30s+ in "log replication has not progressed"
+    #    retries, so only the explicit limbo marker triggers a kill+retry.
+    node_log = os.path.join(LOGDIR, f"node{old_leader}.log")
     rejoined = False
     for attempt in range(3):
         time.sleep(15 if attempt == 0 else 10)
+        log_offset = os.path.getsize(node_log) if os.path.exists(node_log) else 0
         start_node(old_leader)
-        deadline = time.time() + 60
-        while time.time() < deadline:
+        deadline = time.time() + 150
+        wedged = False
+        while time.time() < deadline and not wedged:
             try:
                 if re.search(r"leaderMemberId=\d+", cluster_tool(old_leader, "list-members")):
                     rejoined = True
                     break
             except Exception:
                 pass
+            try:
+                with open(node_log, "rb") as f:
+                    f.seek(log_offset)
+                    wedged = b"active mark file detected" in f.read()
+            except OSError:
+                pass
             time.sleep(3)
         if rejoined:
             break
-        log(f"node{old_leader} restart attempt {attempt + 1} wedged; retrying")
+        log(f"node{old_leader} restart attempt {attempt + 1} "
+            + ("hit the active-mark-file window" if wedged else "timed out") + "; retrying")
         kill9(f"node{old_leader}")
     if not rejoined:
         fail(f"node{old_leader} failed to rejoin after restarts")
