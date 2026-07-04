@@ -10,6 +10,8 @@ import com.openexchange.oms.api.auth.DevAuthenticationProvider;
 import com.openexchange.oms.api.auth.GrpcAuthInterceptor;
 import com.openexchange.oms.api.auth.JwtAuthenticationProvider;
 import com.openexchange.oms.api.auth.RoleBasedAuthorizer;
+import com.openexchange.oms.api.audit.AuditLog;
+import com.openexchange.oms.api.rest.CorsPolicy;
 import com.openexchange.oms.api.grpc.GrpcAccountService;
 import com.openexchange.oms.api.grpc.GrpcOrderService;
 import com.openexchange.oms.api.grpc.GrpcServer;
@@ -51,6 +53,7 @@ public class OmsApplication {
     private HttpServer httpServer;
     private GrpcServer grpcServer;
     private ClusterClient clusterClient;
+    private AuditLog auditLog;
 
     public static void main(String[] args) {
         OmsApplication app = new OmsApplication();
@@ -328,6 +331,10 @@ public class OmsApplication {
         AuthenticationProvider authProvider = buildAuthProvider(config);
         Authorizer authorizer = new RoleBasedAuthorizer();
 
+        // 11a. Edge policy (oms#37): CORS allowlist + append-only audit log
+        CorsPolicy corsPolicy = CorsPolicy.fromSpec(config.corsOrigins());
+        auditLog = AuditLog.open(config.auditLogPath());
+
         // 11b. WebSocket handler
         WebSocketHandler wsHandler = new WebSocketHandler(authorizer);
 
@@ -337,7 +344,7 @@ public class OmsApplication {
                 balanceStore, egressAdapter, idGenerator, marketDataProvider);
 
         // 13. gRPC services (created before state listener so push methods can be called)
-        GrpcOrderService grpcOrderSvc = new GrpcOrderService(orderService, authorizer);
+        GrpcOrderService grpcOrderSvc = new GrpcOrderService(orderService, authorizer, auditLog);
         GrpcAccountService grpcAccountSvc = new GrpcAccountService(orderService, authorizer);
 
         // 14. Order state listener — pushes to WebSocket + gRPC, handles balance release
@@ -395,7 +402,7 @@ public class OmsApplication {
 
         // 16. HTTP server
         httpServer = new HttpServer(config.httpPort(), orderService, wsHandler, adminService,
-                authProvider, authorizer);
+                authProvider, authorizer, corsPolicy, auditLog);
         httpServer.start();
 
         // 17. gRPC server
@@ -465,6 +472,14 @@ public class OmsApplication {
         if (clusterClient != null) {
             clusterClient.stopPolling();
             clusterClient.close();
+        }
+
+        if (auditLog != null) {
+            try {
+                auditLog.close();
+            } catch (Exception e) {
+                log.warn("Audit log close failed: {}", e.getMessage());
+            }
         }
 
         log.info("OMS Application stopped");

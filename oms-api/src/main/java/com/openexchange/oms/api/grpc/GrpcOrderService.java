@@ -1,7 +1,9 @@
 package com.openexchange.oms.api.grpc;
 
 import com.openexchange.oms.api.OrderService;
+import com.openexchange.oms.api.audit.AuditLog;
 import com.openexchange.oms.api.auth.Authorizer;
+import com.openexchange.oms.api.auth.GrpcAuthInterceptor;
 import com.openexchange.oms.api.auth.RoleBasedAuthorizer;
 import com.openexchange.oms.api.dto.CreateOrderRequest;
 import com.openexchange.oms.api.dto.CreateOrderResponse;
@@ -27,18 +29,20 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
 
     private final OrderService orderService;
     private final Authorizer authorizer;
+    private final AuditLog auditLog;
 
     // Streaming subscriptions
     private final Map<Long, Set<StreamObserver<OrderUpdate>>> orderStreamsByUser = new ConcurrentHashMap<>();
     private final Map<Long, Set<StreamObserver<ExecutionReport>>> executionStreamsByUser = new ConcurrentHashMap<>();
 
     public GrpcOrderService(OrderService orderService) {
-        this(orderService, new RoleBasedAuthorizer());
+        this(orderService, new RoleBasedAuthorizer(), AuditLog.disabled());
     }
 
-    public GrpcOrderService(OrderService orderService, Authorizer authorizer) {
+    public GrpcOrderService(OrderService orderService, Authorizer authorizer, AuditLog auditLog) {
         this.orderService = orderService;
         this.authorizer = authorizer;
+        this.auditLog = auditLog;
     }
 
     @Override
@@ -63,6 +67,9 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
             dto.setClientOrderId(request.getClientOrderId().isEmpty() ? null : request.getClientOrderId());
 
             CreateOrderResponse resp = orderService.createOrder(dto);
+            auditLog.record(GrpcAuthInterceptor.PRINCIPAL.get(), "order.create", "user:" + userId,
+                    resp.isAccepted(),
+                    resp.isAccepted() ? "omsOrderId=" + resp.getOmsOrderId() : resp.getRejectReason());
 
             com.openexchange.oms.grpc.CreateOrderResponse grpcResp =
                     com.openexchange.oms.grpc.CreateOrderResponse.newBuilder()
@@ -91,6 +98,8 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
                 return;
             }
             CancelOrderResponse resp = orderService.cancelOrder(request.getOmsOrderId());
+            auditLog.record(GrpcAuthInterceptor.PRINCIPAL.get(), "order.cancel",
+                    "order:" + request.getOmsOrderId(), resp.isAccepted(), resp.getMessage());
 
             com.openexchange.oms.grpc.CancelOrderResponse grpcResp =
                     com.openexchange.oms.grpc.CancelOrderResponse.newBuilder()

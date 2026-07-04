@@ -14,6 +14,8 @@ import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.QueryStringDecoder;
 import io.netty.util.AttributeKey;
 
+import com.openexchange.oms.api.rest.CorsPolicy;
+
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -34,9 +36,15 @@ public final class HttpAuthHandler extends ChannelInboundHandlerAdapter {
     public static final AttributeKey<Principal> PRINCIPAL = AttributeKey.valueOf("authPrincipal");
 
     private final AuthenticationProvider provider;
+    private final CorsPolicy corsPolicy;
 
     public HttpAuthHandler(AuthenticationProvider provider) {
+        this(provider, CorsPolicy.fromSpec(""));
+    }
+
+    public HttpAuthHandler(AuthenticationProvider provider, CorsPolicy corsPolicy) {
         this.provider = provider;
+        this.corsPolicy = corsPolicy;
     }
 
     @Override
@@ -54,8 +62,9 @@ public final class HttpAuthHandler extends ChannelInboundHandlerAdapter {
             ctx.channel().attr(PRINCIPAL).set(principal);
             ctx.fireChannelRead(msg);
         } catch (AuthenticationException e) {
+            String origin = req.headers().get(HttpHeaderNames.ORIGIN);
             req.release();
-            sendUnauthorized(ctx, e.getMessage());
+            sendUnauthorized(ctx, origin, e.getMessage());
         }
     }
 
@@ -96,7 +105,7 @@ public final class HttpAuthHandler extends ChannelInboundHandlerAdapter {
         return bearer ? token : null;
     }
 
-    private static void sendUnauthorized(ChannelHandlerContext ctx, String message) {
+    private void sendUnauthorized(ChannelHandlerContext ctx, String origin, String message) {
         String safe = message == null ? "Unauthorized" : message.replace("\\", "\\\\").replace("\"", "\\\"");
         byte[] body = ("{\"error\":\"" + safe + "\"}").getBytes(StandardCharsets.UTF_8);
         FullHttpResponse response = new DefaultFullHttpResponse(
@@ -104,7 +113,7 @@ public final class HttpAuthHandler extends ChannelInboundHandlerAdapter {
         response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json");
         response.headers().set(HttpHeaderNames.CONTENT_LENGTH, body.length);
         response.headers().set(HttpHeaderNames.WWW_AUTHENTICATE, "Bearer");
-        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+        corsPolicy.apply(origin, response);
         ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
     }
 }

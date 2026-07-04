@@ -1,8 +1,10 @@
 package com.openexchange.oms.api;
 
+import com.openexchange.oms.api.audit.AuditLog;
 import com.openexchange.oms.api.auth.AuthenticationProvider;
 import com.openexchange.oms.api.auth.Authorizer;
 import com.openexchange.oms.api.auth.HttpAuthHandler;
+import com.openexchange.oms.api.rest.CorsPolicy;
 import com.openexchange.oms.api.rest.RestApiHandler;
 import com.openexchange.oms.api.websocket.WebSocketHandler;
 import com.openexchange.oms.api.AdminService;
@@ -29,18 +31,23 @@ public class HttpServer {
     private final AdminService adminService;
     private final AuthenticationProvider authProvider;
     private final Authorizer authorizer;
+    private final CorsPolicy corsPolicy;
+    private final AuditLog auditLog;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
 
     public HttpServer(int port, OrderService orderService, WebSocketHandler webSocketHandler,
-                      AdminService adminService, AuthenticationProvider authProvider, Authorizer authorizer) {
+                      AdminService adminService, AuthenticationProvider authProvider, Authorizer authorizer,
+                      CorsPolicy corsPolicy, AuditLog auditLog) {
         this.port = port;
         this.orderService = orderService;
         this.webSocketHandler = webSocketHandler;
         this.adminService = adminService;
         this.authProvider = authProvider;
         this.authorizer = authorizer;
+        this.corsPolicy = corsPolicy;
+        this.auditLog = auditLog;
     }
 
     public void start() throws InterruptedException {
@@ -58,7 +65,7 @@ public class HttpServer {
                     pipeline.addLast(new HttpObjectAggregator(1048576)); // 1MB max
                     // Auth gate: every request (incl. the WS upgrade) is
                     // authenticated here; the Principal rides on the channel.
-                    pipeline.addLast(new HttpAuthHandler(authProvider));
+                    pipeline.addLast(new HttpAuthHandler(authProvider, corsPolicy));
                     // Route: /ws/v1 → WebSocket, everything else → REST
                     pipeline.addLast(new ChannelInboundHandlerAdapter() {
                         @Override
@@ -75,7 +82,8 @@ public class HttpServer {
                                     ctx.fireChannelRead(msg);
                                 } else {
                                     // REST handler
-                                    ctx.pipeline().addLast(new RestApiHandler(orderService, adminService, authorizer));
+                                    ctx.pipeline().addLast(new RestApiHandler(orderService, adminService,
+                                            authorizer, corsPolicy, auditLog));
                                     ctx.pipeline().remove(this);
                                     ctx.fireChannelRead(msg);
                                 }
