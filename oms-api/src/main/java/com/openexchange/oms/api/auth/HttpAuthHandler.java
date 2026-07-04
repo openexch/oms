@@ -70,7 +70,9 @@ public final class HttpAuthHandler extends ChannelInboundHandlerAdapter {
 
     private static boolean isExempt(String uri) {
         String path = new QueryStringDecoder(uri).path();
-        return path.equals("/api/v1/health");
+        // /metrics is for the local Prometheus scraper — like health, it must
+        // work without credentials. Never proxy it publicly (docs/deploy-tls.md).
+        return path.equals("/api/v1/health") || path.equals("/metrics");
     }
 
     private static AuthenticationProvider.Headers headersOf(FullHttpRequest req) {

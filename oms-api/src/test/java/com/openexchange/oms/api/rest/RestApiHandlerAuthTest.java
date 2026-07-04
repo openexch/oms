@@ -54,7 +54,9 @@ class RestApiHandlerAuthTest {
         return new EmbeddedChannel(
                 new HttpAuthHandler(PROVIDER),
                 new RestApiHandler(orderService, adminService, new RoleBasedAuthorizer(),
-                        CorsPolicy.fromSpec(""), com.openexchange.oms.api.audit.AuditLog.disabled()));
+                        CorsPolicy.fromSpec(""), com.openexchange.oms.api.audit.AuditLog.disabled(),
+                        new io.micrometer.prometheusmetrics.PrometheusMeterRegistry(
+                                io.micrometer.prometheusmetrics.PrometheusConfig.DEFAULT)));
     }
 
     private static FullHttpRequest request(HttpMethod method, String uri, String body, String apiKey) {

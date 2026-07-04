@@ -61,6 +61,9 @@
         <slf4j.version>2.0.18</slf4j.version>
         <logback.version>1.5.37</logback.version>
 
+        <!-- Metrics (P3.1 / oms#38) -->
+        <micrometer.version>1.16.3</micrometer.version>
+
         <!-- Testing -->
         <junit.version>6.1.1</junit.version>
         <mockito.version>5.23.0</mockito.version>
@@ -155,6 +158,13 @@
                 <groupId>io.netty</groupId>
                 <artifactId>netty-all</artifactId>
                 <version>${netty.version}</version>
+            </dependency>
+
+            <!-- Metrics (P3.1 / oms#38) -->
+            <dependency>
+                <groupId>io.micrometer</groupId>
+                <artifactId>micrometer-registry-prometheus</artifactId>
+                <version>${micrometer.version}</version>
             </dependency>
 
             <!-- Jackson — import the BOM so all jackson artifacts get mutually-compatible versions.

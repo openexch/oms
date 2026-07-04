@@ -10,6 +10,9 @@ import com.openexchange.oms.api.auth.HttpAuthHandler;
 import com.openexchange.oms.api.auth.Principal;
 import com.openexchange.oms.api.auth.RoleBasedAuthorizer;
 import com.openexchange.oms.api.dto.*;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFutureListener;
@@ -43,21 +46,24 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private final Authorizer authorizer;
     private final CorsPolicy corsPolicy;
     private final AuditLog auditLog;
+    private final PrometheusMeterRegistry meterRegistry;
 
     // One request per connection (every response closes); set in channelRead0.
     private String requestOrigin;
 
     public RestApiHandler(OrderService orderService) {
-        this(orderService, null, new RoleBasedAuthorizer(), CorsPolicy.fromSpec(""), AuditLog.disabled());
+        this(orderService, null, new RoleBasedAuthorizer(), CorsPolicy.fromSpec(""), AuditLog.disabled(),
+                new PrometheusMeterRegistry(io.micrometer.prometheusmetrics.PrometheusConfig.DEFAULT));
     }
 
     public RestApiHandler(OrderService orderService, AdminService adminService, Authorizer authorizer,
-                          CorsPolicy corsPolicy, AuditLog auditLog) {
+                          CorsPolicy corsPolicy, AuditLog auditLog, PrometheusMeterRegistry meterRegistry) {
         this.orderService = orderService;
         this.adminService = adminService;
         this.authorizer = authorizer;
         this.corsPolicy = corsPolicy;
         this.auditLog = auditLog;
+        this.meterRegistry = meterRegistry;
     }
 
     @Override
@@ -72,8 +78,26 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
             return;
         }
 
+        // Request timing (oms#38): handlers are synchronous, so wall time here
+        // is the request latency. Route labels are a fixed set (no id parts).
+        final long startNanos = System.nanoTime();
         try {
-            if (uri.equals("/api/v1/health") && method == HttpMethod.GET) {
+            route(ctx, request, uri, method);
+        } finally {
+            Timer.builder("oms_http_request_seconds")
+                    .description("OMS REST request latency")
+                    .tag("route", routeLabel(uri, method))
+                    .publishPercentiles(0.5, 0.95, 0.99)
+                    .register(meterRegistry)
+                    .record(System.nanoTime() - startNanos, java.util.concurrent.TimeUnit.NANOSECONDS);
+        }
+    }
+
+    private void route(ChannelHandlerContext ctx, FullHttpRequest request, String uri, HttpMethod method) {
+        try {
+            if (uri.equals("/metrics") && method == HttpMethod.GET) {
+                handleMetrics(ctx);
+            } else if (uri.equals("/api/v1/health") && method == HttpMethod.GET) {
                 handleHealth(ctx);
             } else if (uri.equals("/api/v1/orders") && method == HttpMethod.POST) {
                 handleCreateOrder(ctx, request);
@@ -114,6 +138,42 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
             sendResponse(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR,
                 "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
         }
+    }
+
+    /** Fixed-cardinality route label: id/query parts stripped. */
+    private static String routeLabel(String uri, HttpMethod method) {
+        String path = uri;
+        int q = path.indexOf('?');
+        if (q >= 0) path = path.substring(0, q);
+        String m = method.name();
+        if (path.equals("/metrics")) return "metrics";
+        if (path.equals("/api/v1/health")) return "health";
+        if (path.equals("/api/v1/markets")) return "markets";
+        if (path.equals("/api/v1/orders")) return m.equals("POST") ? "orders.create" : "orders.query";
+        if (path.startsWith("/api/v1/orders/")) {
+            return switch (m) {
+                case "DELETE" -> "orders.cancel";
+                case "PUT" -> "orders.update";
+                default -> "orders.get";
+            };
+        }
+        if (path.startsWith("/api/v1/accounts/")) {
+            if (path.endsWith("/deposit")) return "accounts.deposit";
+            if (path.endsWith("/withdraw")) return "accounts.withdraw";
+            return "accounts.get";
+        }
+        if (path.startsWith("/api/v1/admin/")) return "admin";
+        return "other";
+    }
+
+    private void handleMetrics(ChannelHandlerContext ctx) {
+        String scrape = meterRegistry.scrape();
+        byte[] bytes = scrape.getBytes(StandardCharsets.UTF_8);
+        FullHttpResponse response = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1, HttpResponseStatus.OK, Unpooled.wrappedBuffer(bytes));
+        response.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8");
+        response.headers().set(HttpHeaderNames.CONTENT_LENGTH, bytes.length);
+        ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
     }
 
     private Principal principal(ChannelHandlerContext ctx) {
@@ -198,6 +258,15 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         }
 
         CreateOrderResponse resp = orderService.createOrder(req);
+
+        // Reject reasons are a small fixed set (risk enum + admission strings).
+        Counter.builder("oms_orders_total")
+                .description("Order submissions by outcome")
+                .tag("result", resp.isAccepted() ? "accepted" : "rejected")
+                .tag("reason", resp.isAccepted() ? "none"
+                        : (resp.getRejectReason() != null ? resp.getRejectReason().replace(' ', '_') : "unknown"))
+                .register(meterRegistry)
+                .increment();
 
         audit(ctx, "order.create", "user:" + userId, resp.isAccepted(),
                 resp.isAccepted() ? "omsOrderId=" + resp.getOmsOrderId() : resp.getRejectReason());

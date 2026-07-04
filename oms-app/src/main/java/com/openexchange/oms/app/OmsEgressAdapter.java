@@ -49,6 +49,16 @@ public class OmsEgressAdapter implements EgressListener {
         return connected;
     }
 
+    /** Cumulative OrderStatus seq-gap count (statuses shed on the wire) — for /metrics. */
+    public long getStatusGapCount() {
+        return statusGapCount;
+    }
+
+    /** Cumulative tradeId gap count (TradeExecutions shed on the wire) — for /metrics. */
+    public long getTradeGapCount() {
+        return tradeGapCount;
+    }
+
     @Override
     public void onTradeExecution(int marketId, long tradeId, long takerOrderId, long makerOrderId,
                                   long takerUserId, long makerUserId, long price, long quantity,

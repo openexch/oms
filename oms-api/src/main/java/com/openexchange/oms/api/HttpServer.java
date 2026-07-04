@@ -33,13 +33,15 @@ public class HttpServer {
     private final Authorizer authorizer;
     private final CorsPolicy corsPolicy;
     private final AuditLog auditLog;
+    private final io.micrometer.prometheusmetrics.PrometheusMeterRegistry meterRegistry;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
 
     public HttpServer(int port, OrderService orderService, WebSocketHandler webSocketHandler,
                       AdminService adminService, AuthenticationProvider authProvider, Authorizer authorizer,
-                      CorsPolicy corsPolicy, AuditLog auditLog) {
+                      CorsPolicy corsPolicy, AuditLog auditLog,
+                      io.micrometer.prometheusmetrics.PrometheusMeterRegistry meterRegistry) {
         this.port = port;
         this.orderService = orderService;
         this.webSocketHandler = webSocketHandler;
@@ -48,6 +50,7 @@ public class HttpServer {
         this.authorizer = authorizer;
         this.corsPolicy = corsPolicy;
         this.auditLog = auditLog;
+        this.meterRegistry = meterRegistry;
     }
 
     public void start() throws InterruptedException {
@@ -83,7 +86,7 @@ public class HttpServer {
                                 } else {
                                     // REST handler
                                     ctx.pipeline().addLast(new RestApiHandler(orderService, adminService,
-                                            authorizer, corsPolicy, auditLog));
+                                            authorizer, corsPolicy, auditLog, meterRegistry));
                                     ctx.pipeline().remove(this);
                                     ctx.fireChannelRead(msg);
                                 }
