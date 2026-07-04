@@ -319,9 +319,16 @@ public class OmsCoreEngine {
                     order.getOmsOrderId(), order.getClusterOrderId(),
                     order.getFilledQty(), order.getQuantity(),
                     fullyFilled ? "FILLED" : "CANCELLED");
-            lifecycleManager.onClusterOrderStatus(order.getOmsOrderId(), order.getClusterOrderId(),
+            OmsOrder repaired = lifecycleManager.onClusterOrderStatus(
+                    order.getOmsOrderId(), order.getClusterOrderId(),
                     fullyFilled ? 2 : 3, // cluster raw status: FILLED : CANCELLED
                     fullyFilled ? 0L : order.getRemainingQty(), order.getFilledQty());
+            // Persist the repair: this path bypasses onOrderStatus (which persists),
+            // and unpersisted repairs would resurrect on the next startup rebuild
+            // (oms#35) and be re-repaired forever.
+            if (repaired != null && persistenceHandler != null) {
+                persistenceHandler.persistOrderUpdate(repaired);
+            }
         }
         if (!toTerminalize.isEmpty()) {
             log.info("Membership repair terminalized {} lost order(s)", toTerminalize.size());
