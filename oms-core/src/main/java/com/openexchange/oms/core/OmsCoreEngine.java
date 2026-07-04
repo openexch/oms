@@ -359,6 +359,8 @@ public class OmsCoreEngine {
         if (!toTerminalize.isEmpty()) {
             log.info("Membership repair terminalized {} lost order(s)", toTerminalize.size());
         }
+        totalRepairedOrders += toTerminalize.size();
+        totalRelinkedOrders += toRelink.size();
         // Post-reconcile audit hook (oms#49): lifecycle state is freshly trued
         // up against the cluster here, making this the right moment to
         // rebaseline derived bookkeeping (risk open-order slot counts) that
@@ -372,6 +374,18 @@ public class OmsCoreEngine {
     /** See reconcileAgainstOpenOrders: runs after every membership reconcile. */
     public void setPostReconcileHook(Runnable hook) {
         this.postReconcileHook = hook;
+    }
+
+    // Cumulative reconcile-repair tallies — read by /metrics gauges (oms#38).
+    private volatile long totalRepairedOrders;
+    private volatile long totalRelinkedOrders;
+
+    public long getTotalRepairedOrders() {
+        return totalRepairedOrders;
+    }
+
+    public long getTotalRelinkedOrders() {
+        return totalRelinkedOrders;
     }
 
     // ==================== Helpers ====================

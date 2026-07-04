@@ -12,6 +12,15 @@ import com.openexchange.oms.api.auth.JwtAuthenticationProvider;
 import com.openexchange.oms.api.auth.RoleBasedAuthorizer;
 import com.openexchange.oms.api.audit.AuditLog;
 import com.openexchange.oms.api.rest.CorsPolicy;
+import io.micrometer.core.instrument.FunctionCounter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.binder.jvm.JvmGcMetrics;
+import io.micrometer.core.instrument.binder.jvm.JvmMemoryMetrics;
+import io.micrometer.core.instrument.binder.jvm.JvmThreadMetrics;
+import io.micrometer.core.instrument.binder.system.ProcessorMetrics;
+import io.micrometer.core.instrument.binder.system.UptimeMetrics;
+import io.micrometer.prometheusmetrics.PrometheusConfig;
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import com.openexchange.oms.api.grpc.GrpcAccountService;
 import com.openexchange.oms.api.grpc.GrpcOrderService;
 import com.openexchange.oms.api.grpc.GrpcServer;
@@ -54,6 +63,7 @@ public class OmsApplication {
     private GrpcServer grpcServer;
     private ClusterClient clusterClient;
     private AuditLog auditLog;
+    private PrometheusMeterRegistry meterRegistry;
 
     public static void main(String[] args) {
         OmsApplication app = new OmsApplication();
@@ -151,9 +161,28 @@ public class OmsApplication {
         SyntheticOrderEngine syntheticEngine = new SyntheticOrderEngine();
         OmsCoreEngine coreEngine = new OmsCoreEngine(lifecycleManager, syntheticEngine);
 
+        // 7b. Metrics registry (oms#38): Prometheus + JVM binders; exposed at
+        // GET /metrics (auth-exempt for the local scraper).
+        meterRegistry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+        new JvmMemoryMetrics().bindTo(meterRegistry);
+        new JvmGcMetrics().bindTo(meterRegistry);
+        new JvmThreadMetrics().bindTo(meterRegistry);
+        new ProcessorMetrics().bindTo(meterRegistry);
+        new UptimeMetrics().bindTo(meterRegistry);
+        io.micrometer.core.instrument.Timer settlementTimer =
+                io.micrometer.core.instrument.Timer.builder("oms_settlement_seconds")
+                        .description("Trade settlement latency (ledger + risk bookkeeping)")
+                        .publishPercentiles(0.5, 0.95, 0.99)
+                        .register(meterRegistry);
+        io.micrometer.core.instrument.Counter settledTrades =
+                io.micrometer.core.instrument.Counter.builder("oms_trades_settled_total")
+                        .description("Trades settled (deduplicated)")
+                        .register(meterRegistry);
+
         // 8. Wire settlement handler
         coreEngine.setSettlementHandler((tradeId, buyerUserId, sellerUserId, marketId,
                                           price, quantity, buyerOmsOrderId, sellerOmsOrderId) -> {
+            long settleStart = System.nanoTime();
             // settleTradeExecution is idempotent on tradeId; an empty result means the trade was a
             // duplicate (re-delivered on leader switchover) and was NOT newly applied. Skip all
             // side effects so risk positions / open-order counts / overlock are not double-applied.
@@ -185,6 +214,8 @@ public class OmsApplication {
                 ledgerService.handleOverlock(buyerOmsOrderId, buyerUserId, marketId,
                         buyerOrder.getPrice(), price, quantity);
             }
+            settlementTimer.record(System.nanoTime() - settleStart, java.util.concurrent.TimeUnit.NANOSECONDS);
+            settledTrades.increment();
             return true;
         });
 
@@ -339,9 +370,27 @@ public class OmsApplication {
         WebSocketHandler wsHandler = new WebSocketHandler(authorizer);
 
         // 12. Order service
-        OrderService orderService = new OmsOrderServiceImpl(
+        OmsOrderServiceImpl orderServiceImpl = new OmsOrderServiceImpl(
                 coreEngine, riskEngine, ledgerService, clusterClient,
                 balanceStore, egressAdapter, idGenerator, marketDataProvider);
+        orderServiceImpl.setMeterRegistry(meterRegistry);
+        OrderService orderService = orderServiceImpl;
+
+        // 12b. Operational gauges (oms#38)
+        Gauge.builder("oms_active_orders", orderService, OrderService::getActiveOrderCount)
+                .description("Orders active in the OMS lifecycle").register(meterRegistry);
+        Gauge.builder("oms_ws_connections", wsHandler, WebSocketHandler::getConnectionCount)
+                .description("OMS WebSocket connections").register(meterRegistry);
+        Gauge.builder("oms_cluster_connected", egressAdapter, a -> a.isConnected() ? 1 : 0)
+                .description("Cluster egress session up (1) / down (0)").register(meterRegistry);
+        FunctionCounter.builder("oms_egress_status_gaps_total", egressAdapter, OmsEgressAdapter::getStatusGapCount)
+                .description("OrderStatus seq gaps detected on the egress wire").register(meterRegistry);
+        FunctionCounter.builder("oms_egress_trade_gaps_total", egressAdapter, OmsEgressAdapter::getTradeGapCount)
+                .description("TradeExecution id gaps detected on the egress wire").register(meterRegistry);
+        FunctionCounter.builder("oms_reconcile_repaired_total", coreEngine, OmsCoreEngine::getTotalRepairedOrders)
+                .description("Orders terminalized by membership repair").register(meterRegistry);
+        FunctionCounter.builder("oms_reconcile_relinked_total", coreEngine, OmsCoreEngine::getTotalRelinkedOrders)
+                .description("Orders re-linked to cluster ids by membership repair").register(meterRegistry);
 
         // 13. gRPC services (created before state listener so push methods can be called)
         GrpcOrderService grpcOrderSvc = new GrpcOrderService(orderService, authorizer, auditLog);
@@ -402,7 +451,7 @@ public class OmsApplication {
 
         // 16. HTTP server
         httpServer = new HttpServer(config.httpPort(), orderService, wsHandler, adminService,
-                authProvider, authorizer, corsPolicy, auditLog);
+                authProvider, authorizer, corsPolicy, auditLog, meterRegistry);
         httpServer.start();
 
         // 17. gRPC server

@@ -249,6 +249,15 @@ All configuration via environment variables with sensible defaults:
 | `OMS_CORS_ORIGINS` | _(empty)_ | CORS allowlist (comma-separated origins, or `*`); empty = no CORS headers |
 | `OMS_AUDIT_LOG` | `oms-audit.log` | Append-only JSONL audit log of order/account/admin mutations; `off` disables |
 
+### Metrics (oms#38)
+
+`GET /metrics` serves a Prometheus scrape (auth-exempt, like health — never
+proxy it publicly). Micrometer-backed: REST request latency percentiles per
+route, order accept/reject counters by reason, risk-check / ledger-hold /
+settlement timings, egress gap counters, reconcile repair/relink totals,
+active orders, WS connections, cluster connectivity, and JVM
+memory/GC/thread/CPU metrics.
+
 Note on secrets (oms#37): `OMS_POSTGRES_PASSWORD` has **no default** (the old
 `oms/oms` default is gone — unset means Postgres auth fails and the OMS runs
 without persistence). `OMS_POSTGRES_PASSWORD_FILE` and `OMS_JWT_SECRET_FILE`

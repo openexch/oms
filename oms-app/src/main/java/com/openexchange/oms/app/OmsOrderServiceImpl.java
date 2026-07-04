@@ -40,6 +40,21 @@ public class OmsOrderServiceImpl implements OrderService {
     // Slippage multiplier for market buy hold estimation (5% above best ask)
     private static final double MARKET_BUY_SLIPPAGE = 1.05;
 
+    // Optional admission-stage timers (oms#38); no-ops until a registry is set.
+    private io.micrometer.core.instrument.Timer riskCheckTimer;
+    private io.micrometer.core.instrument.Timer ledgerHoldTimer;
+
+    public void setMeterRegistry(io.micrometer.core.instrument.MeterRegistry registry) {
+        this.riskCheckTimer = io.micrometer.core.instrument.Timer.builder("oms_risk_check_seconds")
+                .description("Risk engine admission check latency")
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(registry);
+        this.ledgerHoldTimer = io.micrometer.core.instrument.Timer.builder("oms_ledger_hold_seconds")
+                .description("Ledger hold placement latency (Redis round-trip)")
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(registry);
+    }
+
     public OmsOrderServiceImpl(OmsCoreEngine coreEngine, RiskEngine riskEngine,
                                 LedgerService ledgerService, ClusterClient clusterClient,
                                 BalanceStore balanceStore, OmsEgressAdapter egressAdapter,
@@ -99,9 +114,13 @@ public class OmsOrderServiceImpl implements OrderService {
             lcm.registerOrder(order);
 
             // 2. Risk check
+            long riskStart = System.nanoTime();
             RiskResult riskResult = riskEngine.check(
                     order.getUserId(), order.getMarketId(), side, orderType,
                     order.getPrice(), order.getQuantity());
+            if (riskCheckTimer != null) {
+                riskCheckTimer.record(System.nanoTime() - riskStart, java.util.concurrent.TimeUnit.NANOSECONDS);
+            }
 
             if (!riskResult.isPassed()) {
                 lcm.onRiskRejected(order.getOmsOrderId(), riskResult.getRejectReason());
@@ -112,7 +131,11 @@ public class OmsOrderServiceImpl implements OrderService {
             lcm.onRiskPassed(order.getOmsOrderId());
 
             // 4. Place ledger hold
+            long holdStart = System.nanoTime();
             List<LedgerEntry> holdEntries = ledgerService.holdForOrder(order);
+            if (ledgerHoldTimer != null) {
+                ledgerHoldTimer.record(System.nanoTime() - holdStart, java.util.concurrent.TimeUnit.NANOSECONDS);
+            }
             if (holdEntries.isEmpty()) {
                 lcm.onHoldFailed(order.getOmsOrderId(), "Insufficient balance");
                 return CreateOrderResponse.rejected("Insufficient balance");

@@ -39,7 +39,9 @@ class RestApiHandlerValidationTest {
         EmbeddedChannel ch = new EmbeddedChannel(
                 new HttpAuthHandler(new DevAuthenticationProvider()),
                 new RestApiHandler(orderService, mock(AdminService.class),
-                        new RoleBasedAuthorizer(), CorsPolicy.fromSpec(""), AuditLog.disabled()));
+                        new RoleBasedAuthorizer(), CorsPolicy.fromSpec(""), AuditLog.disabled(),
+                        new io.micrometer.prometheusmetrics.PrometheusMeterRegistry(
+                                io.micrometer.prometheusmetrics.PrometheusConfig.DEFAULT)));
         FullHttpRequest req = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, method, uri,
                 body == null ? Unpooled.EMPTY_BUFFER : Unpooled.copiedBuffer(body, StandardCharsets.UTF_8));
         ch.writeInbound(req);
