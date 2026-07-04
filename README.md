@@ -242,6 +242,42 @@ All configuration via environment variables with sensible defaults:
 | `OMS_POSTGRES_USER` | `oms` | PostgreSQL user |
 | `OMS_POSTGRES_PASSWORD` | `oms` | PostgreSQL password |
 | `OMS_CLUSTER_INGRESS` | `localhost:9000` | Aeron Cluster ingress endpoint |
+| `OMS_AUTH_MODE` | `api-key` | Auth provider: `api-key`, `jwt`, or `dev` (see below) |
+| `OMS_API_KEYS` | _(empty)_ | Inline API keys: `key:userId[:ROLE1\|ROLE2];...` |
+| `OMS_API_KEYS_FILE` | _(empty)_ | API-key file, one `key:userId[:roles]` entry per line, `#` comments |
+| `OMS_JWT_SECRET` | _(empty)_ | HS256 secret, required when `OMS_AUTH_MODE=jwt` |
+
+## Authentication & Authorization (oms#36)
+
+Every external surface (REST, WebSocket upgrade, gRPC) authenticates through a
+pluggable seam in `oms-api`'s `auth` package: `AuthenticationProvider`
+(headers → `Principal{subject, userId, roles}`) and `Authorizer`
+(principal, action, resource). The caller's identity comes from the principal,
+never from the request: a body/query/path `userId` is honored only when the
+principal may act as that user (its own id, or the `ANY_USER` role), order-id
+routes are invisible for foreign orders (404), deposit/withdraw enforce the
+same ownership, and `/api/v1/admin/*` requires the `ADMIN` role. Unauthenticated
+calls get 401 (gRPC `UNAUTHENTICATED`); only `GET /api/v1/health` and CORS
+preflight are exempt.
+
+Reference providers, selected by `OMS_AUTH_MODE`:
+
+- **`api-key`** (default): static registry from `OMS_API_KEYS` /
+  `OMS_API_KEYS_FILE`, sent as `Authorization: Bearer <key>` or `X-API-Key`.
+  With no keys configured every request is rejected — secure by default.
+- **`jwt`**: HS256 verification with `OMS_JWT_SECRET`; claims `sub` (numeric
+  userId), `roles` (array), `exp` (enforced).
+- **`dev`**: accepts everything; no credentials → user 1 with
+  `ADMIN|ANY_USER` (keeps the demo UI and load harness working), and a
+  `Bearer dev:<userId>` token selects a user. Never use outside development.
+
+Browsers can't set arbitrary headers on a WebSocket upgrade, so a client may
+offer the subprotocol list `["bearer", "<token>"]` (`new WebSocket(url,
+['bearer', token])`) — the server selects `bearer` and reads the token from
+the `Sec-WebSocket-Protocol` header. Tokens are deliberately NOT accepted in
+the query string (URLs leak into access logs and browser history). Integrators plug real IAM
+by implementing `AuthenticationProvider`/`Authorizer` and wiring them in
+`OmsApplication` — KYC/session management stays the integrator's concern.
 
 ## Durability & Recovery (oms#35)
 

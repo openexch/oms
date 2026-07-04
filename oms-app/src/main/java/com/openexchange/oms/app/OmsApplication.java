@@ -3,6 +3,13 @@ package com.openexchange.oms.app;
 import com.openexchange.oms.api.HttpServer;
 import com.openexchange.oms.api.OrderService;
 import com.openexchange.oms.api.AdminService;
+import com.openexchange.oms.api.auth.ApiKeyAuthenticationProvider;
+import com.openexchange.oms.api.auth.AuthenticationProvider;
+import com.openexchange.oms.api.auth.Authorizer;
+import com.openexchange.oms.api.auth.DevAuthenticationProvider;
+import com.openexchange.oms.api.auth.GrpcAuthInterceptor;
+import com.openexchange.oms.api.auth.JwtAuthenticationProvider;
+import com.openexchange.oms.api.auth.RoleBasedAuthorizer;
 import com.openexchange.oms.api.grpc.GrpcAccountService;
 import com.openexchange.oms.api.grpc.GrpcOrderService;
 import com.openexchange.oms.api.grpc.GrpcServer;
@@ -317,8 +324,12 @@ public class OmsApplication {
             log.warn("Cluster connection failed at startup (will retry in background): {}", e.getMessage());
         }
 
-        // 11. WebSocket handler
-        WebSocketHandler wsHandler = new WebSocketHandler();
+        // 11. Auth seam (oms#36): provider per OMS_AUTH_MODE, shared authorizer
+        AuthenticationProvider authProvider = buildAuthProvider(config);
+        Authorizer authorizer = new RoleBasedAuthorizer();
+
+        // 11b. WebSocket handler
+        WebSocketHandler wsHandler = new WebSocketHandler(authorizer);
 
         // 12. Order service
         OrderService orderService = new OmsOrderServiceImpl(
@@ -326,8 +337,8 @@ public class OmsApplication {
                 balanceStore, egressAdapter, idGenerator, marketDataProvider);
 
         // 13. gRPC services (created before state listener so push methods can be called)
-        GrpcOrderService grpcOrderSvc = new GrpcOrderService(orderService);
-        GrpcAccountService grpcAccountSvc = new GrpcAccountService(orderService);
+        GrpcOrderService grpcOrderSvc = new GrpcOrderService(orderService, authorizer);
+        GrpcAccountService grpcAccountSvc = new GrpcAccountService(orderService, authorizer);
 
         // 14. Order state listener — pushes to WebSocket + gRPC, handles balance release
         lifecycleManager.setStateListener((order, oldStatus, newStatus) -> {
@@ -383,11 +394,13 @@ public class OmsApplication {
         AdminService adminService = new OmsAdminServiceImpl(configManager, riskEngine);
 
         // 16. HTTP server
-        httpServer = new HttpServer(config.httpPort(), orderService, wsHandler, adminService);
+        httpServer = new HttpServer(config.httpPort(), orderService, wsHandler, adminService,
+                authProvider, authorizer);
         httpServer.start();
 
         // 17. gRPC server
-        grpcServer = new GrpcServer(config.grpcPort(), grpcOrderSvc, grpcAccountSvc);
+        grpcServer = new GrpcServer(config.grpcPort(), grpcOrderSvc, grpcAccountSvc,
+                new GrpcAuthInterceptor(authProvider));
         grpcServer.start();
         log.info("gRPC server started on port {}", config.grpcPort());
 
@@ -410,6 +423,32 @@ public class OmsApplication {
         log.info("GTD expiry checker started (1s interval)");
 
         log.info("OMS Application started successfully");
+    }
+
+    private static AuthenticationProvider buildAuthProvider(OmsConfig config) {
+        switch (config.authMode()) {
+            case "dev":
+                log.warn("AUTH: dev mode — every request is accepted with caller-chosen identity. "
+                        + "NEVER use in production (set OMS_AUTH_MODE=api-key or jwt).");
+                return new DevAuthenticationProvider();
+            case "jwt":
+                log.info("AUTH: jwt mode (HS256)");
+                return new JwtAuthenticationProvider(config.jwtSecret());
+            case "api-key":
+                ApiKeyAuthenticationProvider provider =
+                        ApiKeyAuthenticationProvider.parse(config.apiKeys(), config.apiKeysFile());
+                if (provider.isEmpty()) {
+                    log.warn("AUTH: api-key mode with NO keys configured — every request will be "
+                            + "rejected. Set OMS_API_KEYS / OMS_API_KEYS_FILE, or OMS_AUTH_MODE=dev "
+                            + "for development.");
+                } else {
+                    log.info("AUTH: api-key mode");
+                }
+                return provider;
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown OMS_AUTH_MODE '" + config.authMode() + "' (expected api-key, jwt, or dev)");
+        }
     }
 
     public void stop() {

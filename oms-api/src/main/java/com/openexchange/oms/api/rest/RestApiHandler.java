@@ -4,6 +4,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.openexchange.oms.api.AdminService;
 import com.openexchange.oms.api.OrderService;
+import com.openexchange.oms.api.auth.Authorizer;
+import com.openexchange.oms.api.auth.HttpAuthHandler;
+import com.openexchange.oms.api.auth.Principal;
+import com.openexchange.oms.api.auth.RoleBasedAuthorizer;
 import com.openexchange.oms.api.dto.*;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -32,14 +36,16 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
 
     private final OrderService orderService;
     private final AdminService adminService;
+    private final Authorizer authorizer;
 
     public RestApiHandler(OrderService orderService) {
-        this(orderService, null);
+        this(orderService, null, new RoleBasedAuthorizer());
     }
 
-    public RestApiHandler(OrderService orderService, AdminService adminService) {
+    public RestApiHandler(OrderService orderService, AdminService adminService, Authorizer authorizer) {
         this.orderService = orderService;
         this.adminService = adminService;
+        this.authorizer = authorizer;
     }
 
     @Override
@@ -74,12 +80,19 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
                 handleGetAccount(ctx, uri);
             } else if (uri.equals("/api/v1/markets") && method == HttpMethod.GET) {
                 handleGetMarkets(ctx);
-            } else if (uri.startsWith("/api/v1/admin/risk/circuit-breaker/") && method == HttpMethod.POST) {
-                handleCircuitBreaker(ctx, uri);
-            } else if (uri.startsWith("/api/v1/admin/risk/config") && method == HttpMethod.GET) {
-                handleGetRiskConfig(ctx, uri);
-            } else if (uri.startsWith("/api/v1/admin/risk/config/") && method == HttpMethod.PUT) {
-                handleUpdateRiskConfig(ctx, uri, request);
+            } else if (uri.startsWith("/api/v1/admin/")) {
+                Principal principal = principal(ctx);
+                if (principal == null || !authorizer.allow(principal, Authorizer.ACTION_ADMIN, method + " " + uri)) {
+                    sendResponse(ctx, HttpResponseStatus.FORBIDDEN, "{\"error\":\"Admin role required\"}");
+                } else if (uri.startsWith("/api/v1/admin/risk/circuit-breaker/") && method == HttpMethod.POST) {
+                    handleCircuitBreaker(ctx, uri);
+                } else if (uri.startsWith("/api/v1/admin/risk/config/") && method == HttpMethod.PUT) {
+                    handleUpdateRiskConfig(ctx, uri, request);
+                } else if (uri.startsWith("/api/v1/admin/risk/config") && method == HttpMethod.GET) {
+                    handleGetRiskConfig(ctx, uri);
+                } else {
+                    sendResponse(ctx, HttpResponseStatus.NOT_FOUND, "{\"error\":\"Not Found\"}");
+                }
             } else {
                 sendResponse(ctx, HttpResponseStatus.NOT_FOUND, "{\"error\":\"Not Found\"}");
             }
@@ -88,6 +101,35 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
             sendResponse(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR,
                 "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
         }
+    }
+
+    private Principal principal(ChannelHandlerContext ctx) {
+        return ctx.channel().attr(HttpAuthHandler.PRINCIPAL).get();
+    }
+
+    /** Whether the authenticated caller may act as the given user. */
+    private boolean canActAs(ChannelHandlerContext ctx, long userId) {
+        Principal p = principal(ctx);
+        return p != null && authorizer.allow(p, Authorizer.ACTION_ACT_AS_USER, Long.toString(userId));
+    }
+
+    private void sendForbidden(ChannelHandlerContext ctx, long userId) {
+        sendResponse(ctx, HttpResponseStatus.FORBIDDEN,
+                "{\"error\":\"Forbidden: cannot act as user " + userId + "\"}");
+    }
+
+    /**
+     * Ownership gate for order-id routes (cancel/update/get): responds 404 for
+     * orders the caller may not touch — indistinguishable from a missing order,
+     * so order ids can't be probed.
+     */
+    private boolean deniedOrderAccess(ChannelHandlerContext ctx, long omsOrderId) {
+        OrderResponse existing = orderService.getOrder(omsOrderId);
+        if (existing != null && !canActAs(ctx, existing.getUserId())) {
+            sendResponse(ctx, HttpResponseStatus.NOT_FOUND, "{\"error\":\"Order not found\"}");
+            return true;
+        }
+        return false;
     }
 
     private void handleHealth(ChannelHandlerContext ctx) throws Exception {
@@ -102,6 +144,16 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         String body = request.content().toString(StandardCharsets.UTF_8);
         CreateOrderRequest req = MAPPER.readValue(body, CreateOrderRequest.class);
 
+        // Identity comes from the principal; a caller-supplied userId is only
+        // honored when the principal may act as that user (0 = unspecified).
+        Principal p = principal(ctx);
+        long userId = p == null ? req.getUserId() : p.resolveUserId(req.getUserId());
+        if (!canActAs(ctx, userId)) {
+            sendForbidden(ctx, userId);
+            return;
+        }
+        req.setUserId(userId);
+
         CreateOrderResponse resp = orderService.createOrder(req);
 
         HttpResponseStatus status = resp.isAccepted()
@@ -112,6 +164,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private void handleCancelOrder(ChannelHandlerContext ctx, String uri) throws Exception {
         String idStr = uri.substring("/api/v1/orders/".length());
         long omsOrderId = Long.parseLong(idStr);
+        if (deniedOrderAccess(ctx, omsOrderId)) return;
         CancelOrderResponse resp = orderService.cancelOrder(omsOrderId);
         sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
     }
@@ -119,6 +172,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private void handleUpdateOrder(ChannelHandlerContext ctx, FullHttpRequest request, String uri) throws Exception {
         String idStr = uri.substring("/api/v1/orders/".length());
         long omsOrderId = Long.parseLong(idStr);
+        if (deniedOrderAccess(ctx, omsOrderId)) return;
         String body = request.content().toString(StandardCharsets.UTF_8);
         Map<String, Object> params = MAPPER.readValue(body, Map.class);
 
@@ -141,7 +195,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         String idStr = uri.substring("/api/v1/orders/".length());
         long omsOrderId = Long.parseLong(idStr);
         OrderResponse resp = orderService.getOrder(omsOrderId);
-        if (resp == null) {
+        if (resp == null || !canActAs(ctx, resp.getUserId())) {
             sendResponse(ctx, HttpResponseStatus.NOT_FOUND, "{\"error\":\"Order not found\"}");
         } else {
             sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
@@ -155,12 +209,17 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         String statusStr = decoder.parameters().containsKey("status")
             ? decoder.parameters().get("status").getFirst() : null;
 
-        if (userIdStr == null) {
+        Principal p = principal(ctx);
+        if (userIdStr == null && p == null) {
             sendResponse(ctx, HttpResponseStatus.BAD_REQUEST, "{\"error\":\"userId required\"}");
             return;
         }
 
-        long userId = Long.parseLong(userIdStr);
+        long userId = userIdStr != null ? Long.parseLong(userIdStr) : p.userId();
+        if (!canActAs(ctx, userId)) {
+            sendForbidden(ctx, userId);
+            return;
+        }
         var orders = orderService.queryOrders(userId, statusStr);
         sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(orders));
     }
@@ -172,6 +231,10 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
             idStr = idStr.substring(0, slash);
         }
         long userId = Long.parseLong(idStr);
+        if (!canActAs(ctx, userId)) {
+            sendForbidden(ctx, userId);
+            return;
+        }
         var balances = orderService.getBalances(userId);
         sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(balances));
     }
@@ -179,6 +242,10 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     @SuppressWarnings("unchecked")
     private void handleDeposit(ChannelHandlerContext ctx, String uri, FullHttpRequest request) throws Exception {
         long userId = extractAccountUserId(uri);
+        if (!canActAs(ctx, userId)) {
+            sendForbidden(ctx, userId);
+            return;
+        }
         String body = request.content().toString(StandardCharsets.UTF_8);
         Map<String, Object> req = MAPPER.readValue(body, Map.class);
 
@@ -199,6 +266,10 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     @SuppressWarnings("unchecked")
     private void handleWithdraw(ChannelHandlerContext ctx, String uri, FullHttpRequest request) throws Exception {
         long userId = extractAccountUserId(uri);
+        if (!canActAs(ctx, userId)) {
+            sendForbidden(ctx, userId);
+            return;
+        }
         String body = request.content().toString(StandardCharsets.UTF_8);
         Map<String, Object> req = MAPPER.readValue(body, Map.class);
 
@@ -323,7 +394,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private static void addCorsHeaders(FullHttpResponse response) {
         response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_ORIGIN, "*");
         response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, PUT, DELETE, OPTIONS");
-        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type");
+        response.headers().set(HttpHeaderNames.ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, X-API-Key");
         response.headers().set("Access-Control-Allow-Private-Network", "true");
     }
 

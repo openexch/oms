@@ -3,6 +3,10 @@ package com.openexchange.oms.api.websocket;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.openexchange.oms.api.auth.Authorizer;
+import com.openexchange.oms.api.auth.HttpAuthHandler;
+import com.openexchange.oms.api.auth.Principal;
+import com.openexchange.oms.api.auth.RoleBasedAuthorizer;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
@@ -33,6 +37,16 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<WebSocketFrame
     // userId → set of contexts (for broadcasting updates to all connections of a user)
     private final Map<Long, Set<ChannelHandlerContext>> userConnections = new ConcurrentHashMap<>();
 
+    private final Authorizer authorizer;
+
+    public WebSocketHandler() {
+        this(new RoleBasedAuthorizer());
+    }
+
+    public WebSocketHandler(Authorizer authorizer) {
+        this.authorizer = authorizer;
+    }
+
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) throws Exception {
         if (frame instanceof TextWebSocketFrame textFrame) {
@@ -46,7 +60,20 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<WebSocketFrame
             String op = msg.has("op") ? msg.get("op").asText() : "";
 
             if ("subscribe".equals(op)) {
-                long userId = msg.get("userId").asLong();
+                // Identity: principal attached at the HTTP upgrade; a
+                // self-declared userId is only honored when permitted.
+                Principal principal = ctx.channel().attr(HttpAuthHandler.PRINCIPAL).get();
+                long requested = msg.has("userId") ? msg.get("userId").asLong() : 0;
+                long userId = principal != null ? principal.resolveUserId(requested) : requested;
+                if (principal == null
+                        || !authorizer.allow(principal, Authorizer.ACTION_ACT_AS_USER, Long.toString(userId))) {
+                    ObjectNode err = MAPPER.createObjectNode();
+                    err.put("type", "ERROR");
+                    err.put("error", "Forbidden: cannot subscribe as user " + userId);
+                    ctx.writeAndFlush(new TextWebSocketFrame(MAPPER.writeValueAsString(err)));
+                    ctx.close();
+                    return;
+                }
                 Set<String> channels = new CopyOnWriteArraySet<>();
                 if (msg.has("channels")) {
                     for (JsonNode ch : msg.get("channels")) {
