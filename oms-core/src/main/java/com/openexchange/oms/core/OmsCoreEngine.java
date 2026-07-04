@@ -289,14 +289,25 @@ public class OmsCoreEngine {
      *
      * Race guards: only orders with clusterOrderId BELOW the snapshot's orderId
      * cutoff are eligible (created-after-snapshot orders are legitimately
-     * absent), and clusterOrderId-less PENDING_NEW orders are only reconciled
-     * by omsOrderId when older than ORPHAN_MIN_AGE_MS at request time.
+     * absent), and clusterOrderId-less orders are only reconciled by omsOrderId
+     * when older than ORPHAN_MIN_AGE_MS at request time.
      * Fills already settled via TradeExecution decide FILLED vs CANCELLED.
+     *
+     * clusterOrderId-less repair covers every submitted-to-cluster state, not
+     * just PENDING_NEW (oms#53): when the ack carrying the clusterOrderId is
+     * lost at a seam but TradeExecutions still arrive (matched by omsOrderId),
+     * the order sits NEW/PARTIALLY_FILLED with cid=0 — invisible to the
+     * clusterOrderId membership check and previously outside the orphan path,
+     * i.e. a permanent zombie that resurrected on every startup rebuild. Such
+     * an order still open on the cluster (snapshot carries its omsOrderId) is
+     * RE-LINKED by adopting the snapshot's clusterOrderId; one the cluster no
+     * longer has open is terminalized like any other lost order.
      */
     public int reconcileAgainstOpenOrders(org.agrona.collections.LongHashSet clusterOpenOrderIds,
-                                          org.agrona.collections.LongHashSet clusterOpenOmsIds,
+                                          org.agrona.collections.Long2LongHashMap clusterOmsToClusterId,
                                           long snapshotMaxOrderId, long requestTimeMs) {
         ArrayList<OmsOrder> toTerminalize = new ArrayList<>();
+        ArrayList<OmsOrder> toRelink = new ArrayList<>();
         lifecycleManager.forEachActiveOrder(order -> {
             OmsOrderStatus st = order.getStatus();
             if (st == OmsOrderStatus.PENDING_TRIGGER) {
@@ -307,12 +318,26 @@ public class OmsCoreEngine {
                 if (cid < snapshotMaxOrderId && !clusterOpenOrderIds.contains(cid)) {
                     toTerminalize.add(order);
                 }
-            } else if (st == OmsOrderStatus.PENDING_NEW
-                    && requestTimeMs - order.getCreatedAtMs() > ORPHAN_MIN_AGE_MS
-                    && !clusterOpenOmsIds.contains(order.getOmsOrderId())) {
-                toTerminalize.add(order);
+            } else if ((st == OmsOrderStatus.PENDING_NEW || st == OmsOrderStatus.NEW
+                    || st == OmsOrderStatus.PARTIALLY_FILLED)
+                    && requestTimeMs - order.getCreatedAtMs() > ORPHAN_MIN_AGE_MS) {
+                // PENDING_RISK/PENDING_HOLD stay out: pre-cluster admission states.
+                if (clusterOmsToClusterId.containsKey(order.getOmsOrderId())) {
+                    toRelink.add(order);
+                } else {
+                    toTerminalize.add(order);
+                }
             }
         });
+        for (OmsOrder order : toRelink) {
+            long clusterOrderId = clusterOmsToClusterId.get(order.getOmsOrderId());
+            log.warn("Membership repair: re-linking open order omsOrderId={} to clusterOrderId={} "
+                    + "(ack lost, order still open on cluster)", order.getOmsOrderId(), clusterOrderId);
+            lifecycleManager.onSentToCluster(order.getOmsOrderId(), clusterOrderId);
+            if (persistenceHandler != null) {
+                persistenceHandler.persistOrderUpdate(order);
+            }
+        }
         for (OmsOrder order : toTerminalize) {
             boolean fullyFilled = order.getFilledQty() >= order.getQuantity();
             log.warn("Membership repair: terminalizing lost order omsOrderId={} clusterOrderId={} "

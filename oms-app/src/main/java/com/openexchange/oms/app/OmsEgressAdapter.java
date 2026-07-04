@@ -35,7 +35,8 @@ public class OmsEgressAdapter implements EgressListener {
 
     /** Accumulates OpenOrdersSnapshot chunks for the active requestId. */
     private final LongHashSet snapshotOrderIds = new LongHashSet();
-    private final LongHashSet snapshotOmsOrderIds = new LongHashSet();
+    /** omsOrderId → clusterOrderId of cluster-open orders, for orphan repair + re-linking (oms#53). */
+    private final Long2LongHashMap snapshotOmsToClusterId = new Long2LongHashMap(0L);
     private long snapshotRequestId;
     private long snapshotRequestTimeMs;
 
@@ -102,21 +103,21 @@ public class OmsEgressAdapter implements EgressListener {
             // New snapshot stream (or one we did not ask for): start accumulating fresh.
             snapshotRequestId = requestId;
             snapshotOrderIds.clear();
-            snapshotOmsOrderIds.clear();
+            snapshotOmsToClusterId.clear();
         }
         for (OpenOrdersSnapshotDecoder.OrdersDecoder order : decoder.orders()) {
             snapshotOrderIds.add(order.orderId());
             if (order.omsOrderId() != 0) {
-                snapshotOmsOrderIds.add(order.omsOrderId());
+                snapshotOmsToClusterId.put(order.omsOrderId(), order.orderId());
             }
         }
         if (decoder.isLast() == 1) {
             log.info("OpenOrdersSnapshot complete: requestId={} openOrders={} maxOrderId={}",
                     requestId, snapshotOrderIds.size(), maxOrderId);
-            coreEngine.reconcileAgainstOpenOrders(snapshotOrderIds, snapshotOmsOrderIds,
+            coreEngine.reconcileAgainstOpenOrders(snapshotOrderIds, snapshotOmsToClusterId,
                     maxOrderId, snapshotRequestTimeMs);
             snapshotOrderIds.clear();
-            snapshotOmsOrderIds.clear();
+            snapshotOmsToClusterId.clear();
             snapshotRequestId = 0;
         }
     }
