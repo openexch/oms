@@ -35,6 +35,80 @@ jobs:
       - name: Build and test
         run: mvn -B clean verify
 
+  # Full-stack failover E2E (oms#41 / P5.1): real 3-node Aeron cluster +
+  # real OMS + Postgres + Redis on the runner; kills the leader mid-load and
+  # asserts convergence + exact ledger invariants. See e2e/README.md.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out match (cluster + match-common)
+        uses: actions/checkout@v7
+        with:
+          repository: openexch/match
+          ref: main
+          path: _match
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      # Aeron needs real socket buffers: the cluster log/replay channels run
+      # 64m terms, and the kernel default rmem_max (~208k) can't open their
+      # flow-control window — archive replay never connects and post-kill
+      # elections hang in "log replication has not progressed". Same tuning
+      # as match `make optimize-os` on dev boxes.
+      - name: Kernel socket buffers for Aeron
+        run: sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+
+      - name: Build match-cluster jar
+        run: mvn -B -f _match/pom.xml install -DskipTests -pl match-cluster -am
+
+      - name: Build OMS app jar
+        run: mvn -B package -DskipTests
+
+      - name: Failover E2E
+        env:
+          E2E_MATCH_JAR: _match/match-cluster/target/match-cluster.jar
+          E2E_OMS_JAR: oms-app/target/oms-app-1.0-SNAPSHOT.jar
+          E2E_PG_USER: postgres
+          E2E_PG_PASSWORD: postgres
+          E2E_REDIS_PORT: "6379"
+          E2E_WORKDIR: ${{ runner.temp }}/e2e
+        run: python3 e2e/failover_e2e.py
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: ${{ runner.temp }}/e2e/logs
+
   # Dependency CVEs + committed secrets (oms#41 / P5.1). Trivy covers both on a
   # private repo without GitHub Advanced Security; triaged findings go in .trivyignore.
   # Same job as match/admin-gateway (match#43, admin-gateway#27).

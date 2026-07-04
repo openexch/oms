@@ -132,6 +132,20 @@ public class OmsEgressAdapter implements EgressListener {
         }
     }
 
+    /**
+     * Stale-orphan sweep (oms#41): called from the 1s timer thread. When a
+     * submitted order has outlived the orphan age gate without a
+     * clusterOrderId (create/ack lost at a seam) and nothing else will
+     * trigger a reconcile (quiet cluster: no seq gaps, no reconnects),
+     * request one. Rate-limited by the shared resnapshot limiter and
+     * self-quenching: the reconcile terminalizes or re-links the orphans.
+     */
+    public void sweepStaleOrphans() {
+        if (isConnected() && coreEngine.hasStaleSubmittedOrphans(System.currentTimeMillis())) {
+            requestOpenOrdersResnapshot("stale-orphan sweep");
+        }
+    }
+
     private void requestOpenOrdersResnapshot(String reason) {
         final long now = System.currentTimeMillis();
         if (now - lastResnapshotRequestMs < RESNAPSHOT_MIN_INTERVAL_MS) {

@@ -118,6 +118,24 @@ class OmsCoreEngineReconcileTest {
     }
 
     @Test
+    void staleSubmittedOrphansAreDetectedForTheSweep() {
+        // oms#41: the 1s sweep uses this to trigger a reconcile when in-flight
+        // orders lost at a seam would otherwise sit PENDING_NEW forever.
+        assertFalse(engine.hasStaleSubmittedOrphans(NOW), "empty book: no orphans");
+
+        OmsOrder fresh = activeOrder(120, OmsOrderStatus.PENDING_NEW, 0, FRESH, 0);
+        assertFalse(engine.hasStaleSubmittedOrphans(NOW), "inside the age gate: not stale yet");
+
+        OmsOrder linked = activeOrder(121, OmsOrderStatus.NEW, 777, OLD, 0);
+        OmsOrder preCluster = activeOrder(122, OmsOrderStatus.PENDING_HOLD, 0, OLD, 0);
+        assertFalse(engine.hasStaleSubmittedOrphans(NOW),
+                "linked and pre-cluster orders are not orphans");
+
+        OmsOrder stale = activeOrder(123, OmsOrderStatus.PENDING_NEW, 0, OLD, 0);
+        assertTrue(engine.hasStaleSubmittedOrphans(NOW), "aged clusterOrderId-less PENDING_NEW");
+    }
+
+    @Test
     void linkedOrderRepairStillWorksAndFullyFilledBecomesFilled() {
         OmsOrder gone = activeOrder(107, OmsOrderStatus.NEW, 555, OLD, 0);
         OmsOrder full = activeOrder(108, OmsOrderStatus.PARTIALLY_FILLED, 556, OLD, 10_00000000L);

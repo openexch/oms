@@ -271,6 +271,31 @@ public class OmsCoreEngine {
      *  their CreateOrder may legitimately still be in flight. */
     private static final long ORPHAN_MIN_AGE_MS = 10_000;
 
+    /**
+     * True when a submitted order has sat past ORPHAN_MIN_AGE_MS without ever
+     * learning its clusterOrderId — its CreateOrder or ack was lost at a
+     * switchover seam. The oms#41 failover E2E exposed the gap this closes:
+     * on a QUIET cluster the post-reconnect reconcile runs while such orders
+     * are still inside the age gate, no later reconcile ever triggers (no seq
+     * gaps, no reconnects), and they sit PENDING_NEW forever — uncancellable
+     * zombies ("Order is in-flight, please retry shortly") that eat slots.
+     * The 1s timer uses this to trigger a rate-limited reconcile sweep.
+     */
+    public boolean hasStaleSubmittedOrphans(long nowMs) {
+        final boolean[] found = {false};
+        lifecycleManager.forEachActiveOrder(order -> {
+            if (!found[0]
+                    && order.getClusterOrderId() == 0
+                    && (order.getStatus() == OmsOrderStatus.PENDING_NEW
+                        || order.getStatus() == OmsOrderStatus.NEW
+                        || order.getStatus() == OmsOrderStatus.PARTIALLY_FILLED)
+                    && nowMs - order.getCreatedAtMs() > ORPHAN_MIN_AGE_MS) {
+                found[0] = true;
+            }
+        });
+        return found[0];
+    }
+
     /** Delegate an OpenOrdersSnapshot request to the cluster (match#31). */
     public void requestOpenOrdersSnapshot(long requestId, String reason) {
         if (clusterSubmitHandler != null) {

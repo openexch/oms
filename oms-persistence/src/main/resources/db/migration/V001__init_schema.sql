@@ -8,8 +8,11 @@ CREATE TABLE account_balances (
     PRIMARY KEY (user_id, asset_id)
 );
 
+-- PK must include the partition column (PostgreSQL requirement for
+-- partitioned tables; the old entry_id-only PK made this whole statement
+-- fail silently on PG 16 when applied without ON_ERROR_STOP).
 CREATE TABLE ledger_entries (
-    entry_id BIGSERIAL PRIMARY KEY,
+    entry_id BIGSERIAL,
     journal_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     asset_id INT NOT NULL,
@@ -18,7 +21,8 @@ CREATE TABLE ledger_entries (
     is_debit BOOLEAN NOT NULL,
     reference_id BIGINT,
     secondary_ref BIGINT,
-    entry_time TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    entry_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (entry_id, entry_time)
 ) PARTITION BY RANGE (entry_time);
 
 -- Create initial partitions for current and next month
