@@ -359,6 +359,26 @@ public class OmsApplication {
             }
         });
 
+        // 14b. Slot-count rebaseline after every membership reconcile (oms#49):
+        // derived openOrderCounts can drift from lifecycle truth when status
+        // transitions are dropped at switchover seams; recomputing from the
+        // just-reconciled lifecycle bounds any drift to one snapshot cycle.
+        coreEngine.setPostReconcileHook(() -> {
+            java.util.HashMap<Long, Long> truth = new java.util.HashMap<>();
+            lifecycleManager.forEachActiveOrder(o -> {
+                OmsOrderStatus st = o.getStatus();
+                if (st == OmsOrderStatus.PENDING_NEW || st == OmsOrderStatus.NEW
+                        || st == OmsOrderStatus.PARTIALLY_FILLED || st == OmsOrderStatus.PENDING_TRIGGER) {
+                    truth.merge(o.getUserId(), 1L, Long::sum);
+                }
+            });
+            long drift = riskEngine.rebaselineOpenOrderCounts(truth);
+            if (drift != 0) {
+                log.warn("Open-order slot rebaseline corrected drift of {} across {} users (oms#49)",
+                        drift, truth.size());
+            }
+        });
+
         // 15. Admin service
         AdminService adminService = new OmsAdminServiceImpl(configManager, riskEngine);
 

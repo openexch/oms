@@ -188,12 +188,13 @@ public class OmsOrderServiceImpl implements OrderService {
             return CancelOrderResponse.rejected("Order not found or already terminal");
         }
 
-        // If order is PENDING_TRIGGER (synthetic), remove from synthetic engine and release hold
+        // If order is PENDING_TRIGGER (synthetic), remove from synthetic engine.
+        // Hold + slot release happens in the state listener on the CANCELLED
+        // transition below — releasing here too double-credited the hold once
+        // the listener learned to release PENDING_TRIGGER terminals (oms#49).
         if (order.getStatus() == OmsOrderStatus.PENDING_TRIGGER) {
             coreEngine.getSyntheticEngine().removeOrder(order);
-            ledgerService.releaseForCancel(order);
             lcm.onClusterOrderStatus(omsOrderId, 0, 3, 0, 0); // status 3 = CANCELLED
-            riskEngine.onOrderClosed(order.getUserId());
             return CancelOrderResponse.accepted(omsOrderId);
         }
 
