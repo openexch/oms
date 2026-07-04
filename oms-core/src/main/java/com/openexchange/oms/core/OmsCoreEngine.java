@@ -266,6 +266,69 @@ public class OmsCoreEngine {
         return toRecancel.size();
     }
 
+    /** Orders younger than this at snapshot time are never orphan-terminalized:
+     *  their CreateOrder may legitimately still be in flight. */
+    private static final long ORPHAN_MIN_AGE_MS = 10_000;
+
+    /** Delegate an OpenOrdersSnapshot request to the cluster (match#31). */
+    public void requestOpenOrdersSnapshot(long requestId, String reason) {
+        if (clusterSubmitHandler != null) {
+            log.info("Requesting open-orders snapshot: requestId={} reason={}", requestId, reason);
+            clusterSubmitHandler.submitOpenOrdersSnapshotRequest(requestId);
+        }
+    }
+
+    /**
+     * Membership repair (match#31 / oms#34): terminalize OMS-active orders the
+     * cluster no longer has open. Their terminal statuses were lost on the wire
+     * (publisher drops / batch shed / switchover seams) — the 14.05% divergence
+     * measured by the P1.5 gate. Terminalizing through onClusterOrderStatus
+     * reuses the normal paths, so holds are released and the per-user
+     * open-order slot is freed (the oms#34 leak).
+     *
+     * Race guards: only orders with clusterOrderId BELOW the snapshot's orderId
+     * cutoff are eligible (created-after-snapshot orders are legitimately
+     * absent), and clusterOrderId-less PENDING_NEW orders are only reconciled
+     * by omsOrderId when older than ORPHAN_MIN_AGE_MS at request time.
+     * Fills already settled via TradeExecution decide FILLED vs CANCELLED.
+     */
+    public int reconcileAgainstOpenOrders(org.agrona.collections.LongHashSet clusterOpenOrderIds,
+                                          org.agrona.collections.LongHashSet clusterOpenOmsIds,
+                                          long snapshotMaxOrderId, long requestTimeMs) {
+        ArrayList<OmsOrder> toTerminalize = new ArrayList<>();
+        lifecycleManager.forEachActiveOrder(order -> {
+            OmsOrderStatus st = order.getStatus();
+            if (st == OmsOrderStatus.PENDING_TRIGGER) {
+                return; // synthetic parent: legitimately not on the cluster book
+            }
+            long cid = order.getClusterOrderId();
+            if (cid != 0) {
+                if (cid < snapshotMaxOrderId && !clusterOpenOrderIds.contains(cid)) {
+                    toTerminalize.add(order);
+                }
+            } else if (st == OmsOrderStatus.PENDING_NEW
+                    && requestTimeMs - order.getCreatedAtMs() > ORPHAN_MIN_AGE_MS
+                    && !clusterOpenOmsIds.contains(order.getOmsOrderId())) {
+                toTerminalize.add(order);
+            }
+        });
+        for (OmsOrder order : toTerminalize) {
+            boolean fullyFilled = order.getFilledQty() >= order.getQuantity();
+            log.warn("Membership repair: terminalizing lost order omsOrderId={} clusterOrderId={} "
+                            + "filled={}/{} as {}",
+                    order.getOmsOrderId(), order.getClusterOrderId(),
+                    order.getFilledQty(), order.getQuantity(),
+                    fullyFilled ? "FILLED" : "CANCELLED");
+            lifecycleManager.onClusterOrderStatus(order.getOmsOrderId(), order.getClusterOrderId(),
+                    fullyFilled ? 2 : 3, // cluster raw status: FILLED : CANCELLED
+                    fullyFilled ? 0L : order.getRemainingQty(), order.getFilledQty());
+        }
+        if (!toTerminalize.isEmpty()) {
+            log.info("Membership repair terminalized {} lost order(s)", toTerminalize.size());
+        }
+        return toTerminalize.size();
+    }
+
     // ==================== Helpers ====================
 
     private void requestCancel(OmsOrder order) {
@@ -319,5 +382,7 @@ public class OmsCoreEngine {
         void submitTriggeredOrder(OmsOrder parentOrder, OmsOrderType childType, long childPrice);
         void submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity);
         void submitCancel(long clusterOrderId, long userId, int marketId);
+        /** match#31: ask the cluster for an OpenOrdersSnapshot egress. */
+        void submitOpenOrdersSnapshotRequest(long requestId);
     }
 }

@@ -272,6 +272,12 @@ public class OmsApplication {
             }
 
             @Override
+            public void submitOpenOrdersSnapshotRequest(long requestId) {
+                clusterClient.submitOrder(
+                        com.openexchange.oms.cluster.OrderSubmission.requestOpenOrdersSnapshot(requestId));
+            }
+
+            @Override
             public void submitCancel(long clusterOrderId, long userId, int marketId) {
                 OrderSubmission cancel = OrderSubmission.cancelOrder(
                         userId, clusterOrderId, marketId);
