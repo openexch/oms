@@ -29,6 +29,7 @@ public class OmsCoreEngine {
     private PersistenceHandler persistenceHandler;
     // Pluggable cluster submit handler
     private ClusterSubmitHandler clusterSubmitHandler;
+    private Runnable postReconcileHook;
 
     // Reconcile (post-reconnect / leader-switchover): after a switchover, a cancel or its terminal
     // egress can be lost at the seam, leaving OMS holding an order it already tried to cancel (oms#21).
@@ -333,7 +334,19 @@ public class OmsCoreEngine {
         if (!toTerminalize.isEmpty()) {
             log.info("Membership repair terminalized {} lost order(s)", toTerminalize.size());
         }
+        // Post-reconcile audit hook (oms#49): lifecycle state is freshly trued
+        // up against the cluster here, making this the right moment to
+        // rebaseline derived bookkeeping (risk open-order slot counts) that
+        // can drift when status transitions are dropped at switchover seams.
+        if (postReconcileHook != null) {
+            postReconcileHook.run();
+        }
         return toTerminalize.size();
+    }
+
+    /** See reconcileAgainstOpenOrders: runs after every membership reconcile. */
+    public void setPostReconcileHook(Runnable hook) {
+        this.postReconcileHook = hook;
     }
 
     // ==================== Helpers ====================

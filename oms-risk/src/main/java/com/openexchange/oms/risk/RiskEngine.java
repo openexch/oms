@@ -547,6 +547,31 @@ public final class RiskEngine {
     }
 
     /**
+     * Replace ALL open-order counts with lifecycle truth (oms#49). Under
+     * election churn the increment/decrement bookkeeping can drift from the
+     * lifecycle manager's reality (status updates dropped at seams), walling
+     * users into OPEN_ORDER_LIMIT with only a handful of real open orders.
+     * Called after every open-orders reconcile so any residual drift lasts at
+     * most one snapshot cycle. Returns the total absolute correction applied.
+     */
+    public long rebaselineOpenOrderCounts(java.util.Map<Long, Long> truth) {
+        long drift = 0;
+        for (final java.util.Map.Entry<Long, Long> e : openOrderCounts.entrySet()) {
+            if (!truth.containsKey(e.getKey())) {
+                drift += Math.abs(e.getValue());
+            }
+        }
+        for (final java.util.Map.Entry<Long, Long> e : truth.entrySet()) {
+            drift += Math.abs(getOpenOrderCount(e.getKey()) - e.getValue());
+        }
+        openOrderCounts.clear();
+        for (final java.util.Map.Entry<Long, Long> e : truth.entrySet()) {
+            openOrderCounts.put(e.getKey().longValue(), e.getValue().longValue());
+        }
+        return drift;
+    }
+
+    /**
      * Get the current tracked position for a user in a market.
      *
      * @return signed position in fixed-point (positive = net long, negative = net short)
