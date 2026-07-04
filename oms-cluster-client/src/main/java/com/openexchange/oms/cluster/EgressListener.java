@@ -49,6 +49,9 @@ public interface EgressListener {
      * @param filledQty    total filled quantity
      * @param isBuy        true if the order is on the BUY side
      * @param omsOrderId   OMS-assigned order identifier
+     * @param statusSeq    per-market monotonic sequence (match#31, schema v3+);
+     *                     a gap means the publisher dropped statuses in between.
+     *                     0 when the stream predates schema v3.
      */
     void onOrderStatusUpdate(
             int marketId,
@@ -59,7 +62,16 @@ public interface EgressListener {
             long remainingQty,
             long filledQty,
             boolean isBuy,
-            long omsOrderId);
+            long omsOrderId,
+            long statusSeq);
+
+    /**
+     * Called for each OpenOrdersSnapshot chunk (match#31): the cluster's
+     * open-order membership set, requested after a reconnect or a detected
+     * statusSeq/tradeId gap. The decoder is valid only during this call.
+     * Default no-op.
+     */
+    default void onOpenOrdersSnapshot(com.match.infrastructure.generated.OpenOrdersSnapshotDecoder decoder) {}
 
     /**
      * Called when a book delta (incremental update) is received from the cluster.

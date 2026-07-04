@@ -96,6 +96,8 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
     private final OrderStatusBatchDecoder orderStatusBatchDecoder = new OrderStatusBatchDecoder();
     private final BookDeltaDecoder bookDeltaDecoder = new BookDeltaDecoder();
     private final BookSnapshotDecoder bookSnapshotDecoder = new BookSnapshotDecoder();
+    private final OpenOrdersSnapshotDecoder openOrdersSnapshotDecoder = new OpenOrdersSnapshotDecoder();
+    private final RequestOpenOrdersSnapshotEncoder requestOpenOrdersEncoder = new RequestOpenOrdersSnapshotEncoder();
 
     // MPSC queue: API threads enqueue OrderSubmission, polling thread drains and encodes/offers
     private final ManyToOneConcurrentArrayQueue<OrderSubmission> orderQueue =
@@ -645,6 +647,10 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                         .orderType(submission.getOrderType())
                         .orderSide(submission.getOrderSide());
                 return MessageHeaderEncoder.ENCODED_LENGTH + updateOrderEncoder.encodedLength();
+            case REQUEST_OPEN_ORDERS:
+                requestOpenOrdersEncoder.wrapAndApplyHeader(encodeBuffer, 0, headerEncoder);
+                requestOpenOrdersEncoder.requestId(submission.getOrderId());
+                return MessageHeaderEncoder.ENCODED_LENGTH + requestOpenOrdersEncoder.encodedLength();
             default: // CANCEL
                 cancelOrderEncoder.wrapAndApplyHeader(encodeBuffer, 0, headerEncoder);
                 cancelOrderEncoder
@@ -765,6 +771,11 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                 listener.onBookSnapshot(bookSnapshotDecoder.marketId(), bookSnapshotDecoder);
                 break;
 
+            case OpenOrdersSnapshotDecoder.TEMPLATE_ID:
+                openOrdersSnapshotDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                listener.onOpenOrdersSnapshot(openOrdersSnapshotDecoder);
+                break;
+
             default:
                 if (egressMessageCount <= 10) {
                     log.debug("EGRESS: Unknown templateId={}", templateId);
@@ -802,6 +813,11 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
         }
     }
 
+    /** Streams older than schema v3 have no statusSeq: map the SBE null to 0. */
+    private static long normalizeStatusSeq(long raw) {
+        return raw == OrderStatusBatchDecoder.OrdersDecoder.statusSeqNullValue() ? 0L : raw;
+    }
+
     /**
      * Decode an OrderStatusBatch and dispatch individual order status callbacks.
      */
@@ -821,7 +837,8 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                         order.remainingQty(),
                         order.filledQty(),
                         isBuy,
-                        order.omsOrderId());
+                        order.omsOrderId(),
+                        normalizeStatusSeq(order.statusSeq()));
             } catch (Exception e) {
                 log.error("EgressListener.onOrderStatusUpdate() threw exception for orderId={}",
                         order.orderId(), e);

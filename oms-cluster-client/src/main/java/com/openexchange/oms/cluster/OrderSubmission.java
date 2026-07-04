@@ -12,7 +12,9 @@ public final class OrderSubmission {
     public enum Type {
         CREATE,
         CANCEL,
-        UPDATE
+        UPDATE,
+        /** match#31: ask the cluster to re-emit the open-order membership set. */
+        REQUEST_OPEN_ORDERS
     }
 
     private final Type type;
@@ -77,6 +79,16 @@ public final class OrderSubmission {
         return new OrderSubmission(
                 Type.CANCEL, userId, marketId, 0L, 0L, 0L,
                 null, null, 0L, orderId);
+    }
+
+    /**
+     * Request an OpenOrdersSnapshot egress (match#31). The requestId rides in
+     * the orderId slot and is echoed back on every snapshot chunk.
+     */
+    public static OrderSubmission requestOpenOrdersSnapshot(long requestId) {
+        return new OrderSubmission(
+                Type.REQUEST_OPEN_ORDERS, 0L, 0, 0L, 0L, 0L,
+                null, null, 0L, requestId);
     }
 
     /**
