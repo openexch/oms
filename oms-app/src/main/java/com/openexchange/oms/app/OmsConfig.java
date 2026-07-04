@@ -2,6 +2,11 @@ package com.openexchange.oms.app;
 
 /**
  * OMS application configuration.
+ *
+ * Auth (oms#36): authMode selects the AuthenticationProvider — "api-key"
+ * (secure default; with no keys configured every request is rejected),
+ * "jwt" (HS256, requires jwtSecret), or "dev" (accepts everything — must be
+ * opted into explicitly, never production).
  */
 public record OmsConfig(
     int httpPort,
@@ -12,7 +17,11 @@ public record OmsConfig(
     String postgresUser,
     String postgresPassword,
     String clusterIngress,
-    int nodeId
+    int nodeId,
+    String authMode,
+    String apiKeys,
+    String apiKeysFile,
+    String jwtSecret
 ) {
     public static OmsConfig loadDefaults() {
         return new OmsConfig(
@@ -24,7 +33,11 @@ public record OmsConfig(
             prop("OMS_POSTGRES_USER", "oms"),
             prop("OMS_POSTGRES_PASSWORD", "oms"),
             prop("OMS_CLUSTER_INGRESS", "localhost:9000"),
-            intProp("OMS_NODE_ID", 0)
+            intProp("OMS_NODE_ID", 0),
+            prop("OMS_AUTH_MODE", "api-key"),
+            prop("OMS_API_KEYS", ""),
+            prop("OMS_API_KEYS_FILE", ""),
+            prop("OMS_JWT_SECRET", "")
         );
     }
 

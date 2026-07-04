@@ -1,5 +1,8 @@
 package com.openexchange.oms.api;
 
+import com.openexchange.oms.api.auth.AuthenticationProvider;
+import com.openexchange.oms.api.auth.Authorizer;
+import com.openexchange.oms.api.auth.HttpAuthHandler;
 import com.openexchange.oms.api.rest.RestApiHandler;
 import com.openexchange.oms.api.websocket.WebSocketHandler;
 import com.openexchange.oms.api.AdminService;
@@ -24,19 +27,20 @@ public class HttpServer {
     private final OrderService orderService;
     private final WebSocketHandler webSocketHandler;
     private final AdminService adminService;
+    private final AuthenticationProvider authProvider;
+    private final Authorizer authorizer;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
 
-    public HttpServer(int port, OrderService orderService, WebSocketHandler webSocketHandler) {
-        this(port, orderService, webSocketHandler, null);
-    }
-
-    public HttpServer(int port, OrderService orderService, WebSocketHandler webSocketHandler, AdminService adminService) {
+    public HttpServer(int port, OrderService orderService, WebSocketHandler webSocketHandler,
+                      AdminService adminService, AuthenticationProvider authProvider, Authorizer authorizer) {
         this.port = port;
         this.orderService = orderService;
         this.webSocketHandler = webSocketHandler;
         this.adminService = adminService;
+        this.authProvider = authProvider;
+        this.authorizer = authorizer;
     }
 
     public void start() throws InterruptedException {
@@ -52,20 +56,26 @@ public class HttpServer {
                     ChannelPipeline pipeline = ch.pipeline();
                     pipeline.addLast(new HttpServerCodec());
                     pipeline.addLast(new HttpObjectAggregator(1048576)); // 1MB max
+                    // Auth gate: every request (incl. the WS upgrade) is
+                    // authenticated here; the Principal rides on the channel.
+                    pipeline.addLast(new HttpAuthHandler(authProvider));
                     // Route: /ws/v1 → WebSocket, everything else → REST
                     pipeline.addLast(new ChannelInboundHandlerAdapter() {
                         @Override
                         public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
                             if (msg instanceof FullHttpRequest req) {
                                 if (req.uri().startsWith("/ws/v1")) {
-                                    // Upgrade to WebSocket
-                                    ctx.pipeline().addLast(new WebSocketServerProtocolHandler("/ws/v1"));
+                                    // Upgrade to WebSocket. "bearer" subprotocol is offered by
+                                    // browser clients passing a token via Sec-WebSocket-Protocol
+                                    // (see HttpAuthHandler); clients offering no subprotocol
+                                    // still negotiate fine.
+                                    ctx.pipeline().addLast(new WebSocketServerProtocolHandler("/ws/v1", "bearer"));
                                     ctx.pipeline().addLast(webSocketHandler);
                                     ctx.pipeline().remove(this);
                                     ctx.fireChannelRead(msg);
                                 } else {
                                     // REST handler
-                                    ctx.pipeline().addLast(new RestApiHandler(orderService, adminService));
+                                    ctx.pipeline().addLast(new RestApiHandler(orderService, adminService, authorizer));
                                     ctx.pipeline().remove(this);
                                     ctx.fireChannelRead(msg);
                                 }

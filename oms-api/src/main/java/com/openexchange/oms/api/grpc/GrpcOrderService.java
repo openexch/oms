@@ -1,6 +1,8 @@
 package com.openexchange.oms.api.grpc;
 
 import com.openexchange.oms.api.OrderService;
+import com.openexchange.oms.api.auth.Authorizer;
+import com.openexchange.oms.api.auth.RoleBasedAuthorizer;
 import com.openexchange.oms.api.dto.CreateOrderRequest;
 import com.openexchange.oms.api.dto.CreateOrderResponse;
 import com.openexchange.oms.api.dto.CancelOrderResponse;
@@ -24,21 +26,30 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
     private static final Logger log = LoggerFactory.getLogger(GrpcOrderService.class);
 
     private final OrderService orderService;
+    private final Authorizer authorizer;
 
     // Streaming subscriptions
     private final Map<Long, Set<StreamObserver<OrderUpdate>>> orderStreamsByUser = new ConcurrentHashMap<>();
     private final Map<Long, Set<StreamObserver<ExecutionReport>>> executionStreamsByUser = new ConcurrentHashMap<>();
 
     public GrpcOrderService(OrderService orderService) {
+        this(orderService, new RoleBasedAuthorizer());
+    }
+
+    public GrpcOrderService(OrderService orderService, Authorizer authorizer) {
         this.orderService = orderService;
+        this.authorizer = authorizer;
     }
 
     @Override
     public void createOrder(com.openexchange.oms.grpc.CreateOrderRequest request,
                              StreamObserver<com.openexchange.oms.grpc.CreateOrderResponse> responseObserver) {
         try {
+            Long userId = GrpcAuth.resolveUserId(authorizer, request.getUserId(), responseObserver);
+            if (userId == null) return;
+
             CreateOrderRequest dto = new CreateOrderRequest();
-            dto.setUserId(request.getUserId());
+            dto.setUserId(userId);
             dto.setMarketId(request.getMarketId());
             dto.setSide(request.getSide());
             dto.setOrderType(request.getOrderType());
@@ -73,6 +84,12 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
     public void cancelOrder(CancelOrderRequest request,
                              StreamObserver<com.openexchange.oms.grpc.CancelOrderResponse> responseObserver) {
         try {
+            // Ownership gate: not-found and not-yours are indistinguishable.
+            OrderResponse existing = orderService.getOrder(request.getOmsOrderId());
+            if (existing != null && !GrpcAuth.canActAs(authorizer, existing.getUserId())) {
+                responseObserver.onError(io.grpc.Status.NOT_FOUND.withDescription("Order not found").asRuntimeException());
+                return;
+            }
             CancelOrderResponse resp = orderService.cancelOrder(request.getOmsOrderId());
 
             com.openexchange.oms.grpc.CancelOrderResponse grpcResp =
@@ -94,7 +111,7 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
                           StreamObserver<com.openexchange.oms.grpc.OrderResponse> responseObserver) {
         try {
             OrderResponse resp = orderService.getOrder(request.getOmsOrderId());
-            if (resp == null) {
+            if (resp == null || !GrpcAuth.canActAs(authorizer, resp.getUserId())) {
                 responseObserver.onError(io.grpc.Status.NOT_FOUND.withDescription("Order not found").asRuntimeException());
                 return;
             }
@@ -108,7 +125,9 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
 
     @Override
     public void streamOrders(StreamRequest request, StreamObserver<OrderUpdate> responseObserver) {
-        long userId = request.getUserId();
+        Long allowed = GrpcAuth.resolveUserId(authorizer, request.getUserId(), responseObserver);
+        if (allowed == null) return;
+        long userId = allowed;
         Set<StreamObserver<OrderUpdate>> observers =
                 orderStreamsByUser.computeIfAbsent(userId, k -> new CopyOnWriteArraySet<>());
         observers.add(responseObserver);
@@ -123,7 +142,9 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
 
     @Override
     public void streamExecutions(StreamRequest request, StreamObserver<ExecutionReport> responseObserver) {
-        long userId = request.getUserId();
+        Long allowed = GrpcAuth.resolveUserId(authorizer, request.getUserId(), responseObserver);
+        if (allowed == null) return;
+        long userId = allowed;
         Set<StreamObserver<ExecutionReport>> observers =
                 executionStreamsByUser.computeIfAbsent(userId, k -> new CopyOnWriteArraySet<>());
         observers.add(responseObserver);

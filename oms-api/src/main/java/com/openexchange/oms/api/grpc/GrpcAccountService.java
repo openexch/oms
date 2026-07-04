@@ -1,6 +1,8 @@
 package com.openexchange.oms.api.grpc;
 
 import com.openexchange.oms.api.OrderService;
+import com.openexchange.oms.api.auth.Authorizer;
+import com.openexchange.oms.api.auth.RoleBasedAuthorizer;
 import com.openexchange.oms.grpc.*;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
@@ -21,10 +23,16 @@ public class GrpcAccountService extends AccountServiceGrpc.AccountServiceImplBas
     private static final Logger log = LoggerFactory.getLogger(GrpcAccountService.class);
 
     private final OrderService orderService;
+    private final Authorizer authorizer;
     private final Map<Long, Set<StreamObserver<BalanceUpdate>>> balanceStreamsByUser = new ConcurrentHashMap<>();
 
     public GrpcAccountService(OrderService orderService) {
+        this(orderService, new RoleBasedAuthorizer());
+    }
+
+    public GrpcAccountService(OrderService orderService, Authorizer authorizer) {
         this.orderService = orderService;
+        this.authorizer = authorizer;
     }
 
     @Override
@@ -32,7 +40,9 @@ public class GrpcAccountService extends AccountServiceGrpc.AccountServiceImplBas
     public void getBalances(GetBalancesRequest request,
                              StreamObserver<BalancesResponse> responseObserver) {
         try {
-            long userId = request.getUserId();
+            Long allowed = GrpcAuth.resolveUserId(authorizer, request.getUserId(), responseObserver);
+            if (allowed == null) return;
+            long userId = allowed;
             Map<String, Object> balances = orderService.getBalances(userId);
 
             BalancesResponse.Builder builder = BalancesResponse.newBuilder()
@@ -63,7 +73,9 @@ public class GrpcAccountService extends AccountServiceGrpc.AccountServiceImplBas
 
     @Override
     public void streamBalances(StreamRequest request, StreamObserver<BalanceUpdate> responseObserver) {
-        long userId = request.getUserId();
+        Long allowed = GrpcAuth.resolveUserId(authorizer, request.getUserId(), responseObserver);
+        if (allowed == null) return;
+        long userId = allowed;
         Set<StreamObserver<BalanceUpdate>> observers =
                 balanceStreamsByUser.computeIfAbsent(userId, k -> new CopyOnWriteArraySet<>());
         observers.add(responseObserver);
