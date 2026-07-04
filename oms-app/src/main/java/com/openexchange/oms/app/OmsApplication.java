@@ -225,7 +225,17 @@ public class OmsApplication {
                                 ? com.match.infrastructure.generated.OrderSide.BID
                                 : com.match.infrastructure.generated.OrderSide.ASK;
 
-                long totalPrice = com.match.domain.FixedPoint.multiply(childPrice, parentOrder.getQuantity());
+                // Exact since match#30; the CHILD price differs from the admitted
+                // parent's, so its notional needs its own overflow guard.
+                long totalPrice;
+                try {
+                    totalPrice = com.match.domain.FixedPoint.multiply(childPrice, parentOrder.getQuantity());
+                } catch (ArithmeticException e) {
+                    log.error("Triggered child order notional overflows fixed-point — not submitted: "
+                            + "parentOmsOrderId={}, childPrice={}, qty={}",
+                            parentOrder.getOmsOrderId(), childPrice, parentOrder.getQuantity());
+                    return;
+                }
 
                 OrderSubmission submission = OrderSubmission.createOrder(
                         parentOrder.getUserId(), parentOrder.getMarketId(),
@@ -236,7 +246,17 @@ public class OmsApplication {
 
             @Override
             public void submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {
-                long totalPrice = com.match.domain.FixedPoint.multiply(icebergOrder.getPrice(), sliceQuantity);
+                // Slice notional <= admitted parent notional, so this cannot throw
+                // for coherent slices; guarded all the same (exact since match#30).
+                long totalPrice;
+                try {
+                    totalPrice = com.match.domain.FixedPoint.multiply(icebergOrder.getPrice(), sliceQuantity);
+                } catch (ArithmeticException e) {
+                    log.error("Iceberg slice notional overflows fixed-point — not submitted: "
+                            + "omsOrderId={}, price={}, sliceQty={}",
+                            icebergOrder.getOmsOrderId(), icebergOrder.getPrice(), sliceQuantity);
+                    return;
+                }
 
                 com.match.infrastructure.generated.OrderSide sbeSide =
                         icebergOrder.getSide() == OrderSide.BUY

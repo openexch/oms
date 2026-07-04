@@ -164,7 +164,15 @@ public class OmsOrderServiceImpl implements OrderService {
     private static OrderSubmission getOrderSubmission(OmsOrderType orderType, OrderSide side, OmsOrder order) {
         com.match.infrastructure.generated.OrderType sbeOrderType = mapOrderType(orderType);
         com.match.infrastructure.generated.OrderSide sbeOrderSide = mapOrderSide(side);
-        long totalPrice = FixedPoint.multiply(order.getPrice(), order.getQuantity());
+        // Exact since match#30. Risk checks reject overflowing notionals before
+        // this point on the normal path; converting to IllegalArgumentException
+        // routes any residual case into the caller's rejected-response path.
+        long totalPrice;
+        try {
+            totalPrice = FixedPoint.multiply(order.getPrice(), order.getQuantity());
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException("Order notional overflows fixed-point");
+        }
 
         return OrderSubmission.createOrder(
                 order.getUserId(), order.getMarketId(),
