@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package com.openexchange.oms.api.auth;
 
 import com.fasterxml.jackson.databind.JsonNode;

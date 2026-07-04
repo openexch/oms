@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 Full-stack failover E2E (oms#41 / P5.1) — P1's acceptance test in miniature,
 runnable on a clean clone (GitHub Actions) or a dev box.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package com.openexchange.oms.persistence;
 
 import com.openexchange.oms.common.domain.OmsOrder;

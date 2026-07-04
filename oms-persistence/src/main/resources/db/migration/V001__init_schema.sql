@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: Apache-2.0
 CREATE TABLE account_balances (
     user_id BIGINT NOT NULL,
     asset_id INT NOT NULL,

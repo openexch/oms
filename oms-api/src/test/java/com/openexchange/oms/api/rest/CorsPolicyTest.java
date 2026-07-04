@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package com.openexchange.oms.api.rest;
 
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
