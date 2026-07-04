@@ -133,16 +133,20 @@ oms/
 
 ### Create Order
 
+Money crosses the wire as exact 8-dp decimal strings and 64-bit ids as JSON
+strings — the full frozen contract lives in [docs/API.md](docs/API.md)
+([OpenAPI](docs/openapi.yaml); internal SBE wire: [docs/PROTOCOLS.md](docs/PROTOCOLS.md)).
+
 ```bash
 curl -X POST http://localhost:8080/api/v1/orders \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "userId": 1,
     "marketId": 1,
     "side": "BUY",
     "orderType": "LIMIT",
-    "price": 50000.0,
-    "quantity": 1.0
+    "price": "50000",
+    "quantity": "1.0"
   }'
 ```
 
@@ -163,7 +167,7 @@ curl http://localhost:8080/api/v1/accounts/1
 ```bash
 curl -X POST http://localhost:8080/api/v1/accounts/1/deposit \
   -H "Content-Type: application/json" \
-  -d '{"assetId": 0, "amount": 100000.0}'
+  -d '{"assetId": 0, "amount": "100000"}'
 ```
 
 ### gRPC Streaming (Orders)

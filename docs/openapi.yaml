@@ -1,0 +1,303 @@
+openapi: 3.0.3
+info:
+  title: Open Exchange OMS API
+  version: "1.0"
+  description: |
+    Frozen v1 contract (oms#39 / P4.1). Money crosses the wire as exact
+    8-dp decimal strings; 64-bit Snowflake ids as JSON strings. See
+    docs/API.md for conventions and the stability policy.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+paths:
+  /api/v1/health:
+    get:
+      summary: Liveness (no auth)
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  clusterConnected: { type: boolean }
+                  activeOrders: { type: integer }
+  /metrics:
+    get:
+      summary: Prometheus metrics (no auth)
+      security: []
+      responses:
+        "200": { description: Prometheus text exposition }
+  /api/v1/orders:
+    post:
+      summary: Create order
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOrderRequest" }
+      responses:
+        "201":
+          description: Accepted by admission (terminal state arrives via status stream)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateOrderResponse" }
+        "400":
+          description: Rejected (business) or invalid input
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/CreateOrderResponse"
+                  - $ref: "#/components/schemas/Error"
+    get:
+      summary: Query the principal's ACTIVE orders
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string }
+        - name: userId
+          in: query
+          description: Only honored when the principal may act as this user
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Active orders (full history is oms#40)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/OrderResponse" }
+  /api/v1/orders/{omsOrderId}:
+    parameters:
+      - name: omsOrderId
+        in: path
+        required: true
+        schema: { $ref: "#/components/schemas/Id" }
+    get:
+      summary: Get order (active orders only)
+      responses:
+        "200":
+          description: Order
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderResponse" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      summary: Cancel-and-replace price and/or quantity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                price: { $ref: "#/components/schemas/Money" }
+                quantity: { $ref: "#/components/schemas/Money" }
+      responses:
+        "200":
+          description: Update submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: boolean }
+                  omsOrderId: { $ref: "#/components/schemas/Id" }
+                  message: { type: string }
+        "400": { $ref: "#/components/responses/Validation" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      summary: Cancel order
+      responses:
+        "200":
+          description: Cancel result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: boolean }
+                  omsOrderId: { $ref: "#/components/schemas/Id" }
+                  message: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v1/accounts/{userId}:
+    get:
+      summary: Balances
+      parameters:
+        - { name: userId, in: path, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        "200":
+          description: Asset balances
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  userId: { type: integer, format: int64 }
+                  assets:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        asset: { type: string, example: BTC }
+                        assetId: { type: integer }
+                        available: { $ref: "#/components/schemas/Money" }
+                        locked: { $ref: "#/components/schemas/Money" }
+                        total: { $ref: "#/components/schemas/Money" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v1/accounts/{userId}/deposit:
+    post:
+      summary: Credit balance
+      parameters:
+        - { name: userId, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MoneyMovement" }
+      responses:
+        "200": { $ref: "#/components/responses/MoneyMovementOk" }
+        "400": { $ref: "#/components/responses/Validation" }
+  /api/v1/accounts/{userId}/withdraw:
+    post:
+      summary: Debit balance
+      parameters:
+        - { name: userId, in: path, required: true, schema: { type: integer, format: int64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MoneyMovement" }
+      responses:
+        "200": { $ref: "#/components/responses/MoneyMovementOk" }
+        "400":
+          description: Invalid input (VALIDATION) or exceeds available (REJECTED)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/v1/markets:
+    get:
+      summary: Market list
+      responses:
+        "200":
+          description: Markets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    marketId: { type: integer }
+                    symbol: { type: string, example: BTC-USD }
+                    baseAsset: { type: string }
+                    quoteAsset: { type: string }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+  schemas:
+    Money:
+      type: string
+      pattern: '^\d+(\.\d{1,8})?$'
+      description: Exact decimal, at most 8 fractional digits. Responses always carry 8.
+      example: "110224.00000000"
+    Id:
+      type: string
+      pattern: '^\d+$'
+      description: 64-bit id as a string (exceeds JS 2^53 as a number)
+      example: "331884039403208704"
+    CreateOrderRequest:
+      type: object
+      required: [marketId, side, orderType, quantity]
+      properties:
+        marketId: { type: integer }
+        side: { type: string, enum: [BUY, SELL] }
+        orderType: { type: string, enum: [LIMIT, MARKET, LIMIT_MAKER, STOP_LOSS, STOP_LIMIT, TRAILING_STOP, ICEBERG] }
+        timeInForce: { type: string, enum: [GTC, GTD, IOC, FOK], default: GTC }
+        price: { $ref: "#/components/schemas/Money" }
+        quantity: { $ref: "#/components/schemas/Money" }
+        stopPrice: { $ref: "#/components/schemas/Money" }
+        trailingDelta: { $ref: "#/components/schemas/Money" }
+        displayQuantity: { $ref: "#/components/schemas/Money" }
+        expiresAtMs: { type: integer, format: int64 }
+        clientOrderId: { type: string, maxLength: 64 }
+        userId:
+          type: integer
+          format: int64
+          description: Only honored when the principal may act as this user
+    CreateOrderResponse:
+      type: object
+      properties:
+        accepted: { type: boolean }
+        omsOrderId: { $ref: "#/components/schemas/Id" }
+        status: { type: string }
+        rejectReason:
+          type: string
+          nullable: true
+          description: One of the fixed vocabulary in docs/API.md when accepted=false
+    OrderResponse:
+      type: object
+      properties:
+        omsOrderId: { $ref: "#/components/schemas/Id" }
+        clusterOrderId: { $ref: "#/components/schemas/Id" }
+        clientOrderId: { type: string, nullable: true }
+        userId: { type: integer, format: int64 }
+        marketId: { type: integer }
+        side: { type: string, enum: [BUY, SELL] }
+        orderType: { type: string }
+        timeInForce: { type: string }
+        price: { $ref: "#/components/schemas/Money" }
+        quantity: { $ref: "#/components/schemas/Money" }
+        filledQty: { $ref: "#/components/schemas/Money" }
+        remainingQty: { $ref: "#/components/schemas/Money" }
+        stopPrice: { $ref: "#/components/schemas/Money" }
+        status: { type: string, enum: [PENDING_RISK, PENDING_HOLD, PENDING_NEW, PENDING_TRIGGER, NEW, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED] }
+        rejectReason: { type: string, nullable: true }
+        createdAtMs: { type: integer, format: int64 }
+        updatedAtMs: { type: integer, format: int64 }
+    MoneyMovement:
+      type: object
+      required: [assetId, amount]
+      properties:
+        assetId: { type: integer, minimum: 1 }
+        amount: { $ref: "#/components/schemas/Money" }
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error: { type: string }
+        code:
+          type: string
+          enum: [VALIDATION, UNAUTHORIZED, FORBIDDEN, NOT_FOUND, REJECTED, ADMIN_UNAVAILABLE, INTERNAL]
+  responses:
+    Validation:
+      description: Invalid input
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Principal may not act as this user
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found (includes foreign order ids — not probeable)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MoneyMovementOk:
+      description: Movement applied
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success: { type: boolean }
+              userId: { type: integer, format: int64 }
+              assetId: { type: integer }
+              amount: { $ref: "#/components/schemas/Money" }
