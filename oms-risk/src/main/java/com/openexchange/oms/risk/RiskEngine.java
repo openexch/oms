@@ -319,7 +319,15 @@ public final class RiskEngine {
             effectivePrice = price;
         }
 
-        final long notional = FixedPoint.multiply(effectivePrice, quantity);
+        // Exact since match#30; throws when the true notional does not fit
+        // 64-bit fixed-point — which is by definition beyond any max-notional
+        // config, so reject as TOO_LARGE instead of surfacing a 500.
+        final long notional;
+        try {
+            notional = FixedPoint.multiply(effectivePrice, quantity);
+        } catch (ArithmeticException e) {
+            return RiskResult.reject(RiskRejectReason.NOTIONAL_TOO_LARGE);
+        }
 
         if (notional < config.getMinNotional()) {
             return RiskResult.reject(RiskRejectReason.NOTIONAL_TOO_SMALL);
@@ -429,7 +437,13 @@ public final class RiskEngine {
             } else {
                 effectivePrice = price;
             }
-            amount = FixedPoint.multiply(effectivePrice, quantity);
+            // A cost estimate that cannot be represented cannot be affordable:
+            // reject rather than let the (exact, match#30) multiply throw a 500.
+            try {
+                amount = FixedPoint.multiply(effectivePrice, quantity);
+            } catch (ArithmeticException e) {
+                return RiskResult.reject(RiskRejectReason.NOTIONAL_TOO_LARGE);
+            }
             assetId = market.quoteAsset().id();
         } else {
             amount = quantity;

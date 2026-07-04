@@ -46,9 +46,17 @@ public class LedgerService {
         long holdAmount;
 
         if (order.isBuy()) {
-            // Buy: hold quote asset (price * quantity)
+            // Buy: hold quote asset (price * quantity). Exact since match#30; an
+            // unrepresentable hold can never be funded — fail the hold like any
+            // other invalid amount instead of letting the throw escape.
             holdAssetId = market.quoteAsset().id();
-            holdAmount = FixedPoint.multiply(order.getPrice(), order.getQuantity());
+            try {
+                holdAmount = FixedPoint.multiply(order.getPrice(), order.getQuantity());
+            } catch (ArithmeticException e) {
+                log.error("Hold amount overflows fixed-point: orderId={}, price={}, qty={}",
+                        order.getOmsOrderId(), order.getPrice(), order.getQuantity());
+                return Collections.emptyList();
+            }
         } else {
             // Sell: hold base asset (quantity)
             holdAssetId = market.baseAsset().id();
@@ -111,7 +119,9 @@ public class LedgerService {
 
         if (order.isBuy()) {
             // Buy: release remaining quote hold
-            // holdAmount was price * originalQty; already consumed = price * filledQty
+            // holdAmount was price * originalQty; already consumed = price * filledQty.
+            // Cannot throw: filledQty <= quantity, so this is bounded by the hold
+            // amount that was representable at admission (settlement-path invariant).
             holdAssetId = market.quoteAsset().id();
             long consumed = FixedPoint.multiply(order.getPrice(), order.getFilledQty());
             releaseAmount = order.getHoldAmount() - consumed;
