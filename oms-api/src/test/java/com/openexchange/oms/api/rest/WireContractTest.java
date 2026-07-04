@@ -65,6 +65,51 @@ class WireContractTest {
     }
 
     @Test
+    void executionResponseSerializesMoneyAndIdsAsStrings() throws Exception {
+        com.openexchange.oms.common.domain.ExecutionReport exec =
+                new com.openexchange.oms.common.domain.ExecutionReport();
+        exec.setTradeId(BIG_ID);
+        exec.setOmsOrderId(BIG_ID + 1);
+        exec.setUserId(7);
+        exec.setMarketId(1);
+        exec.setSide(com.openexchange.oms.common.enums.OrderSide.BUY);
+        exec.setPrice(11_022_400_000_000L);       // 110224.00000000
+        exec.setQuantity(10_000_001L);            // 0.10000001
+        exec.setMaker(true);
+        exec.setExecutedAtMs(1_700_000_000_000L);
+
+        JsonNode json = MAPPER.readTree(MAPPER.writeValueAsString(
+                com.openexchange.oms.api.dto.ExecutionResponse.fromExecution(exec)));
+
+        assertTrue(json.get("tradeId").isTextual(), "tradeId must be a JSON string");
+        assertEquals("330211482313099544", json.get("tradeId").textValue());
+        assertEquals("330211482313099545", json.get("omsOrderId").textValue());
+        assertTrue(json.get("userId").isNumber(), "small userId stays a number");
+        assertEquals("110224.00000000", json.get("price").textValue());
+        assertEquals("0.10000001", json.get("quantity").textValue());
+        assertTrue(json.get("maker").isBoolean());
+        assertEquals(1_700_000_000_000L, json.get("executedAtMs").longValue());
+    }
+
+    @Test
+    void positionResponseSerializesSignedNetQuantityAsString() throws Exception {
+        JsonNode json = MAPPER.readTree(MAPPER.writeValueAsString(
+                new com.openexchange.oms.api.dto.PositionResponse(7, 1, -10_000_000L)));
+        assertEquals("-0.10000000", json.get("netQuantity").textValue(),
+                "net positions are signed decimal strings");
+    }
+
+    @Test
+    void duplicateCreateResponseCarriesFlagAndExistingId() throws Exception {
+        JsonNode json = MAPPER.readTree(MAPPER.writeValueAsString(
+                CreateOrderResponse.duplicate(BIG_ID, "NEW")));
+        assertTrue(json.get("accepted").booleanValue());
+        assertTrue(json.get("duplicate").booleanValue());
+        assertEquals("330211482313099544", json.get("omsOrderId").textValue());
+        assertEquals("NEW", json.get("status").textValue());
+    }
+
+    @Test
     void createOrderRequestParsesDecimalStringsExactly() throws Exception {
         CreateOrderRequest req = MAPPER.readValue(
                 "{\"marketId\":1,\"side\":\"BUY\",\"orderType\":\"LIMIT\","

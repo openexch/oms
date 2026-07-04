@@ -50,6 +50,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     static final String ERR_NOT_FOUND = "NOT_FOUND";
     static final String ERR_REJECTED = "REJECTED";
     static final String ERR_ADMIN_UNAVAILABLE = "ADMIN_UNAVAILABLE";
+    static final String ERR_UNAVAILABLE = "UNAVAILABLE";
     static final String ERR_INTERNAL = "INTERNAL";
 
     private final OrderService orderService;
@@ -112,6 +113,12 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
                 handleHealth(ctx);
             } else if (uri.equals("/api/v1/orders") && method == HttpMethod.POST) {
                 handleCreateOrder(ctx, request);
+            } else if (stripQuery(uri).equals("/api/v1/orders/history") && method == HttpMethod.GET) {
+                handleOrderHistory(ctx, request);
+            } else if (stripQuery(uri).equals("/api/v1/executions") && method == HttpMethod.GET) {
+                handleExecutions(ctx, request);
+            } else if (stripQuery(uri).equals("/api/v1/positions") && method == HttpMethod.GET) {
+                handlePositions(ctx, request);
             } else if (uri.startsWith("/api/v1/orders/") && method == HttpMethod.DELETE) {
                 handleCancelOrder(ctx, uri);
             } else if (uri.startsWith("/api/v1/orders/") && method == HttpMethod.PUT) {
@@ -150,16 +157,22 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         }
     }
 
+    private static String stripQuery(String uri) {
+        int q = uri.indexOf('?');
+        return q >= 0 ? uri.substring(0, q) : uri;
+    }
+
     /** Fixed-cardinality route label: id/query parts stripped. */
     private static String routeLabel(String uri, HttpMethod method) {
-        String path = uri;
-        int q = path.indexOf('?');
-        if (q >= 0) path = path.substring(0, q);
+        String path = stripQuery(uri);
         String m = method.name();
         if (path.equals("/metrics")) return "metrics";
         if (path.equals("/api/v1/health")) return "health";
         if (path.equals("/api/v1/markets")) return "markets";
         if (path.equals("/api/v1/orders")) return m.equals("POST") ? "orders.create" : "orders.query";
+        if (path.equals("/api/v1/orders/history")) return "orders.history";
+        if (path.equals("/api/v1/executions")) return "executions";
+        if (path.equals("/api/v1/positions")) return "positions";
         if (path.startsWith("/api/v1/orders/")) {
             return switch (m) {
                 case "DELETE" -> "orders.cancel";
@@ -301,16 +314,19 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         // Reject reasons are a small fixed set (risk enum + admission strings).
         Counter.builder("oms_orders_total")
                 .description("Order submissions by outcome")
-                .tag("result", resp.isAccepted() ? "accepted" : "rejected")
+                .tag("result", resp.isDuplicate() ? "duplicate" : resp.isAccepted() ? "accepted" : "rejected")
                 .tag("reason", resp.isAccepted() ? "none"
                         : (resp.getRejectReason() != null ? resp.getRejectReason().replace(' ', '_') : "unknown"))
                 .register(meterRegistry)
                 .increment();
 
         audit(ctx, "order.create", "user:" + userId, resp.isAccepted(),
-                resp.isAccepted() ? "omsOrderId=" + resp.getOmsOrderId() : resp.getRejectReason());
-        HttpResponseStatus status = resp.isAccepted()
-            ? HttpResponseStatus.CREATED : HttpResponseStatus.BAD_REQUEST;
+                resp.isAccepted()
+                        ? "omsOrderId=" + resp.getOmsOrderId() + (resp.isDuplicate() ? " duplicate" : "")
+                        : resp.getRejectReason());
+        // Duplicate clientOrderId replays the existing order: 200, not 201 (oms#40)
+        HttpResponseStatus status = !resp.isAccepted() ? HttpResponseStatus.BAD_REQUEST
+                : resp.isDuplicate() ? HttpResponseStatus.OK : HttpResponseStatus.CREATED;
         sendResponse(ctx, status, MAPPER.writeValueAsString(resp));
     }
 
@@ -386,24 +402,105 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
 
     private void handleQueryOrders(ChannelHandlerContext ctx, FullHttpRequest request) throws Exception {
         QueryStringDecoder decoder = new QueryStringDecoder(request.uri());
-        String userIdStr = decoder.parameters().containsKey("userId")
-            ? decoder.parameters().get("userId").getFirst() : null;
-        String statusStr = decoder.parameters().containsKey("status")
-            ? decoder.parameters().get("status").getFirst() : null;
+        Long userId = resolveQueryUserId(ctx, decoder);
+        if (userId == null) return;
+        var orders = orderService.queryOrders(userId, firstParam(decoder, "status"));
+        sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(orders));
+    }
 
+    /**
+     * History reads (oms#40) — Postgres-backed, so they survive OMS restarts.
+     * All three take the same identity/paging query params; 503 UNAVAILABLE
+     * when the OMS runs without persistence.
+     */
+    private void handleOrderHistory(ChannelHandlerContext ctx, FullHttpRequest request) throws Exception {
+        QueryStringDecoder decoder = new QueryStringDecoder(request.uri());
+        Long userId = resolveQueryUserId(ctx, decoder);
+        if (userId == null) return;
+        String status = firstParam(decoder, "status");
+        Integer limit = intParam(ctx, decoder, "limit", 100);
+        Integer offset = limit != null ? intParam(ctx, decoder, "offset", 0) : null;
+        if (offset == null) return;
+        try {
+            var orders = orderService.getOrderHistory(userId, status, limit, offset);
+            sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(orders));
+        } catch (IllegalArgumentException e) {
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, "Unknown status: " + status);
+        } catch (IllegalStateException e) {
+            sendError(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, ERR_UNAVAILABLE, e.getMessage());
+        }
+    }
+
+    private void handleExecutions(ChannelHandlerContext ctx, FullHttpRequest request) throws Exception {
+        QueryStringDecoder decoder = new QueryStringDecoder(request.uri());
+        Long userId = resolveQueryUserId(ctx, decoder);
+        if (userId == null) return;
+        Integer limit = intParam(ctx, decoder, "limit", 100);
+        Integer offset = limit != null ? intParam(ctx, decoder, "offset", 0) : null;
+        if (offset == null) return;
+        try {
+            var executions = orderService.getExecutions(userId, limit, offset);
+            sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(executions));
+        } catch (IllegalStateException e) {
+            sendError(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, ERR_UNAVAILABLE, e.getMessage());
+        }
+    }
+
+    private void handlePositions(ChannelHandlerContext ctx, FullHttpRequest request) throws Exception {
+        QueryStringDecoder decoder = new QueryStringDecoder(request.uri());
+        Long userId = resolveQueryUserId(ctx, decoder);
+        if (userId == null) return;
+        try {
+            var positions = orderService.getPositions(userId);
+            sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(positions));
+        } catch (IllegalStateException e) {
+            sendError(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, ERR_UNAVAILABLE, e.getMessage());
+        }
+    }
+
+    /**
+     * Identity for user-scoped query endpoints: explicit ?userId= when the
+     * principal may act as that user, else the principal's own. Sends the
+     * error and returns null when unresolvable/forbidden.
+     */
+    private Long resolveQueryUserId(ChannelHandlerContext ctx, QueryStringDecoder decoder) {
+        String userIdStr = firstParam(decoder, "userId");
         Principal p = principal(ctx);
         if (userIdStr == null && p == null) {
             sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, "userId required");
-            return;
+            return null;
         }
-
-        long userId = userIdStr != null ? Long.parseLong(userIdStr) : p.userId();
+        long userId;
+        try {
+            userId = userIdStr != null ? Long.parseLong(userIdStr) : p.userId();
+        } catch (NumberFormatException e) {
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, "userId must be an integer");
+            return null;
+        }
         if (!canActAs(ctx, userId)) {
             sendForbidden(ctx, userId);
-            return;
+            return null;
         }
-        var orders = orderService.queryOrders(userId, statusStr);
-        sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(orders));
+        return userId;
+    }
+
+    private static String firstParam(QueryStringDecoder decoder, String name) {
+        var values = decoder.parameters().get(name);
+        return values != null && !values.isEmpty() ? values.getFirst() : null;
+    }
+
+    /** Non-negative int query param; sends 400 and returns null when malformed. */
+    private Integer intParam(ChannelHandlerContext ctx, QueryStringDecoder decoder, String name, int defaultValue) {
+        String raw = firstParam(decoder, name);
+        if (raw == null) return defaultValue;
+        try {
+            int value = Integer.parseInt(raw);
+            if (value < 0) throw new NumberFormatException();
+            return value;
+        } catch (NumberFormatException e) {
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, name + " must be a non-negative integer");
+            return null;
+        }
     }
 
     private void handleGetAccount(ChannelHandlerContext ctx, String uri) throws Exception {
@@ -479,11 +576,13 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
             com.fasterxml.jackson.databind.JsonNode req = MAPPER.readTree(body);
             com.fasterxml.jackson.databind.JsonNode assetNode = req.get("assetId");
             Long amount = money(req, "amount");
+            // assetId 0 is USD — the oms#37 lower bound of 1 broke USD deposits
+            // (harness seeding included); ids are 0-based.
             if (assetNode == null || !assetNode.isNumber() || !assetNode.canConvertToExactIntegral()
-                    || assetNode.asInt() < 1 || assetNode.asInt() > 1_000_000
+                    || assetNode.asInt() < 0 || assetNode.asInt() > 1_000_000
                     || amount == null || !validMoney(amount)) {
                 throw new IllegalArgumentException(
-                        "assetId (positive integer) and amount (positive decimal string) required");
+                        "assetId (non-negative integer) and amount (positive decimal string) required");
             }
             return new long[]{assetNode.asInt(), amount};
         } catch (IllegalArgumentException | java.io.IOException e) {

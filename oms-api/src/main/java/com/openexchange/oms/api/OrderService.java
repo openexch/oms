@@ -22,6 +22,19 @@ public interface OrderService {
 
     List<OrderResponse> queryOrders(long userId, String status);
 
+    /**
+     * Order history from persistence, newest first (oms#40). {@code status}
+     * null = all statuses. Throws IllegalStateException when persistence is
+     * not configured, IllegalArgumentException on an unknown status.
+     */
+    List<OrderResponse> getOrderHistory(long userId, String status, int limit, int offset);
+
+    /** Execution (fill) history from persistence, newest first (oms#40). */
+    List<ExecutionResponse> getExecutions(long userId, int limit, int offset);
+
+    /** Net position per market aggregated from the executions ledger (oms#40). */
+    List<PositionResponse> getPositions(long userId);
+
     Map<String, Object> getBalances(long userId);
 
     List<Map<String, Object>> getMarkets();

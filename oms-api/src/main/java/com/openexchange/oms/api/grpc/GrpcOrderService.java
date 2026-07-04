@@ -78,6 +78,7 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
                             .setOmsOrderId(resp.getOmsOrderId())
                             .setStatus(resp.getStatus() != null ? resp.getStatus() : "")
                             .setRejectReason(resp.getRejectReason() != null ? resp.getRejectReason() : "")
+                            .setDuplicate(resp.isDuplicate())
                             .build();
 
             responseObserver.onNext(grpcResp);
@@ -131,6 +132,69 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
             responseObserver.onNext(toGrpcOrderResponse(resp));
             responseObserver.onCompleted();
         } catch (Exception e) {
+            responseObserver.onError(io.grpc.Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
+        }
+    }
+
+    @Override
+    public void getOrderHistory(OrderHistoryRequest request,
+                                 StreamObserver<OrderHistoryResponse> responseObserver) {
+        try {
+            Long userId = GrpcAuth.resolveUserId(authorizer, request.getUserId(), responseObserver);
+            if (userId == null) return;
+
+            var orders = orderService.getOrderHistory(userId,
+                    request.getStatus().isEmpty() ? null : request.getStatus(),
+                    request.getLimit(), request.getOffset());
+
+            OrderHistoryResponse.Builder builder = OrderHistoryResponse.newBuilder();
+            for (OrderResponse order : orders) {
+                builder.addOrders(toGrpcOrderResponse(order));
+            }
+            responseObserver.onNext(builder.build());
+            responseObserver.onCompleted();
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(io.grpc.Status.INVALID_ARGUMENT
+                    .withDescription("Unknown status: " + request.getStatus()).asRuntimeException());
+        } catch (IllegalStateException e) {
+            responseObserver.onError(io.grpc.Status.UNAVAILABLE
+                    .withDescription(e.getMessage()).asRuntimeException());
+        } catch (Exception e) {
+            log.error("gRPC getOrderHistory failed", e);
+            responseObserver.onError(io.grpc.Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
+        }
+    }
+
+    @Override
+    public void getTrades(GetTradesRequest request,
+                           StreamObserver<GetTradesResponse> responseObserver) {
+        try {
+            Long userId = GrpcAuth.resolveUserId(authorizer, request.getUserId(), responseObserver);
+            if (userId == null) return;
+
+            var executions = orderService.getExecutions(userId, request.getLimit(), request.getOffset());
+
+            GetTradesResponse.Builder builder = GetTradesResponse.newBuilder();
+            for (com.openexchange.oms.api.dto.ExecutionResponse exec : executions) {
+                builder.addExecutions(ExecutionReport.newBuilder()
+                        .setTradeId(exec.getTradeId())
+                        .setOmsOrderId(exec.getOmsOrderId())
+                        .setUserId(exec.getUserId())
+                        .setMarketId(exec.getMarketId())
+                        .setSide(exec.getSide() != null ? exec.getSide() : "")
+                        .setPrice(com.match.domain.FixedPoint.format(exec.getPrice()))
+                        .setQuantity(com.match.domain.FixedPoint.format(exec.getQuantity()))
+                        .setIsMaker(exec.isMaker())
+                        .setExecutedAtMs(exec.getExecutedAtMs())
+                        .build());
+            }
+            responseObserver.onNext(builder.build());
+            responseObserver.onCompleted();
+        } catch (IllegalStateException e) {
+            responseObserver.onError(io.grpc.Status.UNAVAILABLE
+                    .withDescription(e.getMessage()).asRuntimeException());
+        } catch (Exception e) {
+            log.error("gRPC getTrades failed", e);
             responseObserver.onError(io.grpc.Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
         }
     }

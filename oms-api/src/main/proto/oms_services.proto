@@ -7,6 +7,9 @@ service OrderService {
     rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
     rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
     rpc GetOrder(GetOrderRequest) returns (OrderResponse);
+    // History reads (oms#40) — Postgres-backed, survive OMS restarts
+    rpc GetOrderHistory(OrderHistoryRequest) returns (OrderHistoryResponse);
+    rpc GetTrades(GetTradesRequest) returns (GetTradesResponse);
     rpc StreamOrders(StreamRequest) returns (stream OrderUpdate);
     rpc StreamExecutions(StreamRequest) returns (stream ExecutionReport);
 }
@@ -38,6 +41,30 @@ message CreateOrderResponse {
     int64 oms_order_id = 2;
     string status = 3;
     string reject_reason = 4;
+    // True when client_order_id already names an active order (oms#40):
+    // nothing was created; oms_order_id/status describe the existing order.
+    bool duplicate = 5;
+}
+
+message OrderHistoryRequest {
+    int64 user_id = 1;
+    string status = 2; // "" = all statuses
+    int32 limit = 3;   // 0 = default 100, capped at 1000
+    int32 offset = 4;
+}
+
+message OrderHistoryResponse {
+    repeated OrderResponse orders = 1;
+}
+
+message GetTradesRequest {
+    int64 user_id = 1;
+    int32 limit = 2;   // 0 = default 100, capped at 1000
+    int32 offset = 3;
+}
+
+message GetTradesResponse {
+    repeated ExecutionReport executions = 1;
 }
 
 message CancelOrderRequest {

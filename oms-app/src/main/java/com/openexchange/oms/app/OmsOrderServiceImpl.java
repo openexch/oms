@@ -44,6 +44,17 @@ public class OmsOrderServiceImpl implements OrderService {
     private io.micrometer.core.instrument.Timer riskCheckTimer;
     private io.micrometer.core.instrument.Timer ledgerHoldTimer;
 
+    // Optional Postgres repositories (oms#40): history reads + terminal-order
+    // fallbacks. Null when the OMS runs without persistence.
+    private com.openexchange.oms.persistence.PostgresOrderRepository orderRepository;
+    private com.openexchange.oms.persistence.PostgresExecutionRepository executionRepository;
+
+    public void setRepositories(com.openexchange.oms.persistence.PostgresOrderRepository orderRepository,
+                                com.openexchange.oms.persistence.PostgresExecutionRepository executionRepository) {
+        this.orderRepository = orderRepository;
+        this.executionRepository = executionRepository;
+    }
+
     public void setMeterRegistry(io.micrometer.core.instrument.MeterRegistry registry) {
         this.riskCheckTimer = io.micrometer.core.instrument.Timer.builder("oms_risk_check_seconds")
                 .description("Risk engine admission check latency")
@@ -79,6 +90,23 @@ public class OmsOrderServiceImpl implements OrderService {
             }
             if (request.getMarketId() < 1 || request.getMarketId() > 5) {
                 return CreateOrderResponse.rejected("Invalid marketId");
+            }
+            if (request.getClientOrderId() != null && request.getClientOrderId().length() > 64) {
+                return CreateOrderResponse.rejected("clientOrderId too long (max 64)");
+            }
+
+            // clientOrderId idempotency (oms#40): if the caller already has an
+            // ACTIVE order under this id, return it instead of creating a new
+            // one — a retried POST after a lost response is a no-op. The id
+            // becomes reusable once that order is terminal.
+            if (request.getClientOrderId() != null && !request.getClientOrderId().isEmpty()) {
+                long existingId = coreEngine.getLifecycleManager()
+                        .findActiveByClientOrderId(request.getUserId(), request.getClientOrderId());
+                if (existingId != 0) {
+                    OmsOrder existing = coreEngine.getLifecycleManager().getOrder(existingId);
+                    String existingStatus = existing != null ? existing.getStatus().name() : "UNKNOWN";
+                    return CreateOrderResponse.duplicate(existingId, existingStatus);
+                }
             }
 
             // Parse enums
@@ -276,12 +304,30 @@ public class OmsOrderServiceImpl implements OrderService {
     @Override
     public OrderResponse getOrder(long omsOrderId) {
         OmsOrder order = coreEngine.getLifecycleManager().getOrder(omsOrderId);
-        if (order == null) return null;
-        return OrderResponse.fromOrder(order);
+        if (order != null) {
+            return OrderResponse.fromOrder(order);
+        }
+        // Terminal orders leave the active map; Postgres keeps them (oms#40).
+        if (orderRepository != null) {
+            OmsOrder persisted = orderRepository.findById(omsOrderId);
+            if (persisted != null) {
+                return OrderResponse.fromOrder(persisted);
+            }
+        }
+        return null;
     }
 
     @Override
     public List<OrderResponse> queryOrders(long userId, String status) {
+        // Terminal statuses are never in the active map — serve them from
+        // Postgres (oms#40). Without persistence, [] (the old behavior).
+        if (status != null && isTerminalStatus(status)) {
+            if (orderRepository == null) {
+                return new ArrayList<>();
+            }
+            return getOrderHistory(userId, status, 100, 0);
+        }
+
         OrderLifecycleManager lcm = coreEngine.getLifecycleManager();
         List<OrderResponse> results = new ArrayList<>();
 
@@ -295,6 +341,68 @@ public class OmsOrderServiceImpl implements OrderService {
         });
 
         return results;
+    }
+
+    private static boolean isTerminalStatus(String status) {
+        try {
+            return OmsOrderStatus.valueOf(status).isTerminal();
+        } catch (IllegalArgumentException e) {
+            return false; // unknown string: matches nothing in the active scan, as before
+        }
+    }
+
+    @Override
+    public List<OrderResponse> getOrderHistory(long userId, String status, int limit, int offset) {
+        requirePersistence();
+        int boundedLimit = boundLimit(limit);
+        int boundedOffset = Math.max(0, offset);
+        List<OmsOrder> orders;
+        if (status == null || status.isEmpty()) {
+            orders = orderRepository.findByUser(userId, boundedLimit, boundedOffset);
+        } else {
+            // throws IllegalArgumentException on an unknown status → 400 at the edge
+            OmsOrderStatus parsed = OmsOrderStatus.valueOf(status);
+            orders = orderRepository.findByUserAndStatus(userId, parsed, boundedLimit, boundedOffset);
+        }
+        List<OrderResponse> results = new ArrayList<>(orders.size());
+        for (OmsOrder order : orders) {
+            results.add(OrderResponse.fromOrder(order));
+        }
+        return results;
+    }
+
+    @Override
+    public List<ExecutionResponse> getExecutions(long userId, int limit, int offset) {
+        requirePersistence();
+        List<ExecutionReport> executions =
+                executionRepository.findByUser(userId, boundLimit(limit), Math.max(0, offset));
+        List<ExecutionResponse> results = new ArrayList<>(executions.size());
+        for (ExecutionReport exec : executions) {
+            results.add(ExecutionResponse.fromExecution(exec));
+        }
+        return results;
+    }
+
+    @Override
+    public List<PositionResponse> getPositions(long userId) {
+        requirePersistence();
+        List<PositionResponse> results = new ArrayList<>();
+        for (com.openexchange.oms.persistence.PositionAggregate agg
+                : executionRepository.aggregatePositionsForUser(userId)) {
+            results.add(new PositionResponse(agg.userId(), agg.marketId(), agg.netQuantity()));
+        }
+        return results;
+    }
+
+    private void requirePersistence() {
+        if (orderRepository == null || executionRepository == null) {
+            throw new IllegalStateException("History unavailable: OMS is running without persistence");
+        }
+    }
+
+    private static int boundLimit(int limit) {
+        if (limit <= 0) return 100;
+        return Math.min(limit, 1000);
     }
 
     @Override
