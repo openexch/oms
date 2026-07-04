@@ -22,12 +22,25 @@ public class PostgresOrderRepository {
 
     private static final Logger log = LoggerFactory.getLogger(PostgresOrderRepository.class);
 
+    // UPSERT: persistOrderUpdate fires on every lifecycle change of an order, so
+    // subsequent writes must update the existing row. This used to be a plain
+    // INSERT — every post-insert status/fill update failed on the primary key
+    // (336k logged errors on the dev box) and the table silently froze each
+    // order at its first-persisted state (found during oms#35).
     private static final String INSERT_ORDER = """
             INSERT INTO orders (oms_order_id, cluster_order_id, client_order_id, user_id, market_id,
                 side, order_type, time_in_force, price, quantity, filled_qty, remaining_qty,
                 stop_price, trailing_delta, display_quantity, status, reject_reason, hold_amount,
                 expires_at, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (oms_order_id) DO UPDATE SET
+                cluster_order_id = EXCLUDED.cluster_order_id,
+                status = EXCLUDED.status,
+                filled_qty = EXCLUDED.filled_qty,
+                remaining_qty = EXCLUDED.remaining_qty,
+                reject_reason = EXCLUDED.reject_reason,
+                hold_amount = EXCLUDED.hold_amount,
+                updated_at = EXCLUDED.updated_at
             """;
 
     private static final String UPDATE_STATUS = """
@@ -61,6 +74,15 @@ public class PostgresOrderRepository {
             ORDER BY created_at DESC
             """;
 
+    private static final String SELECT_ALL_OPEN_ORDERS = """
+            SELECT oms_order_id, cluster_order_id, client_order_id, user_id, market_id,
+                side, order_type, time_in_force, price, quantity, filled_qty, remaining_qty,
+                stop_price, trailing_delta, display_quantity, status, reject_reason, hold_amount,
+                expires_at, created_at, updated_at
+            FROM orders WHERE status NOT IN ('FILLED', 'CANCELLED', 'EXPIRED', 'REJECTED')
+            ORDER BY created_at ASC
+            """;
+
     private final HikariDataSource dataSource;
 
     public PostgresOrderRepository(HikariDataSource dataSource) {
@@ -68,7 +90,10 @@ public class PostgresOrderRepository {
     }
 
     /**
-     * Persists a new order. Uses INSERT — caller is responsible for ensuring no duplicate omsOrderId.
+     * Persists an order, updating the mutable columns (status, fills,
+     * clusterOrderId, ...) when the row already exists. Called on every
+     * lifecycle change; the in-memory order is the authority (its monotonic
+     * fill guards prevent regressions), so a straight overwrite is correct.
      */
     public void saveOrder(OmsOrder order) {
         try (Connection conn = dataSource.getConnection();
@@ -164,6 +189,22 @@ public class PostgresOrderRepository {
         } catch (SQLException e) {
             log.error("Failed to find open orders userId={}", userId, e);
             throw new PersistenceException("Failed to find open orders", e);
+        }
+    }
+
+    /**
+     * Returns ALL non-terminal orders across every user, oldest first — the
+     * startup state rebuild source (oms#35).
+     */
+    public List<OmsOrder> findAllOpenOrders() {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(SELECT_ALL_OPEN_ORDERS)) {
+
+            return collectOrders(ps);
+
+        } catch (SQLException e) {
+            log.error("Failed to find all open orders", e);
+            throw new PersistenceException("Failed to find all open orders", e);
         }
     }
 

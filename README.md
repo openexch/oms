@@ -243,6 +243,32 @@ All configuration via environment variables with sensible defaults:
 | `OMS_POSTGRES_PASSWORD` | `oms` | PostgreSQL password |
 | `OMS_CLUSTER_INGRESS` | `localhost:9000` | Aeron Cluster ingress endpoint |
 
+## Durability & Recovery (oms#35)
+
+In-memory state (open orders, risk positions, open-order slots, synthetic
+trigger monitoring) is rebuilt from PostgreSQL on every startup:
+
+- **Open orders**: all non-terminal rows in `orders` are restored as-is into
+  the lifecycle manager (orders interrupted before reaching the cluster
+  pipeline — `PENDING_RISK`/`PENDING_HOLD` — are skipped; there is nothing to
+  repair against). Stop/trailing/iceberg orders re-arm their trigger
+  monitoring.
+- **Positions**: replayed as a SQL aggregate over the `executions` ledger
+  (BUY minus SELL per user/market).
+- **Balances**: live in Redis and survive restarts on their own.
+
+After the rebuild, the cluster open-orders snapshot reconciliation (P1.2)
+trues the restored set up against cluster reality — orders the cluster no
+longer knows are terminalized through the normal path, releasing holds and
+slots.
+
+**RPO**: the Postgres ledger is written synchronously on every order lifecycle
+change and every execution, so OMS-side RPO is effectively zero for anything
+the OMS processed. **Back up PostgreSQL** (e.g. nightly `pg_dump` + WAL
+archiving in production) — it is the source of truth for money movements and
+the rebuild source; losing it means positions/history are only recoverable
+from the cluster's own archive (see match `docs/backup-restore.md`).
+
 ## Load Testing
 
 ```bash

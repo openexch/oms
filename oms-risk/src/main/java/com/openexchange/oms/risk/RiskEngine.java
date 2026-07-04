@@ -525,6 +525,28 @@ public final class RiskEngine {
     }
 
     /**
+     * Restore an absolute position during startup state rebuild (oms#35).
+     * Positions are derived from the persisted executions ledger; this
+     * overwrites whatever is tracked, so call only on a fresh engine.
+     */
+    public void restorePosition(long userId, int marketId, long position) {
+        long[] positions = userPositions.get(userId);
+        if (positions == null) {
+            positions = new long[maxMarkets];
+            userPositions.put(userId, positions);
+        }
+        positions[marketId] = position;
+    }
+
+    /**
+     * Current open-order count for a user (0 when untracked).
+     */
+    public long getOpenOrderCount(long userId) {
+        final long current = openOrderCounts.get(userId);
+        return current == MISSING_VALUE ? 0L : current;
+    }
+
+    /**
      * Get the current tracked position for a user in a market.
      *
      * @return signed position in fixed-point (positive = net long, negative = net short)

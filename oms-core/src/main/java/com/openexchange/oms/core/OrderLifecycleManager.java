@@ -45,6 +45,18 @@ public class OrderLifecycleManager {
     }
 
     /**
+     * Restore an order during startup state rebuild (oms#35): index it AS-IS,
+     * preserving status/filledQty/createdAt from Postgres. No state transition,
+     * no listener, no persistence — the order already lived through those.
+     */
+    public void restoreOrder(OmsOrder order) {
+        activeOrders.put(order.getOmsOrderId(), order);
+        if (order.getClusterOrderId() != 0) {
+            byClusterOrderId.put(order.getClusterOrderId(), order);
+        }
+    }
+
+    /**
      * Transition: PENDING_RISK → PENDING_HOLD (risk passed)
      */
     public void onRiskPassed(long omsOrderId) {

@@ -36,6 +36,14 @@ public class PostgresExecutionRepository {
             ORDER BY executed_at DESC LIMIT ? OFFSET ?
             """;
 
+    private static final String AGGREGATE_POSITIONS = """
+            SELECT user_id, market_id,
+                   SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) AS net_quantity
+            FROM executions
+            GROUP BY user_id, market_id
+            HAVING SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) <> 0
+            """;
+
     private final HikariDataSource dataSource;
 
     public PostgresExecutionRepository(HikariDataSource dataSource) {
@@ -123,6 +131,29 @@ public class PostgresExecutionRepository {
         } catch (SQLException e) {
             log.error("Failed to find executions for userId={}", userId, e);
             throw new PersistenceException("Failed to find executions by user", e);
+        }
+    }
+
+    /**
+     * Net position per (user, market) replayed from the full executions ledger
+     * — the startup state rebuild source for RiskEngine positions (oms#35).
+     * Zero net positions are omitted.
+     */
+    public List<PositionAggregate> aggregatePositions() {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(AGGREGATE_POSITIONS);
+             ResultSet rs = ps.executeQuery()) {
+
+            List<PositionAggregate> results = new ArrayList<>();
+            while (rs.next()) {
+                results.add(new PositionAggregate(
+                        rs.getLong("user_id"), rs.getInt("market_id"), rs.getLong("net_quantity")));
+            }
+            return results;
+
+        } catch (SQLException e) {
+            log.error("Failed to aggregate positions from executions", e);
+            throw new PersistenceException("Failed to aggregate positions", e);
         }
     }
 

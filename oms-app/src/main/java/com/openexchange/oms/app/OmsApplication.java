@@ -16,6 +16,7 @@ import com.openexchange.oms.common.enums.OrderSide;
 import com.openexchange.oms.common.enums.OmsOrderStatus;
 import com.openexchange.oms.core.OmsCoreEngine;
 import com.openexchange.oms.core.OrderLifecycleManager;
+import com.openexchange.oms.core.StartupStateRebuilder;
 import com.openexchange.oms.core.SyntheticOrderEngine;
 import com.openexchange.oms.ledger.BalanceStore;
 import com.openexchange.oms.ledger.InMemoryBalanceStore;
@@ -203,6 +204,24 @@ public class OmsApplication {
                 }
             }
         });
+
+        // 9b. Rebuild in-memory state from the Postgres ledger (oms#35). Must run
+        // BEFORE the cluster client connects so the P1.2 open-orders-snapshot
+        // reconciliation trues the restored set up against cluster reality, and
+        // before the HTTP server so no user traffic races the rebuild.
+        if (orderRepo != null && executionRepo != null) {
+            try {
+                StartupStateRebuilder.rebuild(
+                        orderRepo.findAllOpenOrders(), executionRepo.aggregatePositions(),
+                        lifecycleManager, syntheticEngine, riskEngine);
+            } catch (Exception e) {
+                log.error("State rebuild from Postgres failed — starting with empty state "
+                        + "(open orders will be repaired by the cluster snapshot reconcile; "
+                        + "positions stay unknown until fills arrive)", e);
+            }
+        } else {
+            log.warn("Postgres unavailable — skipping startup state rebuild (oms#35)");
+        }
 
         // 10. Cluster client
         clusterClient = new ClusterClient();
