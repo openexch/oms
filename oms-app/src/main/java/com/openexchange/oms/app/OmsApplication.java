@@ -336,16 +336,24 @@ public class OmsApplication {
             wsHandler.pushToUser(order.getUserId(), "orders", resp);
             grpcOrderSvc.pushOrderUpdate(order.getUserId(), resp);
 
-            // Release balance hold on cluster-confirmed cancellation or expiry
-            if ((newStatus == OmsOrderStatus.CANCELLED || newStatus == OmsOrderStatus.EXPIRED)
-                    && (oldStatus == OmsOrderStatus.NEW || oldStatus == OmsOrderStatus.PARTIALLY_FILLED)) {
-                ledgerService.releaseForCancel(order);
-                riskEngine.onOrderClosed(order.getUserId());
-            }
-            // Release balance hold on cluster rejection (order had a hold placed)
-            if (newStatus == OmsOrderStatus.REJECTED
-                    && (oldStatus == OmsOrderStatus.NEW || oldStatus == OmsOrderStatus.PARTIALLY_FILLED
-                        || oldStatus == OmsOrderStatus.PENDING_NEW)) {
+            // Release balance hold + open-order slot on any terminal transition
+            // out of a state that HELD them (hold is placed before PENDING_NEW,
+            // so every state from PENDING_NEW on carries a hold and a slot).
+            // PENDING_NEW/PENDING_TRIGGER were missing from the cancel/expiry
+            // branch: under election churn an order can still be PENDING_NEW in
+            // the OMS (ack lost at the seam) when its cancel confirms, and that
+            // PENDING_NEW→CANCELLED transition leaked the slot AND the hold —
+            // found by the #10 chaos soak as OPEN_ORDER_LIMIT storms with
+            // openOrderCounts ≥500 while only ~37 orders were really open,
+            // self-healing only on OMS restart (state rebuild resets counters).
+            boolean heldResources = oldStatus == OmsOrderStatus.NEW
+                    || oldStatus == OmsOrderStatus.PARTIALLY_FILLED
+                    || oldStatus == OmsOrderStatus.PENDING_NEW
+                    || oldStatus == OmsOrderStatus.PENDING_TRIGGER;
+            boolean releasingTerminal = newStatus == OmsOrderStatus.CANCELLED
+                    || newStatus == OmsOrderStatus.EXPIRED
+                    || newStatus == OmsOrderStatus.REJECTED;
+            if (heldResources && releasingTerminal) {
                 ledgerService.releaseForCancel(order);
                 riskEngine.onOrderClosed(order.getUserId());
             }
