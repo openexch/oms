@@ -78,6 +78,14 @@ jobs:
           java-version: 21
           cache: maven
 
+      # Aeron needs real socket buffers: the cluster log/replay channels run
+      # 64m terms, and the kernel default rmem_max (~208k) can't open their
+      # flow-control window — archive replay never connects and post-kill
+      # elections hang in "log replication has not progressed". Same tuning
+      # as match `make optimize-os` on dev boxes.
+      - name: Kernel socket buffers for Aeron
+        run: sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
+
       - name: Build match-cluster jar
         run: mvn -B -f _match/pom.xml install -DskipTests -pl match-cluster -am
 
