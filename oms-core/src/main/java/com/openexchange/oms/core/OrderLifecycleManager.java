@@ -3,13 +3,24 @@ package com.openexchange.oms.core;
 
 import com.openexchange.oms.common.domain.OmsOrder;
 import com.openexchange.oms.common.enums.OmsOrderStatus;
-import org.agrona.collections.Long2ObjectHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Manages the lifecycle of all OMS orders.
- * Single-writer: only the OMS Core Thread mutates order state.
+ * <p>
+ * CONCURRENCY (oms#70): despite the original single-writer intent, this
+ * class is mutated from MULTIPLE threads — {@code registerOrder} runs on
+ * Netty I/O threads (createOrder), while cluster-egress transitions
+ * ({@code onClusterOrderStatus}/{@code applyFill}) run on the OMS core
+ * thread, with reads from Netty/gRPC threads throughout. Concurrent
+ * structural modification of the previous Agrona maps corrupted the probe
+ * chain into an INFINITE LOOP and wedged every HTTP worker (total, silent
+ * REST outage — twice on 2026-07-05). The order indexes are therefore
+ * ConcurrentHashMaps: lock-free reads, safe concurrent structure, and the
+ * put/get happens-before edge means a status update observes a fully
+ * initialized order. Do not swap these back to Agrona maps without first
+ * funneling ALL mutation through one thread.
  * <p>
  * State machine transitions:
  *   PENDING_RISK → PENDING_HOLD → PENDING_NEW → NEW → PARTIALLY_FILLED → FILLED
@@ -21,11 +32,13 @@ public class OrderLifecycleManager {
 
     private static final Logger log = LoggerFactory.getLogger(OrderLifecycleManager.class);
 
-    // Active orders indexed by omsOrderId (single-writer, no sync needed)
-    private final Long2ObjectHashMap<OmsOrder> activeOrders = new Long2ObjectHashMap<>();
+    // Active orders indexed by omsOrderId (concurrent: see class doc)
+    private final java.util.concurrent.ConcurrentHashMap<Long, OmsOrder> activeOrders =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
-    // Index by clusterOrderId for egress correlation
-    private final Long2ObjectHashMap<OmsOrder> byClusterOrderId = new Long2ObjectHashMap<>();
+    // Index by clusterOrderId for egress correlation (concurrent: see class doc)
+    private final java.util.concurrent.ConcurrentHashMap<Long, OmsOrder> byClusterOrderId =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     // clientOrderId idempotency index (oms#40): "<userId>:<clientOrderId>" →
     // omsOrderId, ACTIVE orders only (entries leave with removeOrder, so a
