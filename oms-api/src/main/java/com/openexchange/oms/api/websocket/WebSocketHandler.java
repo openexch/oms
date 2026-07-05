@@ -8,6 +8,7 @@ import com.openexchange.oms.api.auth.Authorizer;
 import com.openexchange.oms.api.auth.HttpAuthHandler;
 import com.openexchange.oms.api.auth.Principal;
 import com.openexchange.oms.api.auth.RoleBasedAuthorizer;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
@@ -25,7 +26,14 @@ import java.util.concurrent.CopyOnWriteArraySet;
  *
  * Subscribe: { "op": "subscribe", "channels": ["orders","executions","balances"], "userId": "..." }
  * Push events: ORDER_UPDATE, EXECUTION_REPORT, BALANCE_UPDATE
+ *
+ * One shared instance is added to every upgrading channel's pipeline
+ * (HttpServer), so the handler MUST be @Sharable — without it Netty refuses
+ * the second channel's add and closes the socket mid-handshake, limiting the
+ * user WS to ONE connection per OMS lifetime (oms#68). All state is already
+ * share-safe: concurrent maps keyed by ctx/userId, no per-channel fields.
  */
+@ChannelHandler.Sharable
 public class WebSocketHandler extends SimpleChannelInboundHandler<WebSocketFrame> {
 
     private static final Logger log = LoggerFactory.getLogger(WebSocketHandler.class);
