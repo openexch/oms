@@ -66,6 +66,18 @@ public final class RiskEngine {
     @SuppressWarnings("unused")
     private volatile long circuitBreakerGeneration;
 
+    // THREAD-SAFETY (oms#70 / oms#65): the Agrona maps below
+    // (rateLimitStates, openOrderCounts, userPositions) and the rate-window
+    // buffers are NOT thread-safe, but the engine is called from multiple
+    // Netty I/O threads (check/onOrderOpened via createOrder) AND the OMS
+    // core/egress thread (onOrderClosed/onFill). Concurrent structural
+    // modification corrupts an Agrona map into an infinite probe loop
+    // (wedged the whole REST plane twice on 2026-07-05), and unsynchronized
+    // read-modify-write loses counter updates (the oms#65 drift). Every
+    // public method touching this state is synchronized — contention is
+    // negligible at OMS request rates; do NOT remove the qualifiers without
+    // moving all mutation onto a single thread.
+
     // -- Check 5: Open order counts --
     // Key: userId -> open order count (stored as long). Updated via onOrderOpened/onOrderClosed.
     private final Long2LongHashMap openOrderCounts;
@@ -140,7 +152,7 @@ public final class RiskEngine {
      * @param quantity order quantity in fixed-point
      * @return {@link RiskResult#PASS} or a rejection result with reason
      */
-    public RiskResult check(long userId, int marketId, OrderSide side,
+    public synchronized RiskResult check(long userId, int marketId, OrderSide side,
                             OmsOrderType type, long price, long quantity) {
 
         final RiskConfig config = getConfig(marketId);
@@ -393,7 +405,7 @@ public final class RiskEngine {
     /**
      * Increment open order count for a user. Call when an order is placed or accepted.
      */
-    public void onOrderOpened(long userId) {
+    public synchronized void onOrderOpened(long userId) {
         final long current = openOrderCounts.get(userId);
         openOrderCounts.put(userId, (current == MISSING_VALUE) ? 1L : current + 1L);
     }
@@ -401,7 +413,7 @@ public final class RiskEngine {
     /**
      * Decrement open order count for a user. Call when an order is filled, cancelled, or expired.
      */
-    public void onOrderClosed(long userId) {
+    public synchronized void onOrderClosed(long userId) {
         final long current = openOrderCounts.get(userId);
         if (current != MISSING_VALUE && current > 0L) {
             openOrderCounts.put(userId, current - 1L);
@@ -505,7 +517,7 @@ public final class RiskEngine {
      * @param side     side of the fill
      * @param quantity filled quantity in fixed-point
      */
-    public void onFill(long userId, int marketId, OrderSide side, long quantity) {
+    public synchronized void onFill(long userId, int marketId, OrderSide side, long quantity) {
         long[] positions = userPositions.get(userId);
         if (positions == null) {
             positions = new long[maxMarkets];
@@ -530,7 +542,7 @@ public final class RiskEngine {
      * Positions are derived from the persisted executions ledger; this
      * overwrites whatever is tracked, so call only on a fresh engine.
      */
-    public void restorePosition(long userId, int marketId, long position) {
+    public synchronized void restorePosition(long userId, int marketId, long position) {
         long[] positions = userPositions.get(userId);
         if (positions == null) {
             positions = new long[maxMarkets];
@@ -542,7 +554,7 @@ public final class RiskEngine {
     /**
      * Current open-order count for a user (0 when untracked).
      */
-    public long getOpenOrderCount(long userId) {
+    public synchronized long getOpenOrderCount(long userId) {
         final long current = openOrderCounts.get(userId);
         return current == MISSING_VALUE ? 0L : current;
     }
@@ -555,7 +567,7 @@ public final class RiskEngine {
      * Called after every open-orders reconcile so any residual drift lasts at
      * most one snapshot cycle. Returns the total absolute correction applied.
      */
-    public long rebaselineOpenOrderCounts(java.util.Map<Long, Long> truth) {
+    public synchronized long rebaselineOpenOrderCounts(java.util.Map<Long, Long> truth) {
         long drift = 0;
         for (final java.util.Map.Entry<Long, Long> e : openOrderCounts.entrySet()) {
             if (!truth.containsKey(e.getKey())) {
@@ -577,7 +589,7 @@ public final class RiskEngine {
      *
      * @return signed position in fixed-point (positive = net long, negative = net short)
      */
-    public long getPosition(long userId, int marketId) {
+    public synchronized long getPosition(long userId, int marketId) {
         long[] positions = userPositions.get(userId);
         if (positions == null || marketId >= positions.length) {
             return 0L;
@@ -588,14 +600,14 @@ public final class RiskEngine {
     /**
      * Reset all rate limit state. Useful for testing or after a maintenance window.
      */
-    public void resetRateLimits() {
+    public synchronized void resetRateLimits() {
         rateLimitStates.clear();
     }
 
     /**
      * Reset all tracked state (rate limits, open order counts, positions).
      */
-    public void resetAll() {
+    public synchronized void resetAll() {
         rateLimitStates.clear();
         openOrderCounts.clear();
         userPositions.clear();
