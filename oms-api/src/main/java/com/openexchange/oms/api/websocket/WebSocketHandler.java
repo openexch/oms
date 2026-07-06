@@ -100,6 +100,13 @@ public class WebSocketHandler extends SimpleChannelInboundHandler<WebSocketFrame
                 ctx.writeAndFlush(new TextWebSocketFrame(MAPPER.writeValueAsString(ack)));
             } else if ("unsubscribe".equals(op)) {
                 removeConnection(ctx);
+            } else if ("ping".equals(op)) {
+                // Browser WebSocket clients cannot send protocol-level pings;
+                // this JSON ping gives them a liveness/keepalive signal (the
+                // server itself sends no heartbeats).
+                ObjectNode pong = MAPPER.createObjectNode();
+                pong.put("type", "PONG");
+                ctx.writeAndFlush(new TextWebSocketFrame(MAPPER.writeValueAsString(pong)));
             }
         } catch (Exception e) {
             log.warn("Invalid WebSocket message: {}", e.getMessage());

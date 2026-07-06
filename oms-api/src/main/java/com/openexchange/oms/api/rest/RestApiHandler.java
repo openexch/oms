@@ -61,6 +61,19 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private final AuditLog auditLog;
     private final PrometheusMeterRegistry meterRegistry;
 
+    // Demo auth (OMS_AUTH_MODE=demo); null in other modes -> auth routes 503.
+    private volatile com.openexchange.oms.api.auth.AuthService authService;
+
+    // Register/login run PBKDF2 + JDBC — never on the Netty event loop.
+    // Request bodies are extracted to Strings before dispatch (the request
+    // buffer is auto-released when channelRead0 returns).
+    private static final java.util.concurrent.ExecutorService AUTH_EXECUTOR =
+            java.util.concurrent.Executors.newFixedThreadPool(2, r -> {
+                Thread t = new Thread(r, "oms-auth");
+                t.setDaemon(true);
+                return t;
+            });
+
     // One request per connection (every response closes); set in channelRead0.
     private String requestOrigin;
 
@@ -77,6 +90,11 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         this.corsPolicy = corsPolicy;
         this.auditLog = auditLog;
         this.meterRegistry = meterRegistry;
+    }
+
+    /** Demo auth service (OMS_AUTH_MODE=demo). Absent -> /api/v1/auth/* returns 503. */
+    public void setAuthService(com.openexchange.oms.api.auth.AuthService authService) {
+        this.authService = authService;
     }
 
     @Override
@@ -112,6 +130,12 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
                 handleMetrics(ctx);
             } else if (uri.equals("/api/v1/health") && method == HttpMethod.GET) {
                 handleHealth(ctx);
+            } else if (uri.equals("/api/v1/auth/register") && method == HttpMethod.POST) {
+                handleRegister(ctx, request);
+            } else if (uri.equals("/api/v1/auth/login") && method == HttpMethod.POST) {
+                handleLogin(ctx, request);
+            } else if (uri.equals("/api/v1/auth/me") && method == HttpMethod.GET) {
+                handleMe(ctx);
             } else if (uri.equals("/api/v1/orders") && method == HttpMethod.POST) {
                 handleCreateOrder(ctx, request);
             } else if (stripQuery(uri).equals("/api/v1/orders/history") && method == HttpMethod.GET) {
@@ -169,6 +193,9 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         String m = method.name();
         if (path.equals("/metrics")) return "metrics";
         if (path.equals("/api/v1/health")) return "health";
+        if (path.equals("/api/v1/auth/register")) return "auth.register";
+        if (path.equals("/api/v1/auth/login")) return "auth.login";
+        if (path.equals("/api/v1/auth/me")) return "auth.me";
         if (path.equals("/api/v1/markets")) return "markets";
         if (path.equals("/api/v1/orders")) return m.equals("POST") ? "orders.create" : "orders.query";
         if (path.equals("/api/v1/orders/history")) return "orders.history";
@@ -208,6 +235,75 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
     private boolean canActAs(ChannelHandlerContext ctx, long userId) {
         Principal p = principal(ctx);
         return p != null && authorizer.allow(p, Authorizer.ACTION_ACT_AS_USER, Long.toString(userId));
+    }
+
+    // ==================== Demo auth (OMS_AUTH_MODE=demo) ====================
+
+    private void handleRegister(ChannelHandlerContext ctx, FullHttpRequest request) {
+        runAuthRequest(ctx, request, (username, password) -> {
+            com.openexchange.oms.api.auth.AuthService.Session session =
+                    authService.register(username, password);
+            log.info("Registered demo user '{}' (userId={})", session.username(), session.userId());
+            return session;
+        });
+    }
+
+    private void handleLogin(ChannelHandlerContext ctx, FullHttpRequest request) {
+        runAuthRequest(ctx, request, (username, password) -> authService.login(username, password));
+    }
+
+    /** Token echo — lets the UI validate a stored session on load. */
+    private void handleMe(ChannelHandlerContext ctx) {
+        Principal p = principal(ctx);
+        if (p == null) {
+            sendError(ctx, HttpResponseStatus.UNAUTHORIZED, ERR_UNAUTHORIZED, "Unauthorized");
+            return;
+        }
+        String subject = p.subject();
+        String username = subject.startsWith("user-") ? subject.substring(5) : subject;
+        sendResponse(ctx, HttpResponseStatus.OK,
+                "{\"userId\":" + p.userId() + ",\"username\":\"" + escapeJson(username) + "\"}");
+    }
+
+    private interface AuthCall {
+        com.openexchange.oms.api.auth.AuthService.Session run(String username, String password);
+    }
+
+    /**
+     * Shared register/login plumbing: body parsed on the event loop (the
+     * request buffer is released when channelRead0 returns), credential work
+     * on AUTH_EXECUTOR, null session = bad credentials.
+     */
+    private void runAuthRequest(ChannelHandlerContext ctx, FullHttpRequest request, AuthCall call) {
+        if (authService == null) {
+            sendError(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, ERR_UNAVAILABLE,
+                    "User accounts unavailable: OMS is not running in demo auth mode with persistence");
+            return;
+        }
+        final String body = request.content().toString(StandardCharsets.UTF_8);
+        AUTH_EXECUTOR.execute(() -> {
+            try {
+                com.fasterxml.jackson.databind.JsonNode json = MAPPER.readTree(body);
+                String username = json.path("username").asText(null);
+                String password = json.path("password").asText(null);
+                com.openexchange.oms.api.auth.AuthService.Session session = call.run(username, password);
+                if (session == null) {
+                    sendError(ctx, HttpResponseStatus.UNAUTHORIZED, ERR_UNAUTHORIZED,
+                            "Invalid username or password");
+                    return;
+                }
+                sendResponse(ctx, HttpResponseStatus.OK, MAPPER.writeValueAsString(session));
+            } catch (com.openexchange.oms.api.auth.AuthService.UsernameTakenException e) {
+                sendError(ctx, HttpResponseStatus.CONFLICT, ERR_VALIDATION, e.getMessage());
+            } catch (IllegalArgumentException e) {
+                sendError(ctx, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, e.getMessage());
+            } catch (IllegalStateException e) {
+                sendError(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, ERR_UNAVAILABLE, e.getMessage());
+            } catch (Exception e) {
+                log.error("Auth request failed", e);
+                sendError(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, ERR_INTERNAL, rootMessage(e));
+            }
+        });
     }
 
     private void sendForbidden(ChannelHandlerContext ctx, long userId) {

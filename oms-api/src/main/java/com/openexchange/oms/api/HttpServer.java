@@ -35,6 +35,8 @@ public class HttpServer {
     private final CorsPolicy corsPolicy;
     private final AuditLog auditLog;
     private final io.micrometer.prometheusmetrics.PrometheusMeterRegistry meterRegistry;
+    // Demo auth (OMS_AUTH_MODE=demo); null in other modes
+    private volatile com.openexchange.oms.api.auth.AuthService authService;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
@@ -52,6 +54,11 @@ public class HttpServer {
         this.corsPolicy = corsPolicy;
         this.auditLog = auditLog;
         this.meterRegistry = meterRegistry;
+    }
+
+    /** Demo auth service for the /api/v1/auth/* endpoints. Set before start(). */
+    public void setAuthService(com.openexchange.oms.api.auth.AuthService authService) {
+        this.authService = authService;
     }
 
     public void start() throws InterruptedException {
@@ -86,8 +93,10 @@ public class HttpServer {
                                     ctx.fireChannelRead(msg);
                                 } else {
                                     // REST handler
-                                    ctx.pipeline().addLast(new RestApiHandler(orderService, adminService,
-                                            authorizer, corsPolicy, auditLog, meterRegistry));
+                                    RestApiHandler restHandler = new RestApiHandler(orderService, adminService,
+                                            authorizer, corsPolicy, auditLog, meterRegistry);
+                                    restHandler.setAuthService(authService);
+                                    ctx.pipeline().addLast(restHandler);
                                     ctx.pipeline().remove(this);
                                     ctx.fireChannelRead(msg);
                                 }

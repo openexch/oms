@@ -102,12 +102,25 @@ values (`match-cluster` `MarketConfig`, discoverability tracked in match#64):
 ### Authentication
 
 `Authorization: Bearer <token>` on every call. Providers: `api-key`
-(`key:userId[:ROLES]`, the secure default), `jwt` (HS256), `dev`
-(development only). Identity is always derived from the token; caller-
-supplied `userId` fields are honored only when the principal may act as
-that user. WebSocket browser clients pass the token as the second
-`Sec-WebSocket-Protocol` offer: `['bearer', <token>]`. Query-string tokens
-are rejected. `GET /api/v1/health` and `GET /metrics` are exempt.
+(`key:userId[:ROLES]`, the secure default), `jwt` (HS256), `demo`
+(public demo: self-registered users, see below), `dev` (development only).
+Identity is always derived from the token; caller-supplied `userId` fields
+are honored only when the principal may act as that user. WebSocket browser
+clients pass the token as the second `Sec-WebSocket-Protocol` offer:
+`['bearer', <token>]`. Query-string tokens are rejected.
+`GET /api/v1/health`, `GET /metrics`, and the demo register/login endpoints
+are exempt.
+
+**Demo mode** (`OMS_AUTH_MODE=demo`; requires Postgres with
+`V002__users.sql` applied): `POST /api/v1/auth/register` and
+`POST /api/v1/auth/login` take `{username, password}` and return
+`{userId, username, token}` — one active opaque token per user, rotated on
+login. `GET /api/v1/auth/me` echoes the authenticated identity. Registered
+principals are self-scoped (no `ANY_USER`), so every endpoint below serves
+only their own data; registration funds demo balances on all assets. A
+`dev:<id>` backdoor remains for local infrastructure only: userId 1 (ADMIN,
+self-scoped) and the simulator range 900000-900999 (self-scoped);
+registered-range ids are rejected.
 
 ## REST endpoints
 
@@ -138,12 +151,17 @@ PARTIALLY_FILLED → FILLED | CANCELLED | REJECTED` (+ `PENDING_TRIGGER` for
 stop/trailing orders). `filledQty` derives from the authoritative trade
 stream, never from coalesced status updates.
 
-## OMS WebSocket (`/ws` on :8080)
+## OMS WebSocket (`/ws/v1` on :8080)
 
-Subscribe protocol: `{"action":"subscribe","channel":"orders","userId":N}`
-(the principal must be allowed to act as `userId`). Push events carry the
-same `OrderResponse` JSON as REST (`ORDER_UPDATE` on channel `orders`).
-Channels `executions`/`balances` are declared but not yet pushed.
+Subscribe protocol: `{"op":"subscribe","channels":["orders"],"userId":N}` —
+`userId` optional (defaults to the principal's own; the principal must be
+allowed to act as it). Ack: `{"type":"SUBSCRIBED","userId":N}`. Push events
+are the bare `OrderResponse` JSON (same shape as REST, no type wrapper —
+distinguish from acks by the presence of `omsOrderId`), delivered only to
+the order owner's connections. `{"op":"ping"}` → `{"type":"PONG"}` for
+client-side liveness (the server sends no heartbeats). Channels
+`executions`/`balances` are declared but not yet pushed. Browser auth: pass
+the token via the `Sec-WebSocket-Protocol` offer `['bearer', <token>]`.
 
 ## gRPC (`:9090`)
 
