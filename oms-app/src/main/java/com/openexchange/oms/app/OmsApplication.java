@@ -5,8 +5,10 @@ import com.openexchange.oms.api.HttpServer;
 import com.openexchange.oms.api.OrderService;
 import com.openexchange.oms.api.AdminService;
 import com.openexchange.oms.api.auth.ApiKeyAuthenticationProvider;
+import com.openexchange.oms.api.auth.AuthService;
 import com.openexchange.oms.api.auth.AuthenticationProvider;
 import com.openexchange.oms.api.auth.Authorizer;
+import com.openexchange.oms.api.auth.DemoAuthenticationProvider;
 import com.openexchange.oms.api.auth.DevAuthenticationProvider;
 import com.openexchange.oms.api.auth.GrpcAuthInterceptor;
 import com.openexchange.oms.api.auth.JwtAuthenticationProvider;
@@ -44,6 +46,7 @@ import com.openexchange.oms.ledger.RedisBalanceStore;
 import io.lettuce.core.RedisClient;
 import com.openexchange.oms.persistence.PostgresOrderRepository;
 import com.openexchange.oms.persistence.PostgresExecutionRepository;
+import com.openexchange.oms.persistence.PostgresUserRepository;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import com.openexchange.oms.risk.RiskConfig;
@@ -94,6 +97,7 @@ public class OmsApplication {
         HikariDataSource dataSource = null;
         PostgresOrderRepository orderRepo = null;
         PostgresExecutionRepository executionRepo = null;
+        PostgresUserRepository userRepo = null;
         try {
             HikariConfig hikariConfig = new HikariConfig();
             hikariConfig.setJdbcUrl(config.postgresUrl());
@@ -105,6 +109,7 @@ public class OmsApplication {
             dataSource = new HikariDataSource(hikariConfig);
             orderRepo = new PostgresOrderRepository(dataSource);
             executionRepo = new PostgresExecutionRepository(dataSource);
+            userRepo = new PostgresUserRepository(dataSource); // demo accounts (V002__users.sql)
             log.info("PostgreSQL persistence initialized: {}", config.postgresUrl());
         } catch (Exception e) {
             log.warn("PostgreSQL not available — running without persistence: {}", e.getMessage());
@@ -377,8 +382,8 @@ public class OmsApplication {
             log.warn("Cluster connection failed at startup (will retry in background): {}", e.getMessage());
         }
 
-        // 11. Auth seam (oms#36): provider per OMS_AUTH_MODE, shared authorizer
-        AuthenticationProvider authProvider = buildAuthProvider(config);
+        // 11. Shared authorizer (the auth provider itself is built in 12a —
+        // demo mode needs the order service for registration funding)
         Authorizer authorizer = new RoleBasedAuthorizer();
 
         // 11a. Edge policy (oms#37): CORS allowlist + append-only audit log
@@ -395,6 +400,12 @@ public class OmsApplication {
         orderServiceImpl.setMeterRegistry(meterRegistry);
         orderServiceImpl.setRepositories(orderRepo, executionRepo); // history reads (oms#40)
         OrderService orderService = orderServiceImpl;
+
+        // 12a. Auth seam (oms#36): provider per OMS_AUTH_MODE
+        AuthService demoAuthService = "demo".equals(config.authMode())
+                ? new DemoAuthService(userRepo, orderService)
+                : null;
+        AuthenticationProvider authProvider = buildAuthProvider(config, demoAuthService);
 
         // 12b. Operational gauges (oms#38)
         Gauge.builder("oms_active_orders", orderService, OrderService::getActiveOrderCount)
@@ -472,6 +483,7 @@ public class OmsApplication {
         // 16. HTTP server
         httpServer = new HttpServer(config.httpPort(), orderService, wsHandler, adminService,
                 authProvider, authorizer, corsPolicy, auditLog, meterRegistry);
+        httpServer.setAuthService(demoAuthService); // /api/v1/auth/* (demo mode only)
         httpServer.start();
 
         // 17. gRPC server
@@ -506,12 +518,16 @@ public class OmsApplication {
         log.info("OMS Application started successfully");
     }
 
-    private static AuthenticationProvider buildAuthProvider(OmsConfig config) {
+    private static AuthenticationProvider buildAuthProvider(OmsConfig config, AuthService demoAuthService) {
         switch (config.authMode()) {
             case "dev":
                 log.warn("AUTH: dev mode — every request is accepted with caller-chosen identity. "
                         + "NEVER use in production (set OMS_AUTH_MODE=api-key or jwt).");
                 return new DevAuthenticationProvider();
+            case "demo":
+                log.info("AUTH: demo mode — registered users (opaque tokens, self-scoped) plus a "
+                        + "dev-token backdoor restricted to userId 1 and the sim range 900000-900999");
+                return new DemoAuthenticationProvider(demoAuthService);
             case "jwt":
                 log.info("AUTH: jwt mode (HS256)");
                 return new JwtAuthenticationProvider(config.jwtSecret());
@@ -528,7 +544,7 @@ public class OmsApplication {
                 return provider;
             default:
                 throw new IllegalArgumentException(
-                        "Unknown OMS_AUTH_MODE '" + config.authMode() + "' (expected api-key, jwt, or dev)");
+                        "Unknown OMS_AUTH_MODE '" + config.authMode() + "' (expected api-key, jwt, demo, or dev)");
         }
     }
 
