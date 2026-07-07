@@ -16,6 +16,8 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.http.*;
 import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
+import io.netty.handler.timeout.IdleStateEvent;
+import io.netty.handler.timeout.IdleStateHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -72,6 +74,15 @@ public class HttpServer {
                 @Override
                 protected void initChannel(SocketChannel ch) {
                     ChannelPipeline pipeline = ch.pipeline();
+                    // Reap pooled-but-abandoned keep-alive connections (oms#66):
+                    // 60s all-idle so a client that pooled a socket and walked
+                    // away does not leak an FD. Placed before the codec so it
+                    // observes raw socket activity; the matching IdleCloseHandler
+                    // does the close. Both are removed on a WebSocket upgrade —
+                    // the server sends no WS heartbeats, so a quiet-but-healthy
+                    // WS must not be reaped here.
+                    pipeline.addLast(new IdleStateHandler(0, 0, 60));
+                    pipeline.addLast(new IdleCloseHandler());
                     pipeline.addLast(new HttpServerCodec());
                     pipeline.addLast(new HttpObjectAggregator(1048576)); // 1MB max
                     // Auth gate: every request (incl. the WS upgrade) is
@@ -87,12 +98,25 @@ public class HttpServer {
                                     // browser clients passing a token via Sec-WebSocket-Protocol
                                     // (see HttpAuthHandler); clients offering no subprotocol
                                     // still negotiate fine.
+                                    // The WS upgrade is always the FIRST request on its own
+                                    // connection (browsers open a fresh socket for it), so this
+                                    // path is untouched by REST keep-alive. Drop the REST idle
+                                    // reaper: WS liveness is the client's JSON ping, not TCP idle.
+                                    ctx.pipeline().remove(IdleStateHandler.class);
+                                    ctx.pipeline().remove(IdleCloseHandler.class);
                                     ctx.pipeline().addLast(new WebSocketServerProtocolHandler("/ws/v1", "bearer"));
                                     ctx.pipeline().addLast(webSocketHandler);
                                     ctx.pipeline().remove(this);
                                     ctx.fireChannelRead(msg);
                                 } else {
-                                    // REST handler
+                                    // REST handler.
+                                    // HAZARD 2 (oms#66): this router removes itself after the
+                                    // first REST request, so on a reused keep-alive connection a
+                                    // later /ws/v1 would reach RestApiHandler and 404 instead of
+                                    // upgrading. Accepted and documented: browsers open a fresh
+                                    // socket per WS upgrade, so a connection is REST-only or
+                                    // WS-only in practice. If mixed reuse ever becomes real, keep
+                                    // the router in place and dispatch per request instead.
                                     RestApiHandler restHandler = new RestApiHandler(orderService, adminService,
                                             authorizer, corsPolicy, auditLog, meterRegistry);
                                     restHandler.setAuthService(authService);
@@ -129,5 +153,21 @@ public class HttpServer {
 
     public WebSocketHandler getWebSocketHandler() {
         return webSocketHandler;
+    }
+
+    /**
+     * Closes a connection once {@link IdleStateHandler} reports it idle past the
+     * window (oms#66): reaps keep-alive sockets a client pooled and abandoned so
+     * they do not leak file descriptors. Removed on WebSocket upgrade.
+     */
+    private static final class IdleCloseHandler extends ChannelInboundHandlerAdapter {
+        @Override
+        public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+            if (evt instanceof IdleStateEvent) {
+                ctx.close();
+            } else {
+                ctx.fireUserEventTriggered(evt);
+            }
+        }
     }
 }
