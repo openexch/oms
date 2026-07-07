@@ -422,6 +422,8 @@ public class OmsApplication {
                 .description("Orders terminalized by membership repair").register(meterRegistry);
         FunctionCounter.builder("oms_reconcile_relinked_total", coreEngine, OmsCoreEngine::getTotalRelinkedOrders)
                 .description("Orders re-linked to cluster ids by membership repair").register(meterRegistry);
+        FunctionCounter.builder("oms_ledger_oversettle_total", balanceStore, BalanceStore::getOversettleCount)
+                .description("Settlements where locked was under-held and clamped (accounting-invariant break, oms#84)").register(meterRegistry);
 
         // 13. gRPC services (created before state listener so push methods can be called)
         GrpcOrderService grpcOrderSvc = new GrpcOrderService(orderService, authorizer, auditLog);
