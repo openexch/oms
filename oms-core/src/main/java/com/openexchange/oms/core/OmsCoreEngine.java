@@ -67,12 +67,16 @@ public class OmsCoreEngine {
     /**
      * Process OrderStatusBatch entry from cluster egress.
      * Called on OMS Core Thread via Disruptor.
+     *
+     * @param rejectReason engine reject reason string (match#75), already mapped from the raw SBE
+     *                     code by the transport adapter; null when the egress carried no reason.
+     *                     The lifecycle manager applies it only on a genuine REJECTED terminal.
      */
     public void onClusterOrderStatus(int marketId, long clusterOrderId, long userId, int status,
                                       long price, long remainingQty, long filledQty,
-                                      boolean isBuy, long omsOrderId) {
+                                      boolean isBuy, long omsOrderId, String rejectReason) {
         OmsOrder order = lifecycleManager.onClusterOrderStatus(omsOrderId, clusterOrderId, status,
-            remainingQty, filledQty);
+            remainingQty, filledQty, rejectReason);
 
         if (order == null) return;
 

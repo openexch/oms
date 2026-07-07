@@ -53,6 +53,9 @@ public interface EgressListener {
      * @param statusSeq    per-market monotonic sequence (match#31, schema v3+);
      *                     a gap means the publisher dropped statuses in between.
      *                     0 when the stream predates schema v3.
+     * @param rejectReasonRaw raw engine {@code OrderRejectReason} code (match#75, schema v6+):
+     *                     0 = NONE (non-rejects), 1..N on rejects/terminals. -1 is the sentinel
+     *                     for "no reason available": a pre-v6 stream or an explicit SBE null (255).
      */
     void onOrderStatusUpdate(
             int marketId,
@@ -64,7 +67,8 @@ public interface EgressListener {
             long filledQty,
             boolean isBuy,
             long omsOrderId,
-            long statusSeq);
+            long statusSeq,
+            int rejectReasonRaw);
 
     /**
      * Called for each OpenOrdersSnapshot chunk (match#31): the cluster's

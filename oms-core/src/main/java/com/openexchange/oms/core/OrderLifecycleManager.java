@@ -310,11 +310,27 @@ public class OrderLifecycleManager {
     }
 
     /**
-     * Process OrderStatusUpdate from cluster egress.
-     * Correlates via omsOrderId (primary) or clusterOrderId (fallback).
+     * Process OrderStatusUpdate from cluster egress, with no engine-supplied reject reason.
+     * Used by internal terminalizations (synthetic cancels, membership-repair) that carry no
+     * engine reason. Correlates via omsOrderId (primary) or clusterOrderId (fallback).
      */
     public OmsOrder onClusterOrderStatus(long omsOrderId, long clusterOrderId, int status,
                                           long remainingQty, long filledQty) {
+        return onClusterOrderStatus(omsOrderId, clusterOrderId, status, remainingQty, filledQty, null);
+    }
+
+    /**
+     * Process OrderStatusUpdate from cluster egress.
+     * Correlates via omsOrderId (primary) or clusterOrderId (fallback).
+     *
+     * @param rejectReason engine reject reason (match#75), applied to the order ONLY on a genuine
+     *                     REJECTED terminal (case 4). Null when the egress carried no reason. It is
+     *                     intentionally NOT applied on the replace old-leg reject path (which leaves
+     *                     the order live under its original terms) so a live order never carries a
+     *                     misleading reject reason.
+     */
+    public OmsOrder onClusterOrderStatus(long omsOrderId, long clusterOrderId, int status,
+                                          long remainingQty, long filledQty, String rejectReason) {
         OmsOrder order = activeOrders.get(omsOrderId);
         if (order == null) {
             order = byClusterOrderId.get(clusterOrderId);
@@ -348,7 +364,9 @@ public class OrderLifecycleManager {
                 }
                 if (status == 4) {
                     // Engine refused the amend (bad price, cancel-miss): old leg intact, order
-                    // stays live with its original values.
+                    // stays live with its original values. Returns BEFORE the switch, so the
+                    // rejectReason (match#75) is deliberately NOT applied here: a live order must
+                    // never carry a reject reason.
                     abortReplace(order, "engine rejected the amend");
                     return order;
                 }
@@ -414,6 +432,12 @@ public class OrderLifecycleManager {
                 removeOrder(order.getOmsOrderId());
                 break;
             case 4: // REJECTED
+                // Attach the engine reason (match#75) BEFORE the transition, so the state
+                // listener's WS/gRPC push and OrderResponse.fromOrder both carry it. Only on a
+                // genuine reject; null (NONE / pre-v6 / no reason) leaves the field untouched.
+                if (rejectReason != null) {
+                    order.setRejectReason(rejectReason);
+                }
                 transition(order, OmsOrderStatus.REJECTED);
                 removeOrder(order.getOmsOrderId());
                 break;
