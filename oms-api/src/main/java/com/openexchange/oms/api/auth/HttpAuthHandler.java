@@ -2,6 +2,7 @@
 package com.openexchange.oms.api.auth;
 
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -11,6 +12,7 @@ import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.QueryStringDecoder;
 import io.netty.util.AttributeKey;
@@ -64,8 +66,11 @@ public final class HttpAuthHandler extends ChannelInboundHandlerAdapter {
             ctx.fireChannelRead(msg);
         } catch (AuthenticationException e) {
             String origin = req.headers().get(HttpHeaderNames.ORIGIN);
+            // Capture keep-alive before releasing the request (oms#66): a 401 is
+            // not a protocol fault, so an HTTP/1.1 caller may reuse the socket.
+            boolean keepAlive = HttpUtil.isKeepAlive(req);
             req.release();
-            sendUnauthorized(ctx, origin, e.getMessage());
+            sendUnauthorized(ctx, origin, keepAlive, e.getMessage());
         }
     }
 
@@ -111,7 +116,7 @@ public final class HttpAuthHandler extends ChannelInboundHandlerAdapter {
         return bearer ? token : null;
     }
 
-    private void sendUnauthorized(ChannelHandlerContext ctx, String origin, String message) {
+    private void sendUnauthorized(ChannelHandlerContext ctx, String origin, boolean keepAlive, String message) {
         String safe = message == null ? "Unauthorized" : message.replace("\\", "\\\\").replace("\"", "\\\"");
         byte[] body = ("{\"error\":\"" + safe + "\",\"code\":\"UNAUTHORIZED\"}").getBytes(StandardCharsets.UTF_8);
         FullHttpResponse response = new DefaultFullHttpResponse(
@@ -120,6 +125,12 @@ public final class HttpAuthHandler extends ChannelInboundHandlerAdapter {
         response.headers().set(HttpHeaderNames.CONTENT_LENGTH, body.length);
         response.headers().set(HttpHeaderNames.WWW_AUTHENTICATE, "Bearer");
         corsPolicy.apply(origin, response);
-        ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+        // Keep-alive (oms#66): honor the caller's Connection preference and only
+        // close when they did not ask to keep the socket.
+        HttpUtil.setKeepAlive(response, keepAlive);
+        ChannelFuture future = ctx.writeAndFlush(response);
+        if (!keepAlive) {
+            future.addListener(ChannelFutureListener.CLOSE);
+        }
     }
 }
