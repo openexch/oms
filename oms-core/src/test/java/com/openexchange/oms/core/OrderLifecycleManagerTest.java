@@ -331,8 +331,10 @@ class OrderLifecycleManagerTest {
         assertTrue(lcm.onReplaceSubmitted(13L, 130_000_000L, 100_000_000L, 0, 130L));
         order.setPendingHoldDelta(30L); // as the service does after a successful delta hold
 
-        // Engine refuses the amend: REJECTED names the OLD leg, old order intact.
-        lcm.onClusterOrderStatus(13L, 800L, 4, 0, 0);
+        // Engine refuses the amend: REJECTED names the OLD leg, old order intact. Even though the
+        // egress carries an engine reason (match#75), a surviving live order must NOT be tagged with
+        // a reject reason on the abort-replace path.
+        lcm.onClusterOrderStatus(13L, 800L, 4, 0, 0, "ORDER_NOT_FOUND");
         assertEquals(OmsOrderStatus.NEW, order.getStatus());
         assertNotNull(lcm.getOrder(13L));
         assertEquals(800L, order.getClusterOrderId());
@@ -343,6 +345,7 @@ class OrderLifecycleManagerTest {
         assertEquals(1, hooks.aborted);
         assertEquals(30L, hooks.lastAbortedDelta);
         assertFalse(stateTransitions.contains(OmsOrderStatus.REJECTED));
+        assertNull(order.getRejectReason(), "a live order must not carry an engine reject reason");
     }
 
     @Test
@@ -357,8 +360,10 @@ class OrderLifecycleManagerTest {
         assertNotNull(lcm.getOrder(14L));
         // ...but the new leg could not rest: REJECTED names the NEW leg — a real outcome,
         // resolve-then-terminalize (holds now sized to the amended order, released via listener).
-        lcm.onClusterOrderStatus(14L, 901L, 4, 0, 0);
+        // This IS a genuine reject of the (resolved) order, so the engine reason (match#75) sticks.
+        lcm.onClusterOrderStatus(14L, 901L, 4, 0, 0, "WOULD_CROSS");
         assertEquals(OmsOrderStatus.REJECTED, order.getStatus());
+        assertEquals("WOULD_CROSS", order.getRejectReason());
         assertNull(lcm.getOrder(14L));
         assertEquals(1, hooks.resolved);
     }
@@ -470,5 +475,53 @@ class OrderLifecycleManagerTest {
         lcm.onSubmitFailed(999L, "Order queue full"); // must not throw
         assertNull(lcm.getOrder(999L));
         assertFalse(stateTransitions.contains(OmsOrderStatus.REJECTED));
+    }
+
+    // ==================== Engine reject reasons on egress (match#75) ====================
+
+    @Test
+    void testClusterRejectAttachesEngineReasonBeforeTransition() {
+        // A resting order that the engine then rejects (e.g. an amend/cancel miss re-delivered as a
+        // terminal reject). The reason must be on the order BEFORE the REJECTED transition fires, so
+        // the state listener's push and OrderResponse.fromOrder both observe it.
+        OmsOrder order = restingOrder(50L, 5000L);
+        String[] reasonAtTransition = new String[1];
+        lcm.setStateListener((o, oldStatus, newStatus) -> {
+            if (newStatus == OmsOrderStatus.REJECTED) {
+                reasonAtTransition[0] = o.getRejectReason();
+            }
+        });
+
+        lcm.onClusterOrderStatus(50L, 5000L, 4, 0, 0, "NO_LIQUIDITY");
+
+        assertEquals(OmsOrderStatus.REJECTED, order.getStatus());
+        assertEquals("NO_LIQUIDITY", order.getRejectReason());
+        assertEquals("NO_LIQUIDITY", reasonAtTransition[0],
+                "reason must be set before the REJECTED transition so the listener sees it");
+        assertNull(lcm.getOrder(50L));
+    }
+
+    @Test
+    void testClusterRejectWithNullReasonLeavesReasonUnset() {
+        // A reject with no engine reason (pre-v6 stream / NONE / mapped null) keeps prior behavior:
+        // the order rejects but carries no reject reason.
+        OmsOrder order = restingOrder(51L, 5100L);
+
+        lcm.onClusterOrderStatus(51L, 5100L, 4, 0, 0, null);
+
+        assertEquals(OmsOrderStatus.REJECTED, order.getStatus());
+        assertNull(order.getRejectReason());
+        assertNull(lcm.getOrder(51L));
+    }
+
+    @Test
+    void testFiveArgOverloadPassesNoReason() {
+        // The internal/synthetic terminalization path (5-arg overload) carries no engine reason.
+        OmsOrder order = restingOrder(52L, 5200L);
+
+        lcm.onClusterOrderStatus(52L, 5200L, 4, 0, 0);
+
+        assertEquals(OmsOrderStatus.REJECTED, order.getStatus());
+        assertNull(order.getRejectReason());
     }
 }

@@ -820,6 +820,17 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
     }
 
     /**
+     * Map the engine reject-reason group field (match#75, schema v6+) to a raw int, or the -1
+     * sentinel when no reason is available. Mirrors {@link #normalizeStatusSeq}: a pre-v6 acting
+     * version makes the generated accessor return the null value (255) here, so this single check
+     * covers both a genuinely pre-v6 stream and an explicit SBE null on a v6 status. Codes never
+     * reach 255, so the sentinel is unambiguous.
+     */
+    static int normalizeRejectReason(short raw) {
+        return raw == OrderStatusBatchDecoder.OrdersDecoder.rejectReasonNullValue() ? -1 : raw;
+    }
+
+    /**
      * Decode an OrderStatusBatch and dispatch individual order status callbacks.
      */
     private void dispatchOrderStatusBatch(DirectBuffer buffer, int offset, EgressListener listener) {
@@ -839,7 +850,8 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                         order.filledQty(),
                         isBuy,
                         order.omsOrderId(),
-                        normalizeStatusSeq(order.statusSeq()));
+                        normalizeStatusSeq(order.statusSeq()),
+                        normalizeRejectReason(order.rejectReason()));
             } catch (Exception e) {
                 log.error("EgressListener.onOrderStatusUpdate() threw exception for orderId={}",
                         order.orderId(), e);

@@ -85,7 +85,8 @@ public class OmsEgressAdapter implements EgressListener {
     @Override
     public void onOrderStatusUpdate(int marketId, long orderId, long userId, int status,
                                      long price, long remainingQty, long filledQty,
-                                     boolean isBuy, long omsOrderId, long statusSeq) {
+                                     boolean isBuy, long omsOrderId, long statusSeq,
+                                     int rejectReasonRaw) {
         // Per-market contiguity: the publisher consumes a seq for every status,
         // dropped or not, so any wire gap means statuses were lost (match#31).
         // Seq counters reset on leader change; onConnected/onReconnected clears
@@ -103,7 +104,36 @@ public class OmsEgressAdapter implements EgressListener {
             }
         }
         coreEngine.onClusterOrderStatus(marketId, orderId, userId, status,
-                price, remainingQty, filledQty, isBuy, omsOrderId);
+                price, remainingQty, filledQty, isBuy, omsOrderId,
+                mapRejectReason(rejectReasonRaw));
+    }
+
+    /**
+     * Map the raw engine {@code OrderRejectReason} code (match#75, SBE v6) to the OMS
+     * rejectReason string vocabulary. Returns null for the -1 sentinel (no reason available:
+     * pre-v6 stream / SBE null) and for NONE (0, carried on every non-reject status), so a reason
+     * is only ever attached to an actual reject. Unknown/future codes fall back to
+     * {@code ENGINE_REJECT_<n>} rather than throwing, so a newer engine can never break egress
+     * dispatch. Names mirror the engine enum so they read alongside the risk-reject vocabulary
+     * (RATE_LIMIT_EXCEEDED, etc.).
+     */
+    static String mapRejectReason(int raw) {
+        switch (raw) {
+            case -1: // sentinel: pre-v6 stream or SBE null (upstream too old to say)
+            case 0:  // NONE, carried on every non-reject status
+                return null;
+            case 1:  return "PRICE_OUT_OF_RANGE";
+            case 2:  return "PRICE_OFF_TICK";
+            case 3:  return "LEVEL_FULL";
+            case 4:  return "BOOK_FULL";
+            case 5:  return "OVERFLOW";
+            case 6:  return "INVALID_QUANTITY";
+            case 7:  return "MATCH_LIMIT";
+            case 8:  return "WOULD_CROSS";
+            case 9:  return "NO_LIQUIDITY";
+            case 10: return "ORDER_NOT_FOUND";
+            default: return "ENGINE_REJECT_" + raw;
+        }
     }
 
     @Override
