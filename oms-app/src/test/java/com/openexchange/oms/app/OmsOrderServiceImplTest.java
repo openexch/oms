@@ -10,6 +10,7 @@ import com.openexchange.oms.cluster.OrderSubmission;
 import com.openexchange.oms.common.domain.Market;
 import com.openexchange.oms.common.domain.SnowflakeIdGenerator;
 import com.openexchange.oms.common.domain.OmsOrder;
+import com.openexchange.oms.common.enums.OmsOrderStatus;
 import com.openexchange.oms.common.enums.OmsOrderType;
 import com.openexchange.oms.core.OmsCoreEngine;
 import com.openexchange.oms.core.OrderLifecycleManager;
@@ -431,6 +432,103 @@ class OmsOrderServiceImplTest {
 
         assertFalse(resp.isAccepted());
         assertEquals("Order queue full", resp.getRejectReason());
+    }
+
+    // ---- queue-full leaves no PENDING_NEW zombie + no double-release (oms#85) ----
+    //
+    // createOrder advances the order to PENDING_NEW before it enqueues to the cluster.
+    // On a queue-full enqueue failure the old path called onHoldFailed (guarded on
+    // PENDING_HOLD → no-op), so the client was told "rejected" while GET/cancel still saw
+    // an active PENDING_NEW order for ~10-20s until the orphan sweep. The fix terminalizes
+    // it via onSubmitFailed and lets the state listener perform the SINGLE hold release +
+    // slot close. These tests wire that listener exactly as OmsApplication does.
+
+    @Test
+    void testQueueFullTerminalizesOrderNoZombieAndReleasesHoldExactlyOnce() {
+        wireStateListener();
+        when(clusterClient.submitOrder(any())).thenReturn(false);
+
+        long deposit = FixedPoint.fromDouble(100000.0);
+        balanceStore.deposit(1L, 0, deposit);
+
+        CreateOrderRequest req = createLimitBuyRequest(1L, 1, 50000.0, 1.0);
+        CreateOrderResponse resp = orderService.createOrder(req);
+
+        // Client is told rejected...
+        assertFalse(resp.isAccepted());
+        assertEquals("Order queue full", resp.getRejectReason());
+
+        // ...and OMS state matches immediately: the order is gone from the active map, so no
+        // PENDING_NEW zombie for GET to list or cancel to refuse (oms#85).
+        assertNull(coreEngine.getLifecycleManager().getOrder(resp.getOmsOrderId()),
+                "queue-full order must not linger as an active PENDING_NEW zombie");
+
+        // The hold is released EXACTLY once: locked back to 0, available back to the FULL
+        // deposit — never MORE than the deposit (a double-release would over-credit).
+        assertEquals(0L, balanceStore.getLocked(1L, 0));
+        assertEquals(deposit, balanceStore.getAvailable(1L, 0));
+
+        // Open-order slot is net-zero: the pre-submit onOrderOpened is balanced by the
+        // listener's onOrderClosed on the reject (baseline back to 0).
+        assertEquals(0L, riskEngine.getOpenOrderCount(1L));
+    }
+
+    @Test
+    void testQueueFullDoesNotDoubleReleaseAgainstOtherLockedFunds() {
+        wireStateListener();
+
+        long deposit = FixedPoint.fromDouble(200000.0);
+        balanceStore.deposit(1L, 0, deposit);
+
+        // A first order rests and keeps its hold locked (submit succeeds, default mock).
+        CreateOrderResponse resting =
+                orderService.createOrder(createLimitBuyRequest(1L, 1, 50000.0, 1.0));
+        assertTrue(resting.isAccepted());
+        long restingHold =
+                FixedPoint.multiply(FixedPoint.fromDouble(50000.0), FixedPoint.fromDouble(1.0));
+        assertEquals(restingHold, balanceStore.getLocked(1L, 0));
+
+        // The next create queue-fulls. Its own hold (another 50k) was placed at step 4 and
+        // must be released EXACTLY once. If the queue-full path released explicitly AND let the
+        // listener release, the second release would succeed against the RESTING order's locked
+        // funds — unlocking money that must stay held (the oms#85 double-release trap).
+        when(clusterClient.submitOrder(any())).thenReturn(false);
+        CreateOrderResponse rejected =
+                orderService.createOrder(createLimitBuyRequest(1L, 1, 50000.0, 1.0));
+        assertFalse(rejected.isAccepted());
+
+        // Only the resting order's hold remains locked; available is exactly deposit -
+        // restingHold, never MORE (no money created).
+        assertEquals(restingHold, balanceStore.getLocked(1L, 0));
+        assertEquals(deposit - restingHold, balanceStore.getAvailable(1L, 0));
+
+        // The resting order is untouched and live; the rejected one is gone.
+        assertNotNull(coreEngine.getLifecycleManager().getOrder(resting.getOmsOrderId()));
+        assertNull(coreEngine.getLifecycleManager().getOrder(rejected.getOmsOrderId()));
+
+        // Slot count reflects only the one surviving open order.
+        assertEquals(1L, riskEngine.getOpenOrderCount(1L));
+    }
+
+    /**
+     * Wire the terminal hold-release + open-order-slot listener exactly as
+     * OmsApplication does (release + onOrderClosed on any HELD→terminal transition),
+     * minus the WS/gRPC push that has no harness here.
+     */
+    private void wireStateListener() {
+        coreEngine.getLifecycleManager().setStateListener((order, oldStatus, newStatus) -> {
+            boolean heldResources = oldStatus == OmsOrderStatus.NEW
+                    || oldStatus == OmsOrderStatus.PARTIALLY_FILLED
+                    || oldStatus == OmsOrderStatus.PENDING_NEW
+                    || oldStatus == OmsOrderStatus.PENDING_TRIGGER;
+            boolean releasingTerminal = newStatus == OmsOrderStatus.CANCELLED
+                    || newStatus == OmsOrderStatus.EXPIRED
+                    || newStatus == OmsOrderStatus.REJECTED;
+            if (heldResources && releasingTerminal) {
+                ledgerService.releaseForCancel(order);
+                riskEngine.onOrderClosed(order.getUserId());
+            }
+        });
     }
 
     @Test

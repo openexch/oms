@@ -173,6 +173,35 @@ public class OrderLifecycleManager {
     }
 
     /**
+     * Transition: PENDING_NEW → REJECTED (cluster submission enqueue failed, oms#85).
+     * <p>
+     * createOrder advances the order to PENDING_NEW the moment the ledger hold lands
+     * ({@link #onHoldPlaced}), BEFORE it enqueues the submission to the cluster client. When
+     * that bounded MPSC enqueue fails (queue momentarily full), the order is a PENDING_NEW the
+     * cluster has never seen. The old queue-full path called {@link #onHoldFailed}, whose guard
+     * requires PENDING_HOLD, so it no-op'd and the order lingered as an active PENDING_NEW
+     * zombie (client told "rejected", yet GET still lists it and cancel refuses) until the
+     * orphan sweep terminalized it ~10-20s later. Terminalize it here instead, so OMS state
+     * matches the client's rejection immediately.
+     * <p>
+     * Guarded HARD on {@code status == PENDING_NEW && clusterOrderId == 0}: this must ONLY ever
+     * terminalize an order the cluster has never acked. The hold release and the open-order slot
+     * close happen in the state listener on the PENDING_NEW→REJECTED transition, so callers must
+     * NOT release the hold themselves — doing both double-releases the hold (oms#85 trap).
+     */
+    public void onSubmitFailed(long omsOrderId, String reason) {
+        OmsOrder order = activeOrders.get(omsOrderId);
+        if (order == null
+                || order.getStatus() != OmsOrderStatus.PENDING_NEW
+                || order.getClusterOrderId() != 0) {
+            return;
+        }
+        order.setRejectReason(reason);
+        transition(order, OmsOrderStatus.REJECTED);
+        removeOrder(omsOrderId);
+    }
+
+    /**
      * Transition: PENDING_NEW → PENDING_TRIGGER (synthetic order, not sent to cluster)
      */
     public void onPendingTrigger(long omsOrderId) {

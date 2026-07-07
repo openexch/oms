@@ -410,4 +410,65 @@ class OrderLifecycleManagerTest {
         assertFalse(lcm.onReplaceSubmitted(17L, 120_000_000L, 100_000_000L, 0, 120L));
         assertFalse(order.isReplacePending());
     }
+
+    // ==================== Queue-full submit terminalization (oms#85) ====================
+
+    @Test
+    void testOnSubmitFailedTerminalizesPendingNewNeverAckedOrder() {
+        OmsOrder order = createOrder(40L);
+        lcm.registerOrder(order);
+        lcm.onRiskPassed(order.getOmsOrderId());
+        lcm.onHoldPlaced(order.getOmsOrderId());
+        assertEquals(OmsOrderStatus.PENDING_NEW, order.getStatus());
+        assertEquals(0, order.getClusterOrderId());
+
+        lcm.onSubmitFailed(order.getOmsOrderId(), "Order queue full");
+
+        // Terminalized + removed immediately — no PENDING_NEW zombie for the orphan sweep.
+        assertEquals(OmsOrderStatus.REJECTED, order.getStatus());
+        assertEquals("Order queue full", order.getRejectReason());
+        assertNull(lcm.getOrder(order.getOmsOrderId()));
+        assertTrue(stateTransitions.contains(OmsOrderStatus.REJECTED),
+                "the REJECTED transition must fire so the listener releases the hold + slot");
+    }
+
+    @Test
+    void testOnSubmitFailedNoOpsWhenNotPendingNew() {
+        OmsOrder order = createOrder(41L);
+        lcm.registerOrder(order);
+        lcm.onRiskPassed(order.getOmsOrderId()); // PENDING_HOLD — hold not yet placed
+        stateTransitions.clear();
+
+        lcm.onSubmitFailed(order.getOmsOrderId(), "Order queue full");
+
+        // Guard is PENDING_NEW-only: onHoldFailed owns the PENDING_HOLD path.
+        assertEquals(OmsOrderStatus.PENDING_HOLD, order.getStatus());
+        assertNotNull(lcm.getOrder(order.getOmsOrderId()));
+        assertFalse(stateTransitions.contains(OmsOrderStatus.REJECTED));
+    }
+
+    @Test
+    void testOnSubmitFailedNoOpsOnceClusterAcked() {
+        // A PENDING_NEW order the cluster HAS acked (clusterOrderId != 0) belongs to a live
+        // cluster leg — the submit-failed path must never terminalize it.
+        OmsOrder order = createOrder(42L);
+        lcm.registerOrder(order);
+        lcm.onRiskPassed(order.getOmsOrderId());
+        lcm.onHoldPlaced(order.getOmsOrderId());
+        lcm.onSentToCluster(order.getOmsOrderId(), 4242L); // cid assigned, still PENDING_NEW
+        stateTransitions.clear();
+
+        lcm.onSubmitFailed(order.getOmsOrderId(), "Order queue full");
+
+        assertEquals(OmsOrderStatus.PENDING_NEW, order.getStatus());
+        assertNotNull(lcm.getOrder(order.getOmsOrderId()));
+        assertFalse(stateTransitions.contains(OmsOrderStatus.REJECTED));
+    }
+
+    @Test
+    void testOnSubmitFailedNoOpsOnUnknownOrder() {
+        lcm.onSubmitFailed(999L, "Order queue full"); // must not throw
+        assertNull(lcm.getOrder(999L));
+        assertFalse(stateTransitions.contains(OmsOrderStatus.REJECTED));
+    }
 }
