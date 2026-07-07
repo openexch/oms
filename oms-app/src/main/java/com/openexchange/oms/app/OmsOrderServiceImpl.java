@@ -38,7 +38,9 @@ public class OmsOrderServiceImpl implements OrderService {
     private final SnowflakeIdGenerator idGenerator;
     private final OmsMarketDataProvider marketDataProvider;
 
-    // Slippage multiplier for market buy hold estimation (5% above best ask)
+    // Slippage multiplier used to estimate an effective price (5% above best ask) for BUY
+    // orders that carry no real limit price (MARKET, STOP_LOSS, TRAILING_STOP) — both for
+    // the ledger hold and, for MARKET, the eventual cluster submission.
     private static final double MARKET_BUY_SLIPPAGE = 1.05;
 
     // Optional admission-stage timers (oms#38); no-ops until a registry is set.
@@ -161,6 +163,27 @@ public class OmsOrderServiceImpl implements OrderService {
             // 3. Risk passed → PENDING_HOLD
             lcm.onRiskPassed(order.getOmsOrderId());
 
+            // 3b. For BUY orders with no real limit price (price=0 is the "unset" convention
+            // for MARKET, STOP_LOSS, TRAILING_STOP), estimate an effective price from best ask
+            // BEFORE placing the ledger hold below. This MUST happen before step 4: holdForOrder
+            // computes holdAmount = FixedPoint.multiply(order.getPrice(), quantity), and price=0
+            // always yields holdAmount=0, which fails LedgerService's holdAmount<=0 guard and
+            // rejects the order as "Insufficient balance" regardless of the account's real funds
+            // (oms#81) — the risk check above already estimates via best ask and passes, so the
+            // hold and the risk check disagreed purely because of this ordering. STOP_LIMIT is
+            // unaffected: it always carries a real user-supplied price, so it never hits this
+            // branch, and SELL orders hold base asset by quantity so they don't need a price at all.
+            if (side == OrderSide.BUY && order.getPrice() <= 0) {
+                long bestAsk = marketDataProvider.getBestAsk(order.getMarketId());
+                if (bestAsk <= 0) {
+                    lcm.onHoldFailed(order.getOmsOrderId(), "No liquidity (no best ask)");
+                    return CreateOrderResponse.rejected("No liquidity available for market buy");
+                }
+                // Use best ask with slippage buffer as the estimated price for holding
+                long estimatedPrice = (long) (bestAsk * MARKET_BUY_SLIPPAGE);
+                order.setPrice(estimatedPrice);
+            }
+
             // 4. Place ledger hold
             long holdStart = System.nanoTime();
             List<LedgerEntry> holdEntries = ledgerService.holdForOrder(order);
@@ -180,18 +203,6 @@ public class OmsOrderServiceImpl implements OrderService {
                 lcm.onPendingTrigger(order.getOmsOrderId());
                 coreEngine.getSyntheticEngine().registerOrder(order);
                 return CreateOrderResponse.accepted(order.getOmsOrderId(), order.getStatus().name());
-            }
-
-            // 6b. For market buy orders, estimate price from best ask for hold calculation
-            if (orderType == OmsOrderType.MARKET && side == OrderSide.BUY) {
-                long bestAsk = marketDataProvider.getBestAsk(order.getMarketId());
-                if (bestAsk <= 0) {
-                    lcm.onHoldFailed(order.getOmsOrderId(), "No liquidity (no best ask)");
-                    return CreateOrderResponse.rejected("No liquidity available for market buy");
-                }
-                // Use best ask with slippage buffer as the estimated price for holding
-                long estimatedPrice = (long) (bestAsk * MARKET_BUY_SLIPPAGE);
-                order.setPrice(estimatedPrice);
             }
 
             // 7. Build and submit to cluster
