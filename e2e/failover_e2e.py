@@ -260,6 +260,14 @@ def cluster_env(node_id):
         # froze a 31G dev box (page-reclaim storm stalled the LIVE cluster
         # too) and would blow a CI runner's ~3.5G shm. 1m is plenty at E2E rates.
         "TRANSPORT_TERM_LENGTH": os.environ.get("E2E_TERM_LENGTH", "1m"),
+        # The consensus LOG channel is NOT covered by TRANSPORT_TERM_LENGTH:
+        # Aeron's default is 64m, and every catch-up replay maps + zero-faults
+        # a fresh non-sparse 3-term buffer (192MB observed live). Election /
+        # rejoin churn on a small CI runner spends whole connect-timeouts
+        # faulting buffers -> "no connection established for replayChannel"
+        # -> no leader / no rejoin (oms#73, both failure modes). 4m (12MB per
+        # buffer) is ample at E2E rates.
+        "TRANSPORT_LOG_TERM_LENGTH": os.environ.get("E2E_LOG_TERM_LENGTH", "4m"),
         # keep clear of a live stack's 9500..9502
         "METRICS_PORT": str(PORT_BASE + 500 + node_id),
     }
