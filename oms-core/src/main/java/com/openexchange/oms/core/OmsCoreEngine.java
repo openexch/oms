@@ -155,11 +155,29 @@ public class OmsCoreEngine {
             if (makerOrder != null) persistenceHandler.persistOrderUpdate(makerOrder);
         }
 
-        // Check if iceberg slice filled — use the order returned by applyFill, since a FILLED order
-        // is removed from the active map (getOrder would now return null).
-        if (takerOrder != null && takerOrder.getOrderType() == OmsOrderType.ICEBERG
-            && takerOrder.getStatus() == OmsOrderStatus.FILLED) {
-            syntheticEngine.onIcebergSliceFilled(takerOmsOrderId);
+        // Iceberg slice tracking (oms#86): drain each side's per-slice counter by the trade
+        // quantity and refill when the SLICE (not the parent) is exhausted. The old gate here
+        // required takerOrder.getStatus()==FILLED, but applyFill accumulates against the
+        // parent's TOTAL quantity, so a slice fill only ever drove the parent to
+        // PARTIALLY_FILLED — the refill never fired — and it ignored the maker side entirely
+        // (a RESTING slice fills as the maker). Use the orders returned by applyFill: the
+        // final slice's fill makes the parent FILLED and removes it from the active map.
+        trackIcebergSlice(takerOrder, takerOmsOrderId, tradeQuantity);
+        trackIcebergSlice(makerOrder, makerOmsOrderId, tradeQuantity);
+    }
+
+    /** oms#86: per-slice fill tracking, side-agnostic. */
+    private void trackIcebergSlice(OmsOrder order, long omsOrderId, long tradeQuantity) {
+        if (order == null || order.getOrderType() != OmsOrderType.ICEBERG) {
+            return;
+        }
+        long remaining = Math.max(0, order.getSliceRemainingQty() - tradeQuantity);
+        order.setSliceRemainingQty(remaining);
+        if (remaining == 0) {
+            // Slice exhausted: the synthetic engine submits the next slice via
+            // submitIcebergSlice (re-arming the counter), or self-cleans when the
+            // hidden remainder is gone (the parent just went FILLED via applyFill).
+            syntheticEngine.onIcebergSliceFilled(omsOrderId);
         }
     }
 
@@ -191,6 +209,10 @@ public class OmsCoreEngine {
      * handling identical regardless of which slice it is.
      */
     public void submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {
+        // oms#86: arm the per-slice fill tracker. Slice completion is detected on the
+        // TRADE stream (trackIcebergSlice), taker or maker side alike, by draining this
+        // counter — the parent's cumulative status can never say "slice done".
+        icebergOrder.setSliceRemainingQty(sliceQuantity);
         if (clusterSubmitHandler != null) {
             clusterSubmitHandler.submitIcebergSlice(icebergOrder, sliceQuantity);
         }

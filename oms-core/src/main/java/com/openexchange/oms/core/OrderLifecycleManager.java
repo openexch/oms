@@ -3,6 +3,7 @@ package com.openexchange.oms.core;
 
 import com.openexchange.oms.common.domain.OmsOrder;
 import com.openexchange.oms.common.enums.OmsOrderStatus;
+import com.openexchange.oms.common.enums.OmsOrderType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -366,9 +367,28 @@ public class OrderLifecycleManager {
             }
         }
 
+        // Iceberg slice adoption (oms#86): each refill slice is a fresh cluster order carrying
+        // the parent's omsOrderId. Normally the prior slice's FILLED (case 2 below) zeroes the
+        // cid so the adopt block re-links; when that FILLED was coalesced away on the lossy
+        // status stream, a non-terminal status for the NEXT slice arrives while the cid still
+        // names the OLD slice — re-index so user cancels and membership repair target the
+        // slice actually resting.
+        if (order.getOrderType() == OmsOrderType.ICEBERG
+                && clusterOrderId != 0 && order.getClusterOrderId() != 0
+                && clusterOrderId != order.getClusterOrderId()
+                && (status == 0 || status == 1)) {
+            byClusterOrderId.remove(order.getClusterOrderId(), order);
+            order.setClusterOrderId(clusterOrderId);
+            byClusterOrderId.put(clusterOrderId, order);
+            log.debug("Iceberg slice re-linked for omsOrderId={}: clusterOrderId -> {}",
+                    order.getOmsOrderId(), clusterOrderId);
+        }
+
         // STALE-LEG GUARD (oms#67): a terminal status naming a cluster leg this order no longer
-        // occupies (a re-delivered old-leg echo after the replace resolved) must not terminalize
-        // the live order. Non-terminal stale echoes fall through harmlessly (monotonic guards).
+        // occupies (a re-delivered old-leg echo after the replace resolved, or an iceberg's
+        // already-superseded slice) must not terminalize the live order. Non-terminal stale
+        // echoes fall through harmlessly (monotonic guards). An iceberg slice's own FILLED
+        // names the CURRENT cid, so it is not swallowed here.
         if (clusterOrderId != 0 && order.getClusterOrderId() != 0
                 && clusterOrderId != order.getClusterOrderId()
                 && (status == 2 || status == 3 || status == 4)) {
@@ -404,6 +424,27 @@ public class OrderLifecycleManager {
                 }
                 break;
             case 2: // FILLED — cluster confirms the order left the book fully filled; reconcile to qty
+                // Iceberg SLICE FILLED (oms#86): the cluster order that filled is one display
+                // slice, not the parent — the parent still has hidden quantity working. This
+                // status used to setFilledQty(total) and terminalize the whole iceberg after
+                // its FIRST slice (wrong filledQty, hold leaked, refills dead). Slice-level
+                // bookkeeping only: unindex the finished slice and clear the cid so the next
+                // slice's NEW is adopted. Refill timing is driven by the lossless trade stream
+                // (trackIcebergSlice); parent-terminal comes from applyFill when cumulative
+                // fills reach the total.
+                if (order.getOrderType() == OmsOrderType.ICEBERG
+                        && order.getFilledQty() < order.getQuantity()) {
+                    if (clusterOrderId != 0) {
+                        byClusterOrderId.remove(clusterOrderId, order);
+                        if (order.getClusterOrderId() == clusterOrderId) {
+                            order.setClusterOrderId(0);
+                        }
+                    }
+                    log.debug("Iceberg slice FILLED for omsOrderId={} (slice cid={}, parent {}/{} filled)",
+                            order.getOmsOrderId(), clusterOrderId,
+                            order.getFilledQty(), order.getQuantity());
+                    return order;
+                }
                 order.setFilledQty(order.getQuantity());
                 order.setRemainingQty(0);
                 transition(order, OmsOrderStatus.FILLED);
