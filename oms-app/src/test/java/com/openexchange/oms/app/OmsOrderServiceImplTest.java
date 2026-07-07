@@ -36,12 +36,13 @@ class OmsOrderServiceImplTest {
     private RiskEngine riskEngine;
     private OmsMarketDataProvider marketDataProvider;
     private OmsCoreEngine coreEngine;
+    private LedgerService ledgerService;
 
     @BeforeEach
     void setUp() {
         balanceStore = new InMemoryBalanceStore();
         SnowflakeIdGenerator idGenerator = new SnowflakeIdGenerator(0);
-        LedgerService ledgerService = new LedgerService(balanceStore, idGenerator);
+        ledgerService = new LedgerService(balanceStore, idGenerator);
 
         marketDataProvider = new OmsMarketDataProvider();
         OmsBalanceChecker balanceChecker = new OmsBalanceChecker(balanceStore);
@@ -606,5 +607,168 @@ class OmsOrderServiceImplTest {
         req.setQuantity(com.match.domain.FixedPoint.fromDouble(qty));
         req.setStopPrice(com.match.domain.FixedPoint.fromDouble(stopPrice));
         return req;
+    }
+
+    // ==================== PUT amend / cancel-and-replace (oms#67) ====================
+
+    /** Wire the replace ledger hooks exactly as OmsApplication does. */
+    private void wireReplaceHooks() {
+        coreEngine.getLifecycleManager().setReplaceHooks(new OrderLifecycleManager.ReplaceHooks() {
+            @Override
+            public void onReplaceResolved(OmsOrder order) {
+                long target = order.getPendingHoldTarget();
+                long surplus = order.getHoldAmount() + order.getPendingHoldDelta() - target;
+                if (surplus > 0) {
+                    ledgerService.releaseAmendDelta(order, surplus);
+                }
+                order.setHoldAmount(target);
+            }
+
+            @Override
+            public void onReplaceAborted(OmsOrder order) {
+                if (order.getPendingHoldDelta() > 0) {
+                    ledgerService.releaseAmendDelta(order, order.getPendingHoldDelta());
+                }
+            }
+        });
+    }
+
+    /** Create a limit buy and walk it to NEW on cluster leg {@code cid}. */
+    private OmsOrder restingBuy(long userId, double price, double qty, long cid) {
+        CreateOrderResponse resp = orderService.createOrder(createLimitBuyRequest(userId, 1, price, qty));
+        assertTrue(resp.isAccepted());
+        long omsId = resp.getOmsOrderId();
+        coreEngine.getLifecycleManager().onClusterOrderStatus(
+                omsId, cid, 0, FixedPoint.fromDouble(qty), 0);
+        return coreEngine.getLifecycleManager().getOrder(omsId);
+    }
+
+    @Test
+    void testAmendGrowLocksDeltaAtSubmitAndResolvesHoldTarget() {
+        wireReplaceHooks();
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(200_000.0));
+        OmsOrder order = restingBuy(1L, 50_000.0, 1.0, 900L);
+        assertEquals(FixedPoint.fromDouble(50_000.0), balanceStore.getLocked(1L, 0));
+
+        Map<String, Object> resp = orderService.updateOrder(
+                order.getOmsOrderId(), FixedPoint.fromDouble(60_000.0), 0);
+        assertEquals(Boolean.TRUE, resp.get("accepted"));
+        // The +10k delta is locked at submit (the amend's funds check).
+        assertEquals(FixedPoint.fromDouble(60_000.0), balanceStore.getLocked(1L, 0));
+        assertTrue(order.isReplacePending());
+
+        // The leg submitted to the engine carries the remaining quantity at the new price.
+        ArgumentCaptor<OrderSubmission> captor = ArgumentCaptor.forClass(OrderSubmission.class);
+        verify(clusterClient, atLeast(2)).submitOrder(captor.capture());
+        OrderSubmission update = captor.getAllValues().get(captor.getAllValues().size() - 1);
+        assertEquals(FixedPoint.fromDouble(60_000.0), update.getPrice());
+        assertEquals(FixedPoint.fromDouble(1.0), update.getQuantity());
+
+        // Resolution installs the target hold; nothing further moves in the ledger.
+        coreEngine.getLifecycleManager().onClusterOrderStatus(
+                order.getOmsOrderId(), 901L, 0, FixedPoint.fromDouble(1.0), 0);
+        assertEquals(FixedPoint.fromDouble(60_000.0), order.getHoldAmount());
+        assertEquals(FixedPoint.fromDouble(60_000.0), balanceStore.getLocked(1L, 0));
+        assertEquals(FixedPoint.fromDouble(60_000.0), order.getPrice());
+        assertFalse(order.isReplacePending());
+    }
+
+    @Test
+    void testAmendShrinkReleasesOnlyAtResolution() {
+        wireReplaceHooks();
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(100_000.0));
+        OmsOrder order = restingBuy(1L, 50_000.0, 1.0, 910L);
+
+        Map<String, Object> resp = orderService.updateOrder(
+                order.getOmsOrderId(), FixedPoint.fromDouble(40_000.0), 0);
+        assertEquals(Boolean.TRUE, resp.get("accepted"));
+        // Shrink: nothing released at submit — the amend may still fail.
+        assertEquals(FixedPoint.fromDouble(50_000.0), balanceStore.getLocked(1L, 0));
+
+        coreEngine.getLifecycleManager().onClusterOrderStatus(
+                order.getOmsOrderId(), 911L, 0, FixedPoint.fromDouble(1.0), 0);
+        // Resolution releases the 10k surplus.
+        assertEquals(FixedPoint.fromDouble(40_000.0), balanceStore.getLocked(1L, 0));
+        assertEquals(FixedPoint.fromDouble(40_000.0), order.getHoldAmount());
+    }
+
+    @Test
+    void testAmendInsufficientBalanceRejectedAndUnwound() {
+        wireReplaceHooks();
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(50_000.0)); // exactly the original hold
+        OmsOrder order = restingBuy(1L, 50_000.0, 1.0, 920L);
+        assertEquals(0L, balanceStore.getAvailable(1L, 0));
+
+        Map<String, Object> resp = orderService.updateOrder(
+                order.getOmsOrderId(), FixedPoint.fromDouble(60_000.0), 0);
+        assertEquals(Boolean.FALSE, resp.get("accepted"));
+        assertEquals("Insufficient balance for amend", resp.get("message"));
+        assertFalse(order.isReplacePending(), "marker rolled back");
+        assertEquals(FixedPoint.fromDouble(50_000.0), balanceStore.getLocked(1L, 0));
+        assertEquals(0L, balanceStore.getAvailable(1L, 0));
+        // Only the original create reached the cluster.
+        verify(clusterClient, times(1)).submitOrder(any());
+    }
+
+    @Test
+    void testAmendQueueFullRollsBackDeltaAndMarker() {
+        wireReplaceHooks();
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(200_000.0));
+        OmsOrder order = restingBuy(1L, 50_000.0, 1.0, 930L);
+
+        when(clusterClient.submitOrder(any(OrderSubmission.class))).thenReturn(false);
+        Map<String, Object> resp = orderService.updateOrder(
+                order.getOmsOrderId(), FixedPoint.fromDouble(60_000.0), 0);
+        assertEquals(Boolean.FALSE, resp.get("accepted"));
+        assertEquals("Order queue full", resp.get("message"));
+        assertFalse(order.isReplacePending());
+        // The +10k delta locked before the enqueue is released again.
+        assertEquals(FixedPoint.fromDouble(50_000.0), balanceStore.getLocked(1L, 0));
+        assertEquals(FixedPoint.fromDouble(150_000.0), balanceStore.getAvailable(1L, 0));
+    }
+
+    @Test
+    void testAmendBelowFilledQuantityRejected() {
+        wireReplaceHooks();
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(100_000.0));
+        OmsOrder order = restingBuy(1L, 50_000.0, 1.0, 940L);
+        order.setFilledQty(FixedPoint.fromDouble(0.6));
+
+        Map<String, Object> resp = orderService.updateOrder(
+                order.getOmsOrderId(), 0, FixedPoint.fromDouble(0.5));
+        assertEquals(Boolean.FALSE, resp.get("accepted"));
+        assertFalse(order.isReplacePending());
+    }
+
+    @Test
+    void testAmendPartiallyFilledSubmitsRemainingLeg() {
+        wireReplaceHooks();
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(200_000.0));
+        OmsOrder order = restingBuy(1L, 50_000.0, 1.0, 950L);
+        order.setFilledQty(FixedPoint.fromDouble(0.4));
+
+        Map<String, Object> resp = orderService.updateOrder(
+                order.getOmsOrderId(), FixedPoint.fromDouble(55_000.0), 0);
+        assertEquals(Boolean.TRUE, resp.get("accepted"));
+
+        ArgumentCaptor<OrderSubmission> captor = ArgumentCaptor.forClass(OrderSubmission.class);
+        verify(clusterClient, atLeast(2)).submitOrder(captor.capture());
+        OrderSubmission update = captor.getAllValues().get(captor.getAllValues().size() - 1);
+        // Only the unfilled 0.6 goes to the engine — the replacement leg rests its full
+        // submitted quantity, so prior fills must be subtracted here.
+        assertEquals(FixedPoint.fromDouble(0.6), update.getQuantity());
+    }
+
+    @Test
+    void testAmendNonLimitRejected() {
+        wireReplaceHooks();
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(100_000.0));
+        OmsOrder order = restingBuy(1L, 50_000.0, 1.0, 960L);
+        order.setOrderType(OmsOrderType.ICEBERG);
+
+        Map<String, Object> resp = orderService.updateOrder(
+                order.getOmsOrderId(), FixedPoint.fromDouble(55_000.0), 0);
+        assertEquals(Boolean.FALSE, resp.get("accepted"));
+        assertFalse(order.isReplacePending());
     }
 }

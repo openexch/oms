@@ -429,6 +429,31 @@ public class OmsApplication {
         GrpcOrderService grpcOrderSvc = new GrpcOrderService(orderService, authorizer, auditLog);
         GrpcAccountService grpcAccountSvc = new GrpcAccountService(orderService, authorizer);
 
+        // 13b. Cancel-and-replace ledger hooks (oms#67): resolution installs the amended
+        // hold target (releasing any surplus); abort rolls back the incremental hold
+        // placed at amend submit. Keeps the lifecycle manager ledger-agnostic.
+        lifecycleManager.setReplaceHooks(new OrderLifecycleManager.ReplaceHooks() {
+            @Override
+            public void onReplaceResolved(com.openexchange.oms.common.domain.OmsOrder order) {
+                long target = order.getPendingHoldTarget();
+                long heldSoFar = order.getHoldAmount() + order.getPendingHoldDelta();
+                long surplus = heldSoFar - target;
+                if (surplus > 0) {
+                    // Shrunk notional: the delta was deferred to resolution — release it now.
+                    ledgerService.releaseAmendDelta(order, surplus);
+                }
+                order.setHoldAmount(target);
+            }
+
+            @Override
+            public void onReplaceAborted(com.openexchange.oms.common.domain.OmsOrder order) {
+                long delta = order.getPendingHoldDelta();
+                if (delta > 0) {
+                    ledgerService.releaseAmendDelta(order, delta);
+                }
+            }
+        });
+
         // 14. Order state listener — pushes to WebSocket + gRPC, handles balance release
         lifecycleManager.setStateListener((order, oldStatus, newStatus) -> {
             com.openexchange.oms.api.dto.OrderResponse resp =

@@ -42,6 +42,10 @@ public class OmsCoreEngine {
     private static final long RECONCILE_RETRY_MS = 3_000;   // between retry rounds
     private static final int RECONCILE_MAX_ROUNDS = 10;     // bound — a re-cancel lost during leader
                                                             // stabilization is retried until it lands
+    // Replace-pending fallback (oms#67): an amend whose egress is entirely lost is aborted
+    // after this long and handed to membership repair. Comfortably above the engine
+    // round-trip, below anything a user would notice as a wedged order.
+    private static final long REPLACE_PENDING_TIMEOUT_MS = 10_000;
 
     public OmsCoreEngine(OrderLifecycleManager lifecycleManager, SyntheticOrderEngine syntheticEngine) {
         this.lifecycleManager = lifecycleManager;
@@ -211,6 +215,24 @@ public class OmsCoreEngine {
             }
         }
 
+        // Replace timeout fallback (oms#67): lost egress must not wedge an order in
+        // replace-pending forever. Abort the marker (releases the incremental hold; the
+        // order keeps its original values) and request an open-orders snapshot so
+        // membership repair trues up whichever leg actually survived on the cluster.
+        ArrayList<OmsOrder> timedOutReplaces = new ArrayList<>();
+        lifecycleManager.forEachActiveOrder(order -> {
+            if (order.isReplacePending()
+                    && nowMs - order.getReplaceRequestedAtMs() > REPLACE_PENDING_TIMEOUT_MS) {
+                timedOutReplaces.add(order);
+            }
+        });
+        for (OmsOrder order : timedOutReplaces) {
+            lifecycleManager.abortReplace(order, "replace timed out awaiting egress");
+        }
+        if (!timedOutReplaces.isEmpty()) {
+            requestOpenOrdersSnapshot(nowMs, "replace-pending timeout");
+        }
+
         // Collect expired GTD orders (cannot modify map during iteration)
         ArrayList<Long> expiredIds = new ArrayList<>();
         lifecycleManager.forEachActiveOrder(order -> {
@@ -350,6 +372,23 @@ public class OmsCoreEngine {
                 return; // synthetic parent: legitimately not on the cluster book
             }
             long cid = order.getClusterOrderId();
+            if (order.isReplacePending()) {
+                // Cancel-and-replace in flight (oms#67): the stored cid is the old (cancelled)
+                // leg — or 0 mid-swap — so the plain not-in-snapshot check would wrongly
+                // terminalize a healthy amend. The new leg carries the same omsOrderId, so
+                // consult the snapshot by omsOrderId: present under a different cid ⇒ the
+                // new-leg egress was lost, resolve; present under the stored cid ⇒ the amend
+                // has not applied yet, leave it to the replace timeout; absent ⇒ both legs
+                // gone, terminalize once clearly past the leg-swap window.
+                if (clusterOmsToClusterId.containsKey(order.getOmsOrderId())) {
+                    if (clusterOmsToClusterId.get(order.getOmsOrderId()) != cid) {
+                        toRelink.add(order);
+                    }
+                } else if (requestTimeMs - order.getReplaceRequestedAtMs() > ORPHAN_MIN_AGE_MS) {
+                    toTerminalize.add(order);
+                }
+                return;
+            }
             if (cid != 0) {
                 if (cid < snapshotMaxOrderId && !clusterOpenOrderIds.contains(cid)) {
                     toTerminalize.add(order);
@@ -367,14 +406,24 @@ public class OmsCoreEngine {
         });
         for (OmsOrder order : toRelink) {
             long clusterOrderId = clusterOmsToClusterId.get(order.getOmsOrderId());
-            log.warn("Membership repair: re-linking open order omsOrderId={} to clusterOrderId={} "
-                    + "(ack lost, order still open on cluster)", order.getOmsOrderId(), clusterOrderId);
-            lifecycleManager.onSentToCluster(order.getOmsOrderId(), clusterOrderId);
+            if (order.isReplacePending()) {
+                log.warn("Membership repair: resolving replace for omsOrderId={} to clusterOrderId={} "
+                        + "(new-leg egress lost)", order.getOmsOrderId(), clusterOrderId);
+                lifecycleManager.resolveReplaceFromReconcile(order.getOmsOrderId(), clusterOrderId);
+            } else {
+                log.warn("Membership repair: re-linking open order omsOrderId={} to clusterOrderId={} "
+                        + "(ack lost, order still open on cluster)", order.getOmsOrderId(), clusterOrderId);
+                lifecycleManager.onSentToCluster(order.getOmsOrderId(), clusterOrderId);
+            }
             if (persistenceHandler != null) {
                 persistenceHandler.persistOrderUpdate(order);
             }
         }
         for (OmsOrder order : toTerminalize) {
+            // A replace-pending order reaching this point has BOTH legs missing from the
+            // snapshot: release the incremental hold and clear the marker first, or the
+            // pending guard in onClusterOrderStatus would swallow the repair (oms#67).
+            lifecycleManager.abortReplace(order, "membership repair: both replace legs gone");
             boolean fullyFilled = order.getFilledQty() >= order.getQuantity();
             log.warn("Membership repair: terminalizing lost order omsOrderId={} clusterOrderId={} "
                             + "filled={}/{} as {}",
