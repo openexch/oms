@@ -153,7 +153,16 @@
                 <version>${disruptor.version}</version>
             </dependency>
 
-            <!-- Netty -->
+            <!-- Netty. Import the BOM (not just netty-all) so TRANSITIVE netty artifacts are
+                 pinned too: lettuce-core drags in its own netty-handler, which sat at a
+                 CVE-affected 4.2.13 (CVE-2026-44249) while netty-all was already 4.2.15. -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>${netty.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>io.netty</groupId>
                 <artifactId>netty-all</artifactId>
