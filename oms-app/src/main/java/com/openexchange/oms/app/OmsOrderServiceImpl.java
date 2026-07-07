@@ -246,16 +246,23 @@ public class OmsOrderServiceImpl implements OrderService {
             // 7. Build and submit to cluster
             OrderSubmission submission = getOrderSubmission(orderType, side, order);
 
+            // Track the open-order slot BEFORE the enqueue so the open/close pair stays
+            // balanced whichever way submit goes (oms#85). On a queue-full reject the state
+            // listener fires riskEngine.onOrderClosed for the PENDING_NEW→REJECTED transition;
+            // with onOrderOpened still deferred to after a successful submit, that close had no
+            // matching open and would decrement one of the user's OTHER open-order slots.
+            riskEngine.onOrderOpened(order.getUserId());
+
             boolean enqueued = clusterClient.submitOrder(submission);
             if (!enqueued) {
-                // Queue full — release hold and reject
-                ledgerService.releaseForCancel(order);
-                lcm.onHoldFailed(order.getOmsOrderId(), "Order queue full");
+                // Queue full — terminalize the order the cluster never saw (oms#85). Do NOT
+                // release the hold or close the slot here: the state listener performs BOTH on
+                // the PENDING_NEW→REJECTED transition (and pushes the terminal to WS/gRPC).
+                // Releasing here too double-releases the hold, which can succeed against the
+                // user's OTHER locked funds — money creation. This is the double-release trap.
+                lcm.onSubmitFailed(order.getOmsOrderId(), "Order queue full");
                 return CreateOrderResponse.rejected("Order queue full");
             }
-
-            // 8. Track open order count
-            riskEngine.onOrderOpened(order.getUserId());
 
             return CreateOrderResponse.accepted(order.getOmsOrderId(), order.getStatus().name());
 
