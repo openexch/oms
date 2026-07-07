@@ -76,6 +76,22 @@ public interface BalanceStore {
                 long baseAmount, long quoteAmount, long tradeId);
 
     /**
+     * Returns the number of over-settle events observed by this store since creation.
+     * <p>
+     * An over-settle is a {@link #settle} in which a locked balance held less than the
+     * trade required, forcing a floor-guarded clamp (see oms#84). Each such settlement
+     * is counted once regardless of how many legs were affected. A nonzero and rising
+     * value signals an upstream accounting-invariant break (e.g. an amend that grew
+     * notional without an incremental hold) and is wired to the
+     * {@code oms_ledger_oversettle_total} metric.
+     *
+     * @return count of over-settle events since store creation
+     */
+    default long getOversettleCount() {
+        return 0;
+    }
+
+    /**
      * Deposits funds into a user's available balance.
      *
      * @param userId  user identifier
