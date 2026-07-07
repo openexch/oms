@@ -30,6 +30,11 @@ public class OmsOrder {
     private long trailingArmPrice;    // Fixed-point price extreme since placement
     private long displayQuantity;     // Fixed-point visible slice (iceberg)
     private long hiddenQuantity;      // Fixed-point hidden remaining (iceberg)
+    // Fixed-point unfilled remainder of the CURRENT resting slice (iceberg, oms#86).
+    // Armed at each slice submission, drained by the trade stream on either side of a
+    // fill; 0 triggers the next-slice refill. Volatile: armed on the submitting thread,
+    // drained on the core egress thread.
+    private volatile long sliceRemainingQty;
 
     // === Time-in-Force ===
     private TimeInForce timeInForce;
@@ -121,6 +126,8 @@ public class OmsOrder {
 
     public long getHiddenQuantity() { return hiddenQuantity; }
     public void setHiddenQuantity(long hiddenQuantity) { this.hiddenQuantity = hiddenQuantity; }
+    public long getSliceRemainingQty() { return sliceRemainingQty; }
+    public void setSliceRemainingQty(long sliceRemainingQty) { this.sliceRemainingQty = sliceRemainingQty; }
 
     public TimeInForce getTimeInForce() { return timeInForce; }
     public void setTimeInForce(TimeInForce timeInForce) { this.timeInForce = timeInForce; }

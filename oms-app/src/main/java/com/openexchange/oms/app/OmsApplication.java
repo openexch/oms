@@ -482,6 +482,18 @@ public class OmsApplication {
                 ledgerService.releaseForCancel(order);
                 riskEngine.onOrderClosed(order.getUserId());
             }
+            // Iceberg terminal cleanup (oms#86): drop the parent from the synthetic
+            // engine's refill tracking on ANY terminal (a cancel mid-iceberg used to
+            // leave the entry in icebergOrders forever), and on FILLED release the
+            // consumed-estimate residual, which is 0 when fills matched the estimate
+            // exactly (releaseForCancel is 0-safe) but real money if they did not.
+            if (order.getOrderType() == com.openexchange.oms.common.enums.OmsOrderType.ICEBERG
+                    && newStatus.isTerminal()) {
+                syntheticEngine.removeOrder(order);
+                if (newStatus == OmsOrderStatus.FILLED) {
+                    ledgerService.releaseForCancel(order);
+                }
+            }
         });
 
         // 14b. Slot-count rebaseline after every membership reconcile (oms#49):
