@@ -104,6 +104,85 @@ public class LedgerService {
     }
 
     /**
+     * Target total hold for an order amended to (newPrice, newQuantity) — oms#67.
+     * <p>
+     * Mirrors {@link #holdForOrder}'s model so {@link #releaseForCancel}'s
+     * consumed-estimate stays internally consistent after the amend: buy holds
+     * {@code newPrice * newQuantity} quote, sell holds {@code newQuantity} base.
+     *
+     * @return the target hold amount, or -1 when the buy notional overflows fixed-point
+     */
+    public long computeAmendHoldTarget(OmsOrder order, long newPrice, long newQuantity) {
+        if (order.isBuy()) {
+            try {
+                long target = FixedPoint.multiply(newPrice, newQuantity);
+                return target > 0 ? target : -1;
+            } catch (ArithmeticException e) {
+                return -1;
+            }
+        }
+        return newQuantity;
+    }
+
+    /**
+     * Places the incremental hold for an amend that GROWS the order's notional (oms#67).
+     * Runs at amend submit — this is the amend's funds check: an under-funded amend is
+     * rejected here before anything reaches the cluster.
+     *
+     * @return ledger entries, or empty list when the user lacks available funds
+     */
+    public List<LedgerEntry> holdAmendDelta(OmsOrder order, long delta) {
+        return moveAmendDelta(order, delta, true);
+    }
+
+    /**
+     * Releases the surplus hold for an amend that SHRANK the order's notional, or rolls
+     * back {@link #holdAmendDelta} when the amend fails (oms#67). Runs at resolution or
+     * abort — never at submit, where the amend could still fail.
+     */
+    public List<LedgerEntry> releaseAmendDelta(OmsOrder order, long amount) {
+        return moveAmendDelta(order, amount, false);
+    }
+
+    private List<LedgerEntry> moveAmendDelta(OmsOrder order, long amount, boolean hold) {
+        if (amount <= 0) {
+            return Collections.emptyList();
+        }
+        Market market = Market.fromId(order.getMarketId());
+        int holdAssetId = order.isBuy() ? market.quoteAsset().id() : market.baseAsset().id();
+
+        boolean success = hold
+                ? balanceStore.hold(order.getUserId(), holdAssetId, amount, order.getOmsOrderId())
+                : balanceStore.release(order.getUserId(), holdAssetId, amount, order.getOmsOrderId());
+        if (!success) {
+            log.warn("Amend hold {} failed: orderId={}, userId={}, assetId={}, amount={}",
+                    hold ? "increase" : "release", order.getOmsOrderId(), order.getUserId(),
+                    holdAssetId, amount);
+            return Collections.emptyList();
+        }
+
+        long now = System.currentTimeMillis();
+        long journalId = idGenerator.nextId();
+        LedgerEntryType type = hold ? LedgerEntryType.ORDER_HOLD : LedgerEntryType.ORDER_RELEASE;
+
+        List<LedgerEntry> entries = new ArrayList<>(2);
+        entries.add(new LedgerEntry(
+                idGenerator.nextId(), journalId,
+                order.getUserId(), holdAssetId, amount,
+                type, true,
+                order.getOmsOrderId(), now));
+        entries.add(new LedgerEntry(
+                idGenerator.nextId(), journalId,
+                order.getUserId(), holdAssetId, amount,
+                type, false,
+                order.getOmsOrderId(), now));
+
+        log.debug("Amend hold {}: orderId={}, assetId={}, amount={}",
+                hold ? "increase" : "release", order.getOmsOrderId(), holdAssetId, amount);
+        return entries;
+    }
+
+    /**
      * Releases remaining held funds when an order is cancelled.
      * <p>
      * The release amount is computed as the hold amount minus what was already filled.

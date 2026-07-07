@@ -59,6 +59,32 @@ public class OrderLifecycleManager {
     }
 
     /**
+     * Ledger-side effects of a cancel-and-replace (oms#67), wired by the application so the
+     * lifecycle stays ledger-agnostic. Called on the thread processing the resolving event.
+     */
+    public interface ReplaceHooks {
+        /**
+         * The replace resolved (new leg linked): apply the negative hold delta if any and
+         * install the pending hold target as the order's holdAmount. The pending* fields are
+         * still populated when this runs.
+         */
+        void onReplaceResolved(OmsOrder order);
+
+        /**
+         * The replace aborted (amend rejected, timed out, or the order went terminal first):
+         * release the incremental hold placed at submit ({@code getPendingHoldDelta()}), if any.
+         * The order's price/quantity/holdAmount are unchanged.
+         */
+        void onReplaceAborted(OmsOrder order);
+    }
+
+    private ReplaceHooks replaceHooks;
+
+    public void setReplaceHooks(ReplaceHooks replaceHooks) {
+        this.replaceHooks = replaceHooks;
+    }
+
+    /**
      * Register a new order entering the lifecycle.
      */
     public void registerOrder(OmsOrder order) {
@@ -167,6 +193,94 @@ public class OrderLifecycleManager {
     }
 
     /**
+     * Mark a cancel-and-replace as in flight (oms#67). Called by updateOrder BEFORE the
+     * update command is enqueued, so no egress for the replace can precede the marker.
+     * <p>
+     * {@code pendingQuantity} carries the amended TOTAL quantity (prior fills included);
+     * the leg submitted to the engine carries {@code pendingQuantity - filledQty}.
+     *
+     * @return false when the order is unknown, terminal, not yet on the cluster, or a
+     *         replace is already pending (one amend at a time).
+     */
+    public boolean onReplaceSubmitted(long omsOrderId, long newPrice, long newQuantity,
+                                      long holdDelta, long holdTarget) {
+        OmsOrder order = activeOrders.get(omsOrderId);
+        if (order == null || order.getStatus().isTerminal()
+                || order.getClusterOrderId() == 0 || order.isReplacePending()) {
+            return false;
+        }
+        order.setPendingPrice(newPrice);
+        order.setPendingQuantity(newQuantity);
+        order.setPendingHoldDelta(holdDelta);
+        order.setPendingHoldTarget(holdTarget);
+        order.setReplaceRequestedAtMs(System.currentTimeMillis());
+        // Set last: isReplacePending() keys off this field, so the others are visible first.
+        order.setReplacePendingOldClusterOrderId(order.getClusterOrderId());
+        return true;
+    }
+
+    /**
+     * Abort an in-flight replace (oms#67): amend rejected by the engine, submit failed,
+     * timed out, or the order went terminal first. Releases the incremental hold via the
+     * hooks and clears the marker; the order keeps its original price/quantity/holds.
+     */
+    public void abortReplace(OmsOrder order, String why) {
+        if (!order.isReplacePending()) {
+            return;
+        }
+        log.info("Replace aborted for omsOrderId={}: {}", order.getOmsOrderId(), why);
+        if (replaceHooks != null) {
+            replaceHooks.onReplaceAborted(order);
+        }
+        clearReplacePending(order);
+    }
+
+    /**
+     * Resolve an in-flight replace onto its new cluster leg (oms#67): re-index
+     * byClusterOrderId, apply the ledger resolution via the hooks, install the amended
+     * price/quantity, and clear the marker. Idempotent per resolution (marker cleared).
+     */
+    private void resolveReplace(OmsOrder order, long newClusterOrderId) {
+        long oldCid = order.getClusterOrderId();
+        if (oldCid != 0) {
+            byClusterOrderId.remove(oldCid, order);
+        }
+        order.setClusterOrderId(newClusterOrderId);
+        byClusterOrderId.put(newClusterOrderId, order);
+        if (replaceHooks != null) {
+            replaceHooks.onReplaceResolved(order);
+        }
+        order.setPrice(order.getPendingPrice());
+        order.setQuantity(order.getPendingQuantity());
+        order.setRemainingQty(Math.max(0, order.getQuantity() - order.getFilledQty()));
+        log.info("Replace resolved for omsOrderId={}: clusterOrderId {} -> {}, price={}, quantity={}",
+                order.getOmsOrderId(), order.getReplacePendingOldClusterOrderId(),
+                newClusterOrderId, order.getPrice(), order.getQuantity());
+        clearReplacePending(order);
+    }
+
+    /**
+     * Membership-repair entry point (oms#67): the open-orders snapshot proved the replace's
+     * new leg exists under {@code newClusterOrderId} but its NEW egress was lost.
+     */
+    public void resolveReplaceFromReconcile(long omsOrderId, long newClusterOrderId) {
+        OmsOrder order = activeOrders.get(omsOrderId);
+        if (order == null || !order.isReplacePending()) {
+            return;
+        }
+        resolveReplace(order, newClusterOrderId);
+    }
+
+    private void clearReplacePending(OmsOrder order) {
+        order.setReplacePendingOldClusterOrderId(0);
+        order.setPendingPrice(0);
+        order.setPendingQuantity(0);
+        order.setPendingHoldDelta(0);
+        order.setPendingHoldTarget(0);
+        order.setReplaceRequestedAtMs(0);
+    }
+
+    /**
      * Process OrderStatusUpdate from cluster egress.
      * Correlates via omsOrderId (primary) or clusterOrderId (fallback).
      */
@@ -181,6 +295,57 @@ public class OrderLifecycleManager {
             // already terminal/removed here. Debug (not warn) to avoid log noise.
             log.debug("Unknown order in status update: omsOrderId={}, clusterOrderId={}", omsOrderId, clusterOrderId);
             return null;
+        }
+
+        // Cancel-and-replace window (oms#67). The engine emits, for one amend:
+        //   CANCELLED(oldCid) + first-status(newCid)          — amend proceeded
+        //   REJECTED(oldCid)                                  — amend refused, old leg intact
+        //   CANCELLED(oldCid) + REJECTED/CANCELLED(newCid)    — cancelled but the new leg couldn't rest
+        // The two events arrive in either order (egress is unsequenced, match#19), so route by
+        // WHICH LEG the event names rather than by arrival order.
+        if (order.isReplacePending() && clusterOrderId != 0) {
+            long oldLegCid = order.getReplacePendingOldClusterOrderId();
+            if (clusterOrderId == oldLegCid) {
+                if (status == 3) {
+                    // Old leg cancelled by the replace: bookkeeping only. No transition, no
+                    // removal, holds untouched — the same omsOrderId lives on in the new leg.
+                    byClusterOrderId.remove(oldLegCid, order);
+                    if (order.getClusterOrderId() == oldLegCid) {
+                        order.setClusterOrderId(0);
+                    }
+                    log.debug("Replace old leg cancelled for omsOrderId={} (clusterOrderId={})",
+                            order.getOmsOrderId(), oldLegCid);
+                    return order;
+                }
+                if (status == 4) {
+                    // Engine refused the amend (bad price, cancel-miss): old leg intact, order
+                    // stays live with its original values.
+                    abortReplace(order, "engine rejected the amend");
+                    return order;
+                }
+                // NEW/PARTIALLY_FILLED/FILLED for the OLD leg while pending (e.g. a fill racing
+                // the cancel): abort the replace bookkeeping BEFORE normal processing so a
+                // terminal outcome cannot leak the incremental hold.
+                if (status == 2) {
+                    abortReplace(order, "old leg filled before the replace applied");
+                }
+            } else {
+                // Any status for a different cid while pending is the NEW leg: resolve first,
+                // then let normal processing handle the status itself (NEW rests; FILLED /
+                // CANCELLED / REJECTED are real new-leg outcomes, incl. could-not-rest).
+                resolveReplace(order, clusterOrderId);
+            }
+        }
+
+        // STALE-LEG GUARD (oms#67): a terminal status naming a cluster leg this order no longer
+        // occupies (a re-delivered old-leg echo after the replace resolved) must not terminalize
+        // the live order. Non-terminal stale echoes fall through harmlessly (monotonic guards).
+        if (clusterOrderId != 0 && order.getClusterOrderId() != 0
+                && clusterOrderId != order.getClusterOrderId()
+                && (status == 2 || status == 3 || status == 4)) {
+            log.debug("Ignoring stale-leg terminal status for omsOrderId={}: event cid={} current cid={} status={}",
+                    order.getOmsOrderId(), clusterOrderId, order.getClusterOrderId(), status);
+            return order;
         }
 
         // Store clusterOrderId on first status update from cluster

@@ -49,6 +49,19 @@ public class OmsOrder {
     private long holdId;              // Reference to ledger hold
     private long holdAmount;          // Total amount held
 
+    // === Cancel-and-replace (oms#67) ===
+    // While a PUT amend is in flight, one omsOrderId spans two cluster orders: the engine
+    // cancels the old leg and places a new one carrying the same omsOrderId. These fields
+    // mark that window so the old leg's CANCELLED does not terminalize the order and the
+    // new leg's first status re-links + applies the amended values. Volatile: set on a
+    // Netty thread (updateOrder), read/cleared on the core egress thread.
+    private volatile long replacePendingOldClusterOrderId; // != 0 ⇒ replace in flight
+    private volatile long pendingPrice;                    // amended limit price (parent-total semantics)
+    private volatile long pendingQuantity;                 // amended TOTAL quantity (incl. prior fills)
+    private volatile long pendingHoldDelta;                // incremental hold placed at submit (rollback amount)
+    private volatile long pendingHoldTarget;               // holdAmount to install at resolution
+    private volatile long replaceRequestedAtMs;            // timeout fallback anchor
+
     // === Timestamps ===
     private long createdAtMs;
     private long updatedAtMs;
@@ -126,6 +139,20 @@ public class OmsOrder {
 
     public long getHoldAmount() { return holdAmount; }
     public void setHoldAmount(long holdAmount) { this.holdAmount = holdAmount; }
+
+    public boolean isReplacePending() { return replacePendingOldClusterOrderId != 0; }
+    public long getReplacePendingOldClusterOrderId() { return replacePendingOldClusterOrderId; }
+    public void setReplacePendingOldClusterOrderId(long v) { this.replacePendingOldClusterOrderId = v; }
+    public long getPendingPrice() { return pendingPrice; }
+    public void setPendingPrice(long v) { this.pendingPrice = v; }
+    public long getPendingQuantity() { return pendingQuantity; }
+    public void setPendingQuantity(long v) { this.pendingQuantity = v; }
+    public long getPendingHoldDelta() { return pendingHoldDelta; }
+    public void setPendingHoldDelta(long v) { this.pendingHoldDelta = v; }
+    public long getPendingHoldTarget() { return pendingHoldTarget; }
+    public void setPendingHoldTarget(long v) { this.pendingHoldTarget = v; }
+    public long getReplaceRequestedAtMs() { return replaceRequestedAtMs; }
+    public void setReplaceRequestedAtMs(long v) { this.replaceRequestedAtMs = v; }
 
     public long getCreatedAtMs() { return createdAtMs; }
     public void setCreatedAtMs(long createdAtMs) { this.createdAtMs = createdAtMs; }

@@ -150,4 +150,59 @@ class OmsCoreEngineReconcileTest {
         assertEquals(OmsOrderStatus.FILLED, full.getStatus());
         assertEquals(OmsOrderStatus.NEW, open.getStatus());
     }
+
+    // ==================== Cancel-and-replace repair (oms#67) ====================
+
+    @Test
+    void replacePendingResolvedFromSnapshotWhenNewLegEgressLost() {
+        // Amend in flight: old leg cid=600 was cancelled on the cluster, NEW(601) egress lost.
+        // The snapshot maps omsOrderId -> 601: the reconcile must RESOLVE (re-link + apply
+        // pending values), never terminalize.
+        OmsOrder order = activeOrder(140, OmsOrderStatus.NEW, 600, OLD, 0);
+        assertTrue(lifecycle.onReplaceSubmitted(140, 120_00000000L, 10_00000000L, 0, 1_200L));
+
+        LongHashSet clusterOpen = new LongHashSet();
+        clusterOpen.add(601L);
+        Long2LongHashMap omsToCluster = new Long2LongHashMap(0L);
+        omsToCluster.put(140L, 601L);
+
+        assertEquals(0, reconcile(clusterOpen, omsToCluster));
+        assertEquals(OmsOrderStatus.NEW, order.getStatus());
+        assertEquals(601L, order.getClusterOrderId());
+        assertEquals(120_00000000L, order.getPrice());
+        assertFalse(order.isReplacePending());
+        assertSame(order, lifecycle.getByClusterOrderId(601L));
+        assertTrue(persisted.contains(order), "resolved re-link must be persisted");
+    }
+
+    @Test
+    void replacePendingStillOnOldLegIsLeftToTheTimeout() {
+        // The snapshot still shows the OLD leg open: the amend simply has not applied yet.
+        // Not a repair — the replace timeout owns the case where egress never comes.
+        OmsOrder order = activeOrder(141, OmsOrderStatus.NEW, 700, OLD, 0);
+        assertTrue(lifecycle.onReplaceSubmitted(141, 120_00000000L, 10_00000000L, 0, 1_200L));
+
+        LongHashSet clusterOpen = new LongHashSet();
+        clusterOpen.add(700L);
+        Long2LongHashMap omsToCluster = new Long2LongHashMap(0L);
+        omsToCluster.put(141L, 700L);
+
+        assertEquals(0, reconcile(clusterOpen, omsToCluster));
+        assertEquals(OmsOrderStatus.NEW, order.getStatus());
+        assertEquals(700L, order.getClusterOrderId());
+        assertTrue(order.isReplacePending(), "amend still in flight: marker stays");
+    }
+
+    @Test
+    void replacePendingWithBothLegsGoneIsTerminalizedPastTheWindow() {
+        OmsOrder order = activeOrder(142, OmsOrderStatus.NEW, 800, OLD, 0);
+        assertTrue(lifecycle.onReplaceSubmitted(142, 120_00000000L, 10_00000000L, 0, 1_200L));
+        // Simulate an old replace: requested well past the age gate.
+        order.setReplaceRequestedAtMs(OLD);
+
+        assertEquals(1, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
+        assertEquals(OmsOrderStatus.CANCELLED, order.getStatus());
+        assertFalse(order.isReplacePending(), "marker cleared before the terminal repair");
+        assertTrue(persisted.contains(order));
+    }
 }

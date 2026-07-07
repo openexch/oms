@@ -229,4 +229,185 @@ class OrderLifecycleManagerTest {
         order.setRemainingQty(100_000_000L);
         return order;
     }
+
+    // ==================== Cancel-and-replace (oms#67) ====================
+
+    private static class RecordingHooks implements OrderLifecycleManager.ReplaceHooks {
+        int resolved;
+        int aborted;
+        long lastAbortedDelta = -1;
+
+        @Override
+        public void onReplaceResolved(OmsOrder order) {
+            resolved++;
+            order.setHoldAmount(order.getPendingHoldTarget());
+        }
+
+        @Override
+        public void onReplaceAborted(OmsOrder order) {
+            aborted++;
+            lastAbortedDelta = order.getPendingHoldDelta();
+        }
+    }
+
+    /** Register an order and walk it to NEW on cluster leg {@code cid}. */
+    private OmsOrder restingOrder(long id, long cid) {
+        OmsOrder order = createOrder(id);
+        lcm.registerOrder(order);
+        lcm.onRiskPassed(id);
+        lcm.onHoldPlaced(id);
+        lcm.onClusterOrderStatus(id, cid, 0, order.getQuantity(), 0);
+        assertEquals(OmsOrderStatus.NEW, order.getStatus());
+        return order;
+    }
+
+    @Test
+    void testReplaceCancelledFirstThenNew() {
+        RecordingHooks hooks = new RecordingHooks();
+        lcm.setReplaceHooks(hooks);
+        OmsOrder order = restingOrder(10L, 500L);
+        order.setHoldAmount(100L);
+
+        assertTrue(lcm.onReplaceSubmitted(10L, 120_000_000L, 100_000_000L, 0, 120L));
+        // Engine ordering A: CANCELLED(old) first — must NOT terminalize.
+        lcm.onClusterOrderStatus(10L, 500L, 3, 0, 0);
+        assertEquals(OmsOrderStatus.NEW, order.getStatus());
+        assertNotNull(lcm.getOrder(10L));
+        assertEquals(0, order.getClusterOrderId());
+        assertNull(lcm.getByClusterOrderId(500L));
+        assertFalse(stateTransitions.contains(OmsOrderStatus.CANCELLED));
+
+        // NEW(new leg) resolves: re-linked, price/qty applied, hooks fired.
+        lcm.onClusterOrderStatus(10L, 501L, 0, 100_000_000L, 0);
+        assertEquals(OmsOrderStatus.NEW, order.getStatus());
+        assertEquals(501L, order.getClusterOrderId());
+        assertSame(order, lcm.getByClusterOrderId(501L));
+        assertEquals(120_000_000L, order.getPrice());
+        assertEquals(120L, order.getHoldAmount());
+        assertFalse(order.isReplacePending());
+        assertEquals(1, hooks.resolved);
+        assertEquals(0, hooks.aborted);
+    }
+
+    @Test
+    void testReplaceNewFirstThenStaleCancelledIgnored() {
+        RecordingHooks hooks = new RecordingHooks();
+        lcm.setReplaceHooks(hooks);
+        OmsOrder order = restingOrder(11L, 600L);
+
+        assertTrue(lcm.onReplaceSubmitted(11L, 90_000_000L, 100_000_000L, 0, 90L));
+        // Engine ordering B: the new leg's NEW arrives first.
+        lcm.onClusterOrderStatus(11L, 601L, 0, 100_000_000L, 0);
+        assertEquals(601L, order.getClusterOrderId());
+        assertEquals(90_000_000L, order.getPrice());
+        assertFalse(order.isReplacePending());
+        assertEquals(1, hooks.resolved);
+
+        // The old leg's CANCELLED lands afterwards: stale-leg guard must swallow it.
+        lcm.onClusterOrderStatus(11L, 600L, 3, 0, 0);
+        assertEquals(OmsOrderStatus.NEW, order.getStatus());
+        assertNotNull(lcm.getOrder(11L));
+        assertEquals(601L, order.getClusterOrderId());
+        assertFalse(stateTransitions.contains(OmsOrderStatus.CANCELLED));
+    }
+
+    @Test
+    void testSecondAmendRejectedWhilePending() {
+        lcm.setReplaceHooks(new RecordingHooks());
+        OmsOrder order = restingOrder(12L, 700L);
+        assertTrue(lcm.onReplaceSubmitted(12L, 110_000_000L, 100_000_000L, 0, 110L));
+        assertFalse(lcm.onReplaceSubmitted(12L, 115_000_000L, 100_000_000L, 0, 115L));
+        // First amend's values stay pending.
+        assertEquals(110_000_000L, order.getPendingPrice());
+    }
+
+    @Test
+    void testAmendRejectedByEngineOldLegIntact() {
+        RecordingHooks hooks = new RecordingHooks();
+        lcm.setReplaceHooks(hooks);
+        OmsOrder order = restingOrder(13L, 800L);
+        order.setHoldAmount(100L);
+
+        assertTrue(lcm.onReplaceSubmitted(13L, 130_000_000L, 100_000_000L, 0, 130L));
+        order.setPendingHoldDelta(30L); // as the service does after a successful delta hold
+
+        // Engine refuses the amend: REJECTED names the OLD leg, old order intact.
+        lcm.onClusterOrderStatus(13L, 800L, 4, 0, 0);
+        assertEquals(OmsOrderStatus.NEW, order.getStatus());
+        assertNotNull(lcm.getOrder(13L));
+        assertEquals(800L, order.getClusterOrderId());
+        assertEquals(100_000_000L, order.getPrice());
+        assertEquals(100L, order.getHoldAmount());
+        assertFalse(order.isReplacePending());
+        assertEquals(0, hooks.resolved);
+        assertEquals(1, hooks.aborted);
+        assertEquals(30L, hooks.lastAbortedDelta);
+        assertFalse(stateTransitions.contains(OmsOrderStatus.REJECTED));
+    }
+
+    @Test
+    void testNewLegCouldNotRestTerminalizes() {
+        RecordingHooks hooks = new RecordingHooks();
+        lcm.setReplaceHooks(hooks);
+        OmsOrder order = restingOrder(14L, 900L);
+
+        assertTrue(lcm.onReplaceSubmitted(14L, 140_000_000L, 100_000_000L, 0, 140L));
+        // Old leg cancelled...
+        lcm.onClusterOrderStatus(14L, 900L, 3, 0, 0);
+        assertNotNull(lcm.getOrder(14L));
+        // ...but the new leg could not rest: REJECTED names the NEW leg — a real outcome,
+        // resolve-then-terminalize (holds now sized to the amended order, released via listener).
+        lcm.onClusterOrderStatus(14L, 901L, 4, 0, 0);
+        assertEquals(OmsOrderStatus.REJECTED, order.getStatus());
+        assertNull(lcm.getOrder(14L));
+        assertEquals(1, hooks.resolved);
+    }
+
+    @Test
+    void testOldLegFilledWhilePendingAborts() {
+        RecordingHooks hooks = new RecordingHooks();
+        lcm.setReplaceHooks(hooks);
+        OmsOrder order = restingOrder(15L, 1000L);
+        order.setHoldAmount(100L);
+
+        assertTrue(lcm.onReplaceSubmitted(15L, 150_000_000L, 100_000_000L, 0, 150L));
+        order.setPendingHoldDelta(50L);
+
+        // A fill races the amend's cancel: the old leg goes FILLED. The replace must abort
+        // (releasing the delta) and the FILLED terminal proceed normally.
+        lcm.onClusterOrderStatus(15L, 1000L, 2, 0, order.getQuantity());
+        assertEquals(OmsOrderStatus.FILLED, order.getStatus());
+        assertNull(lcm.getOrder(15L));
+        assertEquals(100_000_000L, order.getPrice()); // amend never applied
+        assertEquals(1, hooks.aborted);
+        assertEquals(50L, hooks.lastAbortedDelta);
+        assertEquals(0, hooks.resolved);
+    }
+
+    @Test
+    void testNewLegInstantFillResolvesThenTerminalizes() {
+        RecordingHooks hooks = new RecordingHooks();
+        lcm.setReplaceHooks(hooks);
+        OmsOrder order = restingOrder(16L, 1100L);
+
+        assertTrue(lcm.onReplaceSubmitted(16L, 160_000_000L, 100_000_000L, 0, 160L));
+        lcm.onClusterOrderStatus(16L, 1100L, 3, 0, 0); // old leg cancelled
+        // New leg crossed and filled instantly: resolve first, then the FILLED terminal.
+        lcm.onClusterOrderStatus(16L, 1101L, 2, 0, 100_000_000L);
+        assertEquals(OmsOrderStatus.FILLED, order.getStatus());
+        assertEquals(100_000_000L, order.getFilledQty());
+        assertEquals(160_000_000L, order.getPrice());
+        assertEquals(1, hooks.resolved);
+        assertNull(lcm.getOrder(16L));
+    }
+
+    @Test
+    void testReplaceRequiresLiveClusterOrder() {
+        lcm.setReplaceHooks(new RecordingHooks());
+        OmsOrder order = createOrder(17L);
+        lcm.registerOrder(order);
+        // Not yet on the cluster (cid == 0) → no replace.
+        assertFalse(lcm.onReplaceSubmitted(17L, 120_000_000L, 100_000_000L, 0, 120L));
+        assertFalse(order.isReplacePending());
+    }
 }
