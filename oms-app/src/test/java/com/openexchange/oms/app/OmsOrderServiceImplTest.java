@@ -127,6 +127,129 @@ class OmsOrderServiceImplTest {
         verify(clusterClient, never()).submitOrder(any());
     }
 
+    // ---- market/synthetic buy hold estimation (oms#81) ----
+    //
+    // MARKET, STOP_LOSS and TRAILING_STOP orders carry price=0 (the "unset" convention)
+    // until an effective price is estimated from best ask. Before the oms#81 fix, that
+    // estimate ran AFTER the ledger hold was placed, so holdForOrder always computed
+    // holdAmount = FixedPoint.multiply(0, quantity) = 0, hit LedgerService's
+    // holdAmount<=0 guard, and rejected every BUY of these types as "Insufficient
+    // balance" regardless of funds. These tests exercise the previously-broken
+    // creation path end to end.
+
+    @Test
+    void testMarketBuyAcceptedWithSufficientFunds() {
+        // Plenty of USD; setUp() configures market 1's best ask at 50010.0.
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        CreateOrderRequest req = createMarketBuyRequest(1L, 1, 1.0);
+        CreateOrderResponse resp = orderService.createOrder(req);
+
+        assertTrue(resp.isAccepted(),
+                "market buy on a funded account must be accepted: " + resp.getRejectReason());
+        verify(clusterClient).submitOrder(any(OrderSubmission.class));
+
+        // The hold must be sized off the best-ask-derived estimate (bestAsk * 1.05
+        // slippage collar), not zero.
+        long expectedEstimatedPrice = (long) (FixedPoint.fromDouble(50010.0) * 1.05);
+        long expectedHold = FixedPoint.multiply(expectedEstimatedPrice, FixedPoint.fromDouble(1.0));
+
+        assertTrue(expectedHold > 0);
+        assertEquals(expectedHold, balanceStore.getLocked(1L, 0));
+        assertEquals(FixedPoint.fromDouble(1000000.0) - expectedHold, balanceStore.getAvailable(1L, 0));
+    }
+
+    @Test
+    void testMarketBuyRejectedWhenNoBestAsk() {
+        // Market 2 has no best ask configured in setUp() — the estimate is unavailable.
+        // Must still reject (never hold 0 and pass), and must not touch the balance.
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        CreateOrderRequest req = createMarketBuyRequest(1L, 2, 1.0);
+        CreateOrderResponse resp = orderService.createOrder(req);
+
+        assertFalse(resp.isAccepted());
+        verify(clusterClient, never()).submitOrder(any());
+        assertEquals(0L, balanceStore.getLocked(1L, 0));
+        assertEquals(FixedPoint.fromDouble(1000000.0), balanceStore.getAvailable(1L, 0));
+    }
+
+    @Test
+    void testStopLossBuyAcceptedWithSufficientFunds() {
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        CreateOrderRequest req = createStopTriggerBuyRequest(1L, 1, "STOP_LOSS", 1.0, 51000.0);
+        CreateOrderResponse resp = orderService.createOrder(req);
+
+        assertTrue(resp.isAccepted(),
+                "stop-loss buy on a funded account must be accepted: " + resp.getRejectReason());
+        // Synthetic orders are held pending trigger, never sent straight to the cluster.
+        verify(clusterClient, never()).submitOrder(any());
+
+        assertTrue(balanceStore.getLocked(1L, 0) > 0, "stop-loss buy must place a non-zero hold");
+
+        com.openexchange.oms.common.domain.OmsOrder order =
+                coreEngine.getLifecycleManager().getOrder(resp.getOmsOrderId());
+        assertNotNull(order);
+        assertEquals("PENDING_TRIGGER", order.getStatus().name());
+    }
+
+    @Test
+    void testTrailingStopBuyAcceptedWithSufficientFunds() {
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        CreateOrderRequest req = new CreateOrderRequest();
+        req.setUserId(1L);
+        req.setMarketId(1);
+        req.setSide("BUY");
+        req.setOrderType("TRAILING_STOP");
+        req.setQuantity(FixedPoint.fromDouble(1.0));
+        req.setTrailingDelta(FixedPoint.fromDouble(500.0));
+
+        CreateOrderResponse resp = orderService.createOrder(req);
+
+        assertTrue(resp.isAccepted(),
+                "trailing-stop buy on a funded account must be accepted: " + resp.getRejectReason());
+        verify(clusterClient, never()).submitOrder(any());
+        assertTrue(balanceStore.getLocked(1L, 0) > 0, "trailing-stop buy must place a non-zero hold");
+    }
+
+    @Test
+    void testStopLimitBuyUsesSuppliedPriceNotEstimate() {
+        // STOP_LIMIT always carries a real user-supplied price — it must NOT be
+        // overwritten by the best-ask estimate, and the hold must be sized off it.
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        CreateOrderRequest req = createStopTriggerBuyRequest(1L, 1, "STOP_LIMIT", 1.0, 50900.0);
+        req.setPrice(FixedPoint.fromDouble(51500.0));
+
+        CreateOrderResponse resp = orderService.createOrder(req);
+
+        assertTrue(resp.isAccepted(), "stop-limit buy must be accepted: " + resp.getRejectReason());
+
+        long expectedHold = FixedPoint.multiply(FixedPoint.fromDouble(51500.0), FixedPoint.fromDouble(1.0));
+        assertEquals(expectedHold, balanceStore.getLocked(1L, 0));
+    }
+
+    @Test
+    void testMarketSellUnaffectedHoldsBaseAssetByQuantity() {
+        // SELL orders hold base asset by quantity regardless of price; the oms#81
+        // fix only touches the BUY path and must not change this.
+        balanceStore.deposit(1L, 1, FixedPoint.fromDouble(5.0)); // BTC
+
+        CreateOrderRequest req = new CreateOrderRequest();
+        req.setUserId(1L);
+        req.setMarketId(1);
+        req.setSide("SELL");
+        req.setOrderType("MARKET");
+        req.setQuantity(FixedPoint.fromDouble(2.0));
+
+        CreateOrderResponse resp = orderService.createOrder(req);
+
+        assertTrue(resp.isAccepted(), "market sell must be accepted: " + resp.getRejectReason());
+        assertEquals(FixedPoint.fromDouble(2.0), balanceStore.getLocked(1L, 1));
+    }
+
     @Test
     void testCancelOrder() {
         balanceStore.deposit(1L, 0, FixedPoint.fromDouble(100000.0));
@@ -306,6 +429,31 @@ class OmsOrderServiceImplTest {
         // DTOs carry fixed-point longs now (oms#39)
         req.setPrice(com.match.domain.FixedPoint.fromDouble(price));
         req.setQuantity(com.match.domain.FixedPoint.fromDouble(qty));
+        return req;
+    }
+
+    // price is left at 0 (unset) — the wire convention for MARKET orders (oms#81)
+    private CreateOrderRequest createMarketBuyRequest(long userId, int marketId, double qty) {
+        CreateOrderRequest req = new CreateOrderRequest();
+        req.setUserId(userId);
+        req.setMarketId(marketId);
+        req.setSide("BUY");
+        req.setOrderType("MARKET");
+        req.setQuantity(com.match.domain.FixedPoint.fromDouble(qty));
+        return req;
+    }
+
+    // price is left at 0 (unset); callers that need a real post-trigger limit
+    // price (STOP_LIMIT) set it explicitly afterwards.
+    private CreateOrderRequest createStopTriggerBuyRequest(long userId, int marketId, String orderType,
+                                                            double qty, double stopPrice) {
+        CreateOrderRequest req = new CreateOrderRequest();
+        req.setUserId(userId);
+        req.setMarketId(marketId);
+        req.setSide("BUY");
+        req.setOrderType(orderType);
+        req.setQuantity(com.match.domain.FixedPoint.fromDouble(qty));
+        req.setStopPrice(com.match.domain.FixedPoint.fromDouble(stopPrice));
         return req;
     }
 }
