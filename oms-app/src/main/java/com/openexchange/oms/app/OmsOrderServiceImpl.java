@@ -140,6 +140,16 @@ public class OmsOrderServiceImpl implements OrderService {
 
             if (orderType == OmsOrderType.ICEBERG) {
                 order.setHiddenQuantity(order.getQuantity());
+                // Normalize displayQuantity ONCE at creation so every later slice
+                // computation (the first slice below, and every refill slice in
+                // SyntheticOrderEngine.onIcebergSliceFilled) reads one consistent
+                // value (oms#82). Missing/zero or a value >= the total quantity
+                // both mean "fully displayed" — a single slice for the whole
+                // order, i.e. iceberg degenerates to a plain limit order.
+                long requestedDisplay = order.getDisplayQuantity();
+                order.setDisplayQuantity(requestedDisplay > 0
+                        ? Math.min(requestedDisplay, order.getQuantity())
+                        : order.getQuantity());
             }
 
             // 1. Register with lifecycle manager → PENDING_RISK
@@ -198,7 +208,35 @@ public class OmsOrderServiceImpl implements OrderService {
             // 5. Hold placed → PENDING_NEW
             lcm.onHoldPlaced(order.getOmsOrderId());
 
-            // 6. Synthetic orders go to PENDING_TRIGGER
+            // 6. Synthetic orders go to PENDING_TRIGGER — EXCEPT icebergs.
+            //
+            // A stop/trailing order is dormant: it waits for a market-data trigger
+            // before anything touches the book, so PENDING_TRIGGER is correct. An
+            // ICEBERG has no trigger condition — it must start working its slices
+            // immediately. Routing it through PENDING_TRIGGER with no evaluator
+            // left it resting there forever with the full hold locked and nothing
+            // on the book (oms#82). Instead, register it for refill tracking and
+            // submit the FIRST display slice now, through the SAME path every
+            // refill uses (coreEngine.submitIcebergSlice → the submitIcebergSlice
+            // cluster handler). The order stays PENDING_NEW and advances to NEW on
+            // the cluster ack — the ordinary resting-order path, not PENDING_TRIGGER.
+            if (orderType == OmsOrderType.ICEBERG) {
+                // State is already set up for the refill cycle: hiddenQuantity =
+                // total (set at construction) and displayQuantity normalized to
+                // min(requested, total). onIcebergSliceFilled subtracts a full
+                // displayQuantity from hiddenQuantity on each fill, so the first
+                // slice must be exactly this size for the arithmetic to line up.
+                coreEngine.getSyntheticEngine().registerOrder(order);
+                long firstSlice = Math.min(order.getDisplayQuantity(), order.getQuantity());
+                // No re-hold: the full-quantity hold placed in step 4 covers every
+                // slice; submitIcebergSlice only enqueues to the cluster (exactly
+                // like a refill), it never touches the ledger. Double-holding here
+                // would lock the funds twice.
+                coreEngine.submitIcebergSlice(order, firstSlice);
+                riskEngine.onOrderOpened(order.getUserId());
+                return CreateOrderResponse.accepted(order.getOmsOrderId(), order.getStatus().name());
+            }
+
             if (orderType.isSynthetic()) {
                 lcm.onPendingTrigger(order.getOmsOrderId());
                 coreEngine.getSyntheticEngine().registerOrder(order);

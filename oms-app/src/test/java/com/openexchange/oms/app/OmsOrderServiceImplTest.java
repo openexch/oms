@@ -9,6 +9,8 @@ import com.openexchange.oms.cluster.ClusterClient;
 import com.openexchange.oms.cluster.OrderSubmission;
 import com.openexchange.oms.common.domain.Market;
 import com.openexchange.oms.common.domain.SnowflakeIdGenerator;
+import com.openexchange.oms.common.domain.OmsOrder;
+import com.openexchange.oms.common.enums.OmsOrderType;
 import com.openexchange.oms.core.OmsCoreEngine;
 import com.openexchange.oms.core.OrderLifecycleManager;
 import com.openexchange.oms.core.SyntheticOrderEngine;
@@ -18,6 +20,7 @@ import com.openexchange.oms.risk.RiskConfig;
 import com.openexchange.oms.risk.RiskEngine;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.Map;
 
@@ -71,6 +74,42 @@ class OmsOrderServiceImplTest {
 
         clusterClient = mock(ClusterClient.class);
         when(clusterClient.submitOrder(any(OrderSubmission.class))).thenReturn(true);
+
+        // Wire the cluster submit handler exactly as OmsApplication does, so
+        // synthetic/iceberg submissions flow coreEngine → handler → clusterClient
+        // (the iceberg first-slice + refill path under test, oms#82).
+        coreEngine.setClusterSubmitHandler(new OmsCoreEngine.ClusterSubmitHandler() {
+            @Override
+            public void submitTriggeredOrder(com.openexchange.oms.common.domain.OmsOrder parentOrder,
+                                             OmsOrderType childType, long childPrice) {
+                // not exercised here
+            }
+
+            @Override
+            public void submitIcebergSlice(com.openexchange.oms.common.domain.OmsOrder icebergOrder,
+                                           long sliceQuantity) {
+                long totalPrice = FixedPoint.multiply(icebergOrder.getPrice(), sliceQuantity);
+                com.match.infrastructure.generated.OrderSide sbeSide =
+                        icebergOrder.getSide() == com.openexchange.oms.common.enums.OrderSide.BUY
+                                ? com.match.infrastructure.generated.OrderSide.BID
+                                : com.match.infrastructure.generated.OrderSide.ASK;
+                clusterClient.submitOrder(OrderSubmission.createOrder(
+                        icebergOrder.getUserId(), icebergOrder.getMarketId(),
+                        icebergOrder.getPrice(), sliceQuantity, totalPrice,
+                        com.match.infrastructure.generated.OrderType.LIMIT,
+                        sbeSide, icebergOrder.getOmsOrderId()));
+            }
+
+            @Override
+            public void submitCancel(long clusterOrderId, long userId, int marketId) {
+                clusterClient.submitOrder(OrderSubmission.cancelOrder(userId, clusterOrderId, marketId));
+            }
+
+            @Override
+            public void submitOpenOrdersSnapshotRequest(long requestId) {
+                clusterClient.submitOrder(OrderSubmission.requestOpenOrdersSnapshot(requestId));
+            }
+        });
 
         OmsEgressAdapter egressAdapter = new OmsEgressAdapter(coreEngine, marketDataProvider);
 
@@ -248,6 +287,102 @@ class OmsOrderServiceImplTest {
 
         assertTrue(resp.isAccepted(), "market sell must be accepted: " + resp.getRejectReason());
         assertEquals(FixedPoint.fromDouble(2.0), balanceStore.getLocked(1L, 1));
+    }
+
+    // ---- iceberg first-slice submission (oms#82) ----
+    //
+    // An ICEBERG is synthetic but has no trigger condition: it must start
+    // working slices at creation. Before the fix it was routed to
+    // PENDING_TRIGGER with no evaluator, so the full hold locked and nothing
+    // ever hit the book — funds stuck until manual cancel. It must now submit
+    // its first display slice on creation, via the same handler refills use.
+
+    @Test
+    void testIcebergSubmitsFirstDisplaySliceOnCreation() {
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        // total 10, display 2 — the first slice must be 2, not 10.
+        CreateOrderRequest req = createIcebergBuyRequest(1L, 1, 50000.0, 10.0, 2.0);
+        CreateOrderResponse resp = orderService.createOrder(req);
+
+        assertTrue(resp.isAccepted(), "iceberg must be accepted: " + resp.getRejectReason());
+
+        // The first slice went to the cluster (this is the whole bug: nothing
+        // used to be submitted), carrying the DISPLAY quantity, not the total.
+        ArgumentCaptor<OrderSubmission> captor = ArgumentCaptor.forClass(OrderSubmission.class);
+        verify(clusterClient, times(1)).submitOrder(captor.capture());
+        OrderSubmission slice = captor.getValue();
+        assertEquals(OrderSubmission.Type.CREATE, slice.getType());
+        assertEquals(FixedPoint.fromDouble(2.0), slice.getQuantity(),
+                "first slice must carry the display quantity, not the total");
+        assertEquals(FixedPoint.fromDouble(50000.0), slice.getPrice());
+        assertEquals(resp.getOmsOrderId(), slice.getOmsOrderId());
+
+        // The order rests via the ordinary path (PENDING_NEW → NEW on ack), it
+        // is NOT parked in PENDING_TRIGGER with the book empty.
+        OmsOrder order = coreEngine.getLifecycleManager().getOrder(resp.getOmsOrderId());
+        assertNotNull(order);
+        assertNotEquals("PENDING_TRIGGER", order.getStatus().name());
+        assertEquals("PENDING_NEW", order.getStatus().name());
+
+        // Exactly ONE full-quantity hold: price * total. Submitting the slice
+        // must not re-hold (that would lock the funds twice).
+        long expectedHold = FixedPoint.multiply(FixedPoint.fromDouble(50000.0), FixedPoint.fromDouble(10.0));
+        assertEquals(expectedHold, balanceStore.getLocked(1L, 0),
+                "hold must be the full quantity once, never double-held per slice");
+    }
+
+    @Test
+    void testIcebergDisplayGreaterThanTotalIsSingleFullSlice() {
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        // display (20) >= total (5): fully displayed, a single slice = the whole order.
+        CreateOrderRequest req = createIcebergBuyRequest(1L, 1, 50000.0, 5.0, 20.0);
+        CreateOrderResponse resp = orderService.createOrder(req);
+
+        assertTrue(resp.isAccepted(), "iceberg must be accepted: " + resp.getRejectReason());
+        ArgumentCaptor<OrderSubmission> captor = ArgumentCaptor.forClass(OrderSubmission.class);
+        verify(clusterClient, times(1)).submitOrder(captor.capture());
+        assertEquals(FixedPoint.fromDouble(5.0), captor.getValue().getQuantity(),
+                "display >= total collapses to a single full-quantity slice");
+    }
+
+    @Test
+    void testIcebergMissingDisplayTreatedAsFullyDisplayed() {
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        // displayQuantity omitted (0) — treated as fully displayed: one slice = total.
+        CreateOrderRequest req = createIcebergBuyRequest(1L, 1, 50000.0, 4.0, 0.0);
+        CreateOrderResponse resp = orderService.createOrder(req);
+
+        assertTrue(resp.isAccepted(), "iceberg must be accepted: " + resp.getRejectReason());
+        ArgumentCaptor<OrderSubmission> captor = ArgumentCaptor.forClass(OrderSubmission.class);
+        verify(clusterClient, times(1)).submitOrder(captor.capture());
+        assertEquals(FixedPoint.fromDouble(4.0), captor.getValue().getQuantity(),
+                "missing display quantity is fully displayed: one slice = total");
+    }
+
+    @Test
+    void testIcebergRefillSubmitsNextSliceThroughSamePath() {
+        balanceStore.deposit(1L, 0, FixedPoint.fromDouble(1000000.0));
+
+        CreateOrderRequest req = createIcebergBuyRequest(1L, 1, 50000.0, 10.0, 2.0);
+        CreateOrderResponse resp = orderService.createOrder(req);
+        assertTrue(resp.isAccepted());
+
+        // Simulate the first display slice filling: the synthetic engine's
+        // refill callback is wired to the SAME coreEngine.submitIcebergSlice
+        // path the first slice used, so the second slice must go out too.
+        coreEngine.getSyntheticEngine().onIcebergSliceFilled(resp.getOmsOrderId());
+
+        ArgumentCaptor<OrderSubmission> captor = ArgumentCaptor.forClass(OrderSubmission.class);
+        // 1 first slice + 1 refill slice.
+        verify(clusterClient, times(2)).submitOrder(captor.capture());
+        OrderSubmission secondSlice = captor.getAllValues().get(1);
+        assertEquals(FixedPoint.fromDouble(2.0), secondSlice.getQuantity(),
+                "refill slice must carry the display quantity");
+        assertEquals(resp.getOmsOrderId(), secondSlice.getOmsOrderId(),
+                "refill reuses the parent omsOrderId for egress correlation");
     }
 
     @Test
@@ -440,6 +575,22 @@ class OmsOrderServiceImplTest {
         req.setSide("BUY");
         req.setOrderType("MARKET");
         req.setQuantity(com.match.domain.FixedPoint.fromDouble(qty));
+        return req;
+    }
+
+    private CreateOrderRequest createIcebergBuyRequest(long userId, int marketId, double price,
+                                                       double qty, double displayQty) {
+        CreateOrderRequest req = new CreateOrderRequest();
+        req.setUserId(userId);
+        req.setMarketId(marketId);
+        req.setSide("BUY");
+        req.setOrderType("ICEBERG");
+        req.setPrice(com.match.domain.FixedPoint.fromDouble(price));
+        req.setQuantity(com.match.domain.FixedPoint.fromDouble(qty));
+        // displayQty <= 0 leaves displayQuantity unset (the "fully displayed" convention).
+        if (displayQty > 0) {
+            req.setDisplayQuantity(com.match.domain.FixedPoint.fromDouble(displayQty));
+        }
         return req;
     }
 

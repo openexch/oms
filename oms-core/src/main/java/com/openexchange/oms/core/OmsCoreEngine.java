@@ -49,7 +49,9 @@ public class OmsCoreEngine {
 
         // Wire synthetic trigger callback to create child orders
         syntheticEngine.setTriggerCallback(this::onSyntheticTriggered);
-        syntheticEngine.setIcebergCallback(this::onIcebergSliceFilled);
+        // Refill slices go through the same public submitIcebergSlice(...) used for
+        // the FIRST slice at order creation (oms#82) — one path, not two.
+        syntheticEngine.setIcebergCallback(this::submitIcebergSlice);
     }
 
     public void setSettlementHandler(SettlementHandler handler) { this.settlementHandler = handler; }
@@ -175,10 +177,18 @@ public class OmsCoreEngine {
         }
     }
 
-    private void onIcebergSliceFilled(OmsOrder icebergOrder, long nextSliceQuantity) {
-        // Submit the next visible slice to the cluster
+    /**
+     * Submit an iceberg display slice to the cluster via the pluggable submit handler.
+     * This is the ONE path for every slice an iceberg ever puts on the book: the FIRST
+     * slice (called directly from order creation — oms#82: an iceberg used to sit in
+     * PENDING_TRIGGER forever because nothing ever called this) and every REFILL slice
+     * (called here as the synthetic engine's iceberg callback, wired in the constructor).
+     * Submitting both through the same method keeps egress correlation/lifecycle
+     * handling identical regardless of which slice it is.
+     */
+    public void submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {
         if (clusterSubmitHandler != null) {
-            clusterSubmitHandler.submitIcebergSlice(icebergOrder, nextSliceQuantity);
+            clusterSubmitHandler.submitIcebergSlice(icebergOrder, sliceQuantity);
         }
     }
 
