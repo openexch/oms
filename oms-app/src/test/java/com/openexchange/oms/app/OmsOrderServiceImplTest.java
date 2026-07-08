@@ -88,14 +88,14 @@ class OmsOrderServiceImplTest {
             }
 
             @Override
-            public void submitIcebergSlice(com.openexchange.oms.common.domain.OmsOrder icebergOrder,
+            public boolean submitIcebergSlice(com.openexchange.oms.common.domain.OmsOrder icebergOrder,
                                            long sliceQuantity) {
                 long totalPrice = FixedPoint.multiply(icebergOrder.getPrice(), sliceQuantity);
                 com.match.infrastructure.generated.OrderSide sbeSide =
                         icebergOrder.getSide() == com.openexchange.oms.common.enums.OrderSide.BUY
                                 ? com.match.infrastructure.generated.OrderSide.BID
                                 : com.match.infrastructure.generated.OrderSide.ASK;
-                clusterClient.submitOrder(OrderSubmission.createOrder(
+                return clusterClient.submitOrder(OrderSubmission.createOrder(
                         icebergOrder.getUserId(), icebergOrder.getMarketId(),
                         icebergOrder.getPrice(), sliceQuantity, totalPrice,
                         com.match.infrastructure.generated.OrderType.LIMIT,
@@ -709,24 +709,18 @@ class OmsOrderServiceImplTest {
 
     // ==================== PUT amend / cancel-and-replace (oms#67) ====================
 
-    /** Wire the replace ledger hooks exactly as OmsApplication does. */
+    /** Wire the replace ledger hooks exactly as OmsApplication does (delegating to the
+     *  production LedgerService resolution/abort, single source of truth). */
     private void wireReplaceHooks() {
         coreEngine.getLifecycleManager().setReplaceHooks(new OrderLifecycleManager.ReplaceHooks() {
             @Override
             public void onReplaceResolved(OmsOrder order) {
-                long target = order.getPendingHoldTarget();
-                long surplus = order.getHoldAmount() + order.getPendingHoldDelta() - target;
-                if (surplus > 0) {
-                    ledgerService.releaseAmendDelta(order, surplus);
-                }
-                order.setHoldAmount(target);
+                ledgerService.resolveAmendHold(order);
             }
 
             @Override
             public void onReplaceAborted(OmsOrder order) {
-                if (order.getPendingHoldDelta() > 0) {
-                    ledgerService.releaseAmendDelta(order, order.getPendingHoldDelta());
-                }
+                ledgerService.abortAmendHold(order);
             }
         });
     }

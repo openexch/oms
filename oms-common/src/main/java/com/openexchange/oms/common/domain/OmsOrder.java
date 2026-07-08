@@ -48,7 +48,10 @@ public class OmsOrder {
     // True once a cancel has been submitted to the cluster for this order. The post-reconnect
     // reconcile re-submits cancels for flagged-but-still-active orders whose cancel or terminal
     // egress was lost at a leader-switchover seam (oms#21) — without touching legitimately-resting orders.
-    private boolean cancelRequested;
+    // Volatile: set on a Netty I/O thread (cancelOrder → onCancelRequested) and read on the OMS
+    // core thread (the OMS-11 iceberg-refill guard, the reconnect reconcile), so the write must be
+    // visible across threads.
+    private volatile boolean cancelRequested;
 
     // === Ledger ===
     private long holdId;              // Reference to ledger hold

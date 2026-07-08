@@ -329,7 +329,7 @@ public class OmsApplication {
             }
 
             @Override
-            public void submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {
+            public boolean submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {
                 // Slice notional <= admitted parent notional, so this cannot throw
                 // for coherent slices; guarded all the same (exact since match#30).
                 long totalPrice;
@@ -339,7 +339,7 @@ public class OmsApplication {
                     log.error("Iceberg slice notional overflows fixed-point — not submitted: "
                             + "omsOrderId={}, price={}, sliceQty={}",
                             icebergOrder.getOmsOrderId(), icebergOrder.getPrice(), sliceQuantity);
-                    return;
+                    return false;
                 }
 
                 com.match.infrastructure.generated.OrderSide sbeSide =
@@ -352,7 +352,7 @@ public class OmsApplication {
                         icebergOrder.getPrice(), sliceQuantity, totalPrice,
                         com.match.infrastructure.generated.OrderType.LIMIT,
                         sbeSide, icebergOrder.getOmsOrderId());
-                clusterClient.submitOrder(submission);
+                return clusterClient.submitOrder(submission);
             }
 
             @Override
@@ -435,22 +435,14 @@ public class OmsApplication {
         lifecycleManager.setReplaceHooks(new OrderLifecycleManager.ReplaceHooks() {
             @Override
             public void onReplaceResolved(com.openexchange.oms.common.domain.OmsOrder order) {
-                long target = order.getPendingHoldTarget();
-                long heldSoFar = order.getHoldAmount() + order.getPendingHoldDelta();
-                long surplus = heldSoFar - target;
-                if (surplus > 0) {
-                    // Shrunk notional: the delta was deferred to resolution — release it now.
-                    ledgerService.releaseAmendDelta(order, surplus);
-                }
-                order.setHoldAmount(target);
+                // OMS-3: single source of truth — the ledger nets already-filled qty into the
+                // resolution (release surplus for a shrunk notional, install the amended holdAmount).
+                ledgerService.resolveAmendHold(order);
             }
 
             @Override
             public void onReplaceAborted(com.openexchange.oms.common.domain.OmsOrder order) {
-                long delta = order.getPendingHoldDelta();
-                if (delta > 0) {
-                    ledgerService.releaseAmendDelta(order, delta);
-                }
+                ledgerService.abortAmendHold(order);
             }
         });
 

@@ -212,14 +212,19 @@ public class OmsCoreEngine {
      * Submitting both through the same method keeps egress correlation/lifecycle
      * handling identical regardless of which slice it is.
      */
-    public void submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {
+    public boolean submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {
         // oms#86: arm the per-slice fill tracker. Slice completion is detected on the
         // TRADE stream (trackIcebergSlice), taker or maker side alike, by draining this
         // counter — the parent's cumulative status can never say "slice done".
         icebergOrder.setSliceRemainingQty(sliceQuantity);
         if (clusterSubmitHandler != null) {
-            clusterSubmitHandler.submitIcebergSlice(icebergOrder, sliceQuantity);
+            // OMS-8: propagate the enqueue result so the FIRST-slice caller (order creation)
+            // can roll back a queue-full submit like the normal create path, instead of leaving
+            // a PENDING_NEW iceberg with the full hold locked and nothing on the book. (The refill
+            // callback wiring discards this — a queue-full refill is a separate follow-up.)
+            return clusterSubmitHandler.submitIcebergSlice(icebergOrder, sliceQuantity);
         }
+        return true;
     }
 
     // ==================== GTD Expiry ====================
@@ -550,7 +555,8 @@ public class OmsCoreEngine {
 
     public interface ClusterSubmitHandler {
         void submitTriggeredOrder(OmsOrder parentOrder, OmsOrderType childType, long childPrice);
-        void submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity);
+        /** @return false when the cluster ingress queue was full (the slice was NOT enqueued). */
+        boolean submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity);
         void submitCancel(long clusterOrderId, long userId, int marketId);
         /** match#31: ask the cluster for an OpenOrdersSnapshot egress. */
         void submitOpenOrdersSnapshotRequest(long requestId);
