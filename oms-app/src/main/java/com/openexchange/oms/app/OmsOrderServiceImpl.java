@@ -228,12 +228,25 @@ public class OmsOrderServiceImpl implements OrderService {
                 // slice must be exactly this size for the arithmetic to line up.
                 coreEngine.getSyntheticEngine().registerOrder(order);
                 long firstSlice = Math.min(order.getDisplayQuantity(), order.getQuantity());
+                // Track the open-order slot BEFORE the enqueue so the open/close pair stays
+                // balanced on a queue-full reject (oms#85), same as the normal create path below.
+                riskEngine.onOrderOpened(order.getUserId());
                 // No re-hold: the full-quantity hold placed in step 4 covers every
                 // slice; submitIcebergSlice only enqueues to the cluster (exactly
                 // like a refill), it never touches the ledger. Double-holding here
                 // would lock the funds twice.
-                coreEngine.submitIcebergSlice(order, firstSlice);
-                riskEngine.onOrderOpened(order.getUserId());
+                // OMS-8: the first slice can hit a full cluster queue. Unlike a refill, we must
+                // NOT swallow that here — otherwise the iceberg is left PENDING_NEW with the full
+                // hold locked and nothing on the book, while the client is told "accepted". Roll
+                // back like the normal create path: drop synthetic tracking and terminalize via
+                // onSubmitFailed (the state listener releases the hold + the slot).
+                if (!coreEngine.submitIcebergSlice(order, firstSlice)) {
+                    // onSubmitFailed → PENDING_NEW→REJECTED fires the state listener, which both
+                    // releases the hold/slot AND drops the iceberg from the synthetic engine
+                    // (OmsApplication's terminal cleanup) — so no explicit removeOrder here.
+                    lcm.onSubmitFailed(order.getOmsOrderId(), "Order queue full");
+                    return CreateOrderResponse.rejected("Order queue full");
+                }
                 return CreateOrderResponse.accepted(order.getOmsOrderId(), order.getStatus().name());
             }
 
@@ -369,7 +382,11 @@ public class OmsOrderServiceImpl implements OrderService {
         if (holdTarget < 0) {
             return Map.of("accepted", false, "message", "Amended notional overflows");
         }
-        long holdDelta = holdTarget - order.getHoldAmount();
+        // OMS-3: the hold moved on the ACTUAL balance must net already-filled quantity (settled
+        // units are no longer held), so it is sized off the remaining qty, not the full qty. The
+        // holdTarget above stays the full notional — it becomes holdAmount at resolution so
+        // releaseForCancel's − price·filledQty nets correctly.
+        long holdDelta = ledgerService.amendLockedDelta(order, price, quantity);
 
         // Claim the replace marker BEFORE moving funds: it is the one-amend-at-a-time
         // gate, and no egress for this replace can exist until submitOrder below.

@@ -56,6 +56,16 @@ public class SyntheticOrderEngine {
     private final long[] bestBid = new long[6]; // indexed by marketId (1-5)
     private final long[] bestAsk = new long[6];
 
+    // SYN-1 (oms#70 bug class): despite the "single-writer core thread" intent, register/removeOrder
+    // run on Netty I/O threads (createOrder/cancelOrder) while evaluate*/onIcebergSliceFilled run on
+    // the OMS core thread. The maps above are NOT thread-safe (Agrona + TreeMap), and concurrent
+    // structural modification of an Agrona map corrupts its probe chain into an infinite loop (the
+    // twice-seen total REST outage that moved OrderLifecycleManager to ConcurrentHashMap). ALL map
+    // access is therefore serialized on this lock. The trigger/iceberg CALLBACKS are invoked OUTSIDE
+    // the lock — they submit to the cluster (can block on backpressure) and could re-enter — so the
+    // evaluate/refill paths collect the affected orders under the lock, release it, then call out.
+    private final Object lock = new Object();
+
     public void setTriggerCallback(TriggerCallback callback) {
         this.triggerCallback = callback;
     }
@@ -69,19 +79,21 @@ public class SyntheticOrderEngine {
      */
     public void registerOrder(OmsOrder order) {
         int marketId = order.getMarketId();
-        switch (order.getOrderType()) {
-            case STOP_LOSS:
-            case STOP_LIMIT:
-                registerStopOrder(order, marketId);
-                break;
-            case TRAILING_STOP:
-                registerTrailingOrder(order);
-                break;
-            case ICEBERG:
-                icebergOrders.put(order.getOmsOrderId(), order);
-                break;
-            default:
-                break;
+        synchronized (lock) {
+            switch (order.getOrderType()) {
+                case STOP_LOSS:
+                case STOP_LIMIT:
+                    registerStopOrder(order, marketId);
+                    break;
+                case TRAILING_STOP:
+                    registerTrailingOrder(order);
+                    break;
+                case ICEBERG:
+                    icebergOrders.put(order.getOmsOrderId(), order);
+                    break;
+                default:
+                    break;
+            }
         }
     }
 
@@ -114,18 +126,20 @@ public class SyntheticOrderEngine {
      */
     public void removeOrder(OmsOrder order) {
         long id = order.getOmsOrderId();
-        trailingOrders.remove(id);
-        icebergOrders.remove(id);
+        synchronized (lock) {
+            trailingOrders.remove(id);
+            icebergOrders.remove(id);
 
-        int marketId = order.getMarketId();
-        TreeMap<Long, List<OmsOrder>> stopMap = (order.getSide() == OrderSide.SELL)
-            ? sellStops.get(marketId) : buyStops.get(marketId);
-        if (stopMap != null) {
-            List<OmsOrder> ordersAtPrice = stopMap.get(order.getStopPrice());
-            if (ordersAtPrice != null) {
-                ordersAtPrice.removeIf(o -> o.getOmsOrderId() == id);
-                if (ordersAtPrice.isEmpty()) {
-                    stopMap.remove(order.getStopPrice());
+            int marketId = order.getMarketId();
+            TreeMap<Long, List<OmsOrder>> stopMap = (order.getSide() == OrderSide.SELL)
+                ? sellStops.get(marketId) : buyStops.get(marketId);
+            if (stopMap != null) {
+                List<OmsOrder> ordersAtPrice = stopMap.get(order.getStopPrice());
+                if (ordersAtPrice != null) {
+                    ordersAtPrice.removeIf(o -> o.getOmsOrderId() == id);
+                    if (ordersAtPrice.isEmpty()) {
+                        stopMap.remove(order.getStopPrice());
+                    }
                 }
             }
         }
@@ -136,9 +150,12 @@ public class SyntheticOrderEngine {
      * Evaluates all synthetic triggers for the given market.
      */
     public void onMarketDataUpdate(int marketId, long newBestBid, long newBestAsk) {
-        bestBid[marketId] = newBestBid;
-        bestAsk[marketId] = newBestAsk;
-
+        synchronized (lock) {
+            bestBid[marketId] = newBestBid;
+            bestAsk[marketId] = newBestAsk;
+        }
+        // evaluate* lock internally and fire callbacks after releasing — do NOT hold the lock
+        // across them here, or the callback (cluster submit) would run under the lock.
         evaluateStopOrders(marketId, newBestBid, newBestAsk);
         evaluateTrailingStops(marketId, newBestBid, newBestAsk);
     }
@@ -147,19 +164,35 @@ public class SyntheticOrderEngine {
      * Called when an iceberg slice is filled.
      */
     public void onIcebergSliceFilled(long omsOrderId) {
-        OmsOrder iceberg = icebergOrders.get(omsOrderId);
-        if (iceberg == null) return;
+        OmsOrder iceberg;
+        long nextSlice;
+        synchronized (lock) {
+            iceberg = icebergOrders.get(omsOrderId);
+            if (iceberg == null) return;
 
-        long hiddenRemaining = iceberg.getHiddenQuantity() - iceberg.getDisplayQuantity();
-        if (hiddenRemaining <= 0) {
-            // All slices filled
-            icebergOrders.remove(omsOrderId);
-            return;
+            // OMS-11 / OMS-6: never resubmit a slice for an iceberg the user has cancelled (or that
+            // has otherwise terminalized). A slice-fill event can race a user cancel; refilling here
+            // would resurrect an order the user asked to cancel AND re-link a fresh cluster order id,
+            // which then makes the pending CANCELLED egress look stale and get swallowed. Dropping the
+            // tracking here (cancelRequested is volatile) closes both windows: no new slice, and the
+            // CANCELLED for the still-current slice terminalizes normally.
+            if (iceberg.isCancelRequested() || iceberg.getStatus().isTerminal()) {
+                icebergOrders.remove(omsOrderId);
+                return;
+            }
+
+            long hiddenRemaining = iceberg.getHiddenQuantity() - iceberg.getDisplayQuantity();
+            if (hiddenRemaining <= 0) {
+                // All slices filled
+                icebergOrders.remove(omsOrderId);
+                return;
+            }
+
+            iceberg.setHiddenQuantity(hiddenRemaining);
+            nextSlice = Math.min(iceberg.getDisplayQuantity(), hiddenRemaining);
         }
 
-        iceberg.setHiddenQuantity(hiddenRemaining);
-        long nextSlice = Math.min(iceberg.getDisplayQuantity(), hiddenRemaining);
-
+        // Submit the next slice OUTSIDE the lock (it enqueues to the cluster).
         if (icebergCallback != null) {
             icebergCallback.onSliceFilled(iceberg, nextSlice);
         }
@@ -168,36 +201,32 @@ public class SyntheticOrderEngine {
     private void evaluateStopOrders(int marketId, long bid, long ask) {
         if (triggerCallback == null) return;
 
-        // Sell stops: trigger when bestBid <= stopPrice
-        TreeMap<Long, List<OmsOrder>> sells = sellStops.get(marketId);
-        if (sells != null && !sells.isEmpty() && bid > 0) {
-            // All entries where stopPrice >= bid should trigger
-            var triggered = sells.tailMap(bid, true);
-            List<OmsOrder> toTrigger = new ArrayList<>();
-            for (List<OmsOrder> orders : triggered.values()) {
-                toTrigger.addAll(orders);
+        // Collect + detach the triggered stops under the lock, then fire the trigger callbacks
+        // AFTER releasing it (the callback submits a child order to the cluster).
+        List<OmsOrder> toTrigger = new ArrayList<>();
+        synchronized (lock) {
+            // Sell stops: trigger when bestBid <= stopPrice (stopPrice >= bid)
+            TreeMap<Long, List<OmsOrder>> sells = sellStops.get(marketId);
+            if (sells != null && !sells.isEmpty() && bid > 0) {
+                var triggered = sells.tailMap(bid, true);
+                for (List<OmsOrder> orders : triggered.values()) {
+                    toTrigger.addAll(orders);
+                }
+                triggered.clear();
             }
-            triggered.clear();
-
-            for (OmsOrder order : toTrigger) {
-                triggerStopOrder(order);
+            // Buy stops: trigger when bestAsk >= stopPrice (stopPrice <= ask)
+            TreeMap<Long, List<OmsOrder>> buys = buyStops.get(marketId);
+            if (buys != null && !buys.isEmpty() && ask > 0) {
+                var triggered = buys.headMap(ask, true);
+                for (List<OmsOrder> orders : triggered.values()) {
+                    toTrigger.addAll(orders);
+                }
+                triggered.clear();
             }
         }
 
-        // Buy stops: trigger when bestAsk >= stopPrice
-        TreeMap<Long, List<OmsOrder>> buys = buyStops.get(marketId);
-        if (buys != null && !buys.isEmpty() && ask > 0) {
-            // All entries where stopPrice <= ask should trigger
-            var triggered = buys.headMap(ask, true);
-            List<OmsOrder> toTrigger = new ArrayList<>();
-            for (List<OmsOrder> orders : triggered.values()) {
-                toTrigger.addAll(orders);
-            }
-            triggered.clear();
-
-            for (OmsOrder order : toTrigger) {
-                triggerStopOrder(order);
-            }
+        for (OmsOrder order : toTrigger) {
+            triggerStopOrder(order);
         }
     }
 
@@ -224,63 +253,80 @@ public class SyntheticOrderEngine {
     private void evaluateTrailingStops(int marketId, long bid, long ask) {
         if (triggerCallback == null) return;
 
-        List<Long> triggeredIds = null;
+        // Update arm prices + detach the triggered orders under the lock; fire the trigger
+        // callbacks AFTER releasing it (the callback submits a child order to the cluster).
+        List<OmsOrder> toTrigger = null;
+        synchronized (lock) {
+            List<Long> triggeredIds = null;
+            Long2ObjectHashMap<OmsOrder>.ValueIterator iter = trailingOrders.values().iterator();
+            while (iter.hasNext()) {
+                OmsOrder order = iter.next();
+                if (order.getMarketId() != marketId) continue;
+                if (order.getStatus() != OmsOrderStatus.PENDING_TRIGGER) continue;
 
-        Long2ObjectHashMap<OmsOrder>.ValueIterator iter = trailingOrders.values().iterator();
-        while (iter.hasNext()) {
-            OmsOrder order = iter.next();
-            if (order.getMarketId() != marketId) continue;
-            if (order.getStatus() != OmsOrderStatus.PENDING_TRIGGER) continue;
+                long delta = order.getTrailingDelta();
 
-            long delta = order.getTrailingDelta();
-
-            if (order.getSide() == OrderSide.SELL) {
-                // Track highest bid, trigger when bid falls by delta from high
-                if (bid > order.getTrailingArmPrice()) {
-                    order.setTrailingArmPrice(bid);
-                } else if (order.getTrailingArmPrice() - bid >= delta) {
-                    if (triggeredIds == null) triggeredIds = new ArrayList<>();
-                    triggeredIds.add(order.getOmsOrderId());
+                if (order.getSide() == OrderSide.SELL) {
+                    // Track highest bid, trigger when bid falls by delta from high
+                    if (bid > order.getTrailingArmPrice()) {
+                        order.setTrailingArmPrice(bid);
+                    } else if (order.getTrailingArmPrice() - bid >= delta) {
+                        if (triggeredIds == null) triggeredIds = new ArrayList<>();
+                        triggeredIds.add(order.getOmsOrderId());
+                    }
+                } else {
+                    // Track lowest ask, trigger when ask rises by delta from low
+                    if (ask < order.getTrailingArmPrice() || order.getTrailingArmPrice() == 0) {
+                        order.setTrailingArmPrice(ask);
+                    } else if (ask - order.getTrailingArmPrice() >= delta) {
+                        if (triggeredIds == null) triggeredIds = new ArrayList<>();
+                        triggeredIds.add(order.getOmsOrderId());
+                    }
                 }
-            } else {
-                // Track lowest ask, trigger when ask rises by delta from low
-                if (ask < order.getTrailingArmPrice() || order.getTrailingArmPrice() == 0) {
-                    order.setTrailingArmPrice(ask);
-                } else if (ask - order.getTrailingArmPrice() >= delta) {
-                    if (triggeredIds == null) triggeredIds = new ArrayList<>();
-                    triggeredIds.add(order.getOmsOrderId());
+            }
+
+            if (triggeredIds != null) {
+                for (long id : triggeredIds) {
+                    OmsOrder order = trailingOrders.remove(id);
+                    if (order != null) {
+                        if (toTrigger == null) toTrigger = new ArrayList<>();
+                        toTrigger.add(order);
+                    }
                 }
             }
         }
 
-        if (triggeredIds != null) {
-            for (long id : triggeredIds) {
-                OmsOrder order = trailingOrders.remove(id);
-                if (order != null) {
-                    log.info("Trailing stop triggered: omsOrderId={}, armPrice={}, delta={}",
-                        order.getOmsOrderId(), order.getTrailingArmPrice(), order.getTrailingDelta());
-                    triggerCallback.onTrigger(order, OmsOrderType.MARKET, 0);
-                }
+        if (toTrigger != null) {
+            for (OmsOrder order : toTrigger) {
+                log.info("Trailing stop triggered: omsOrderId={}, armPrice={}, delta={}",
+                    order.getOmsOrderId(), order.getTrailingArmPrice(), order.getTrailingDelta());
+                triggerCallback.onTrigger(order, OmsOrderType.MARKET, 0);
             }
         }
     }
 
     public int getActiveStopCount() {
-        int count = 0;
-        for (TreeMap<Long, List<OmsOrder>> map : sellStops.values()) {
-            for (List<OmsOrder> list : map.values()) count += list.size();
+        synchronized (lock) {
+            int count = 0;
+            for (TreeMap<Long, List<OmsOrder>> map : sellStops.values()) {
+                for (List<OmsOrder> list : map.values()) count += list.size();
+            }
+            for (TreeMap<Long, List<OmsOrder>> map : buyStops.values()) {
+                for (List<OmsOrder> list : map.values()) count += list.size();
+            }
+            return count;
         }
-        for (TreeMap<Long, List<OmsOrder>> map : buyStops.values()) {
-            for (List<OmsOrder> list : map.values()) count += list.size();
-        }
-        return count;
     }
 
     public int getActiveTrailingCount() {
-        return trailingOrders.size();
+        synchronized (lock) {
+            return trailingOrders.size();
+        }
     }
 
     public int getActiveIcebergCount() {
-        return icebergOrders.size();
+        synchronized (lock) {
+            return icebergOrders.size();
+        }
     }
 }

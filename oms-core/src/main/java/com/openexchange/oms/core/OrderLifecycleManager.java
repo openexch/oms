@@ -235,17 +235,29 @@ public class OrderLifecycleManager {
     public boolean onReplaceSubmitted(long omsOrderId, long newPrice, long newQuantity,
                                       long holdDelta, long holdTarget) {
         OmsOrder order = activeOrders.get(omsOrderId);
-        if (order == null || order.getStatus().isTerminal()
-                || order.getClusterOrderId() == 0 || order.isReplacePending()) {
+        if (order == null) {
             return false;
         }
-        order.setPendingPrice(newPrice);
-        order.setPendingQuantity(newQuantity);
-        order.setPendingHoldDelta(holdDelta);
-        order.setPendingHoldTarget(holdTarget);
-        order.setReplaceRequestedAtMs(System.currentTimeMillis());
-        // Set last: isReplacePending() keys off this field, so the others are visible first.
-        order.setReplacePendingOldClusterOrderId(order.getClusterOrderId());
+        // OMS-1: the guard read (isReplacePending) and the marker write must be one atomic,
+        // single-winner transition per order. updateOrder runs on Netty I/O threads, so two
+        // concurrent amends on the SAME order could otherwise both observe no pending replace,
+        // both return true, and each place an incremental hold — permanently double-locking
+        // funds. Synchronizing the claim on the order object serializes competing amends so
+        // exactly one wins. The marker is still written LAST, so a lock-free egress reader that
+        // sees isReplacePending()==true also sees the pending fields (volatile-publish invariant).
+        synchronized (order) {
+            if (order.getStatus().isTerminal()
+                    || order.getClusterOrderId() == 0 || order.isReplacePending()) {
+                return false;
+            }
+            order.setPendingPrice(newPrice);
+            order.setPendingQuantity(newQuantity);
+            order.setPendingHoldDelta(holdDelta);
+            order.setPendingHoldTarget(holdTarget);
+            order.setReplaceRequestedAtMs(System.currentTimeMillis());
+            // Set last: isReplacePending() keys off this field, so the others are visible first.
+            order.setReplacePendingOldClusterOrderId(order.getClusterOrderId());
+        }
         return true;
     }
 
@@ -509,6 +521,12 @@ public class OrderLifecycleManager {
         order.setFilledQty(newFilled);
         order.setRemainingQty(Math.max(0, order.getQuantity() - newFilled));
         if (newFilled >= order.getQuantity()) {
+            // OMS-2: a trade that completes the order while a replace is in flight must abort the
+            // replace — releasing the incremental amend hold (pendingHoldDelta) via the hooks —
+            // before the order is terminalized and removed, or that hold is leaked. Mirrors the
+            // status==2 "old leg filled before the replace applied" path in onClusterOrderStatus.
+            // No-op when no replace is pending.
+            abortReplace(order, "order fully filled before the replace applied");
             transition(order, OmsOrderStatus.FILLED);
             removeOrder(omsOrderId);
         } else {

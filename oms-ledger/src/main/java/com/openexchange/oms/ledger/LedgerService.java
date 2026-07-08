@@ -183,6 +183,62 @@ public class LedgerService {
     }
 
     /**
+     * The signed change in ACTUALLY-locked funds needed to amend {@code order} (currently resting
+     * its remaining quantity at its current price) to {@code (newPrice, newQuantity)}. Positive =
+     * additional hold required (grown notional); negative = surplus to release (shrunk notional).
+     * <p>
+     * OMS-3: already-filled quantity is netted out — those units are settled and no longer held, so
+     * the delta is computed over the REMAINING (unfilled) quantity, not the full quantity. Sizing
+     * the delta off the full quantity (as the old {@code holdTarget − holdAmount} did) over-moves by
+     * {@code (newPrice − oldPrice)·filledQty}, which on a price-lowering amend later drives
+     * {@code releaseForCancel} to release more than remains locked (the all-or-nothing release then
+     * fails outright and strands the funds).
+     * <p>
+     * The order's own {@code holdAmount} stays the FULL notional (see {@link #computeAmendHoldTarget})
+     * so {@code releaseForCancel}'s {@code − price·filledQty} nets correctly after the amend.
+     */
+    public long amendLockedDelta(OmsOrder order, long newPrice, long newQuantity) {
+        long remaining = Math.max(0, order.getQuantity() - order.getFilledQty());
+        long newRemaining = Math.max(0, newQuantity - order.getFilledQty());
+        if (order.isBuy()) {
+            // Bounded by computeAmendHoldTarget's overflow guard upstream (newPrice·newQuantity was
+            // already validated representable), so these narrower products cannot overflow.
+            long current = FixedPoint.multiply(order.getPrice(), remaining);
+            long target = FixedPoint.multiply(newPrice, newRemaining);
+            return target - current;
+        }
+        // Sell holds base = remaining quantity; the price is irrelevant.
+        return newRemaining - remaining;
+    }
+
+    /**
+     * Applies the ledger side of a RESOLVED amend (oms#67 / OMS-3). A grown notional was already
+     * locked at submit (the amend's funds check); a shrunk notional releases its surplus now. Both
+     * net already-filled quantity via {@link #amendLockedDelta}. Then installs the amended notional
+     * as the order's {@code holdAmount} so {@code releaseForCancel} stays exact. Single source of
+     * truth: the lifecycle {@code ReplaceHooks} delegate here rather than re-deriving the math.
+     */
+    public void resolveAmendHold(OmsOrder order) {
+        long delta = amendLockedDelta(order, order.getPendingPrice(), order.getPendingQuantity());
+        if (delta < 0) {
+            releaseAmendDelta(order, -delta);
+        }
+        order.setHoldAmount(order.getPendingHoldTarget());
+    }
+
+    /**
+     * Rolls back the incremental hold placed at amend submit when the amend ABORTS (engine refused,
+     * queue full, order went terminal first). Releases exactly what {@code holdAmendDelta} locked
+     * (tracked in {@code pendingHoldDelta}); the order keeps its original price/quantity/holdAmount.
+     */
+    public void abortAmendHold(OmsOrder order) {
+        long delta = order.getPendingHoldDelta();
+        if (delta > 0) {
+            releaseAmendDelta(order, delta);
+        }
+    }
+
+    /**
      * Releases remaining held funds when an order is cancelled.
      * <p>
      * The release amount is computed as the hold amount minus what was already filled.

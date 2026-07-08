@@ -45,8 +45,9 @@ class OmsCoreEngineIcebergTest {
             public void submitTriggeredOrder(OmsOrder parentOrder, OmsOrderType childType, long childPrice) { }
 
             @Override
-            public void submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {
+            public boolean submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {
                 sliceSubmissions.add(new long[]{icebergOrder.getOmsOrderId(), sliceQuantity});
+                return true;
             }
 
             @Override
