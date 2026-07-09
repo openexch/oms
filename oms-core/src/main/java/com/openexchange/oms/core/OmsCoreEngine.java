@@ -422,7 +422,20 @@ public class OmsCoreEngine {
             }
             if (cid != 0) {
                 if (cid < snapshotMaxOrderId && !clusterOpenOrderIds.contains(cid)) {
-                    toTerminalize.add(order);
+                    // MONEY-A: a vanished order left the book via a FILL or a CANCEL. Terminalizing a
+                    // fully-filled order is always safe (→ FILLED releases no hold). But if it only
+                    // looks PARTIALLY filled, the missing quantity may be a fill the lossless
+                    // TradeExecution stream has not delivered yet — this repair is frequently
+                    // gap-triggered, so filledQty can be stale. Marking such an order CANCELLED here
+                    // releases a hold the cluster already consumed, and the late fill's settlement then
+                    // double-debits `locked`, leaving it permanently short of the user's open exposure.
+                    // Defer the release-bearing (not-fully-filled) case until fill activity has been
+                    // quiet for ORPHAN_MIN_AGE_MS: by then a real fill has arrived (→ FILLED, no
+                    // release) or the order was genuinely cancelled (→ CANCELLED, release is correct).
+                    boolean fullyFilled = order.getFilledQty() >= order.getQuantity();
+                    if (fullyFilled || requestTimeMs - order.getUpdatedAtMs() > ORPHAN_MIN_AGE_MS) {
+                        toTerminalize.add(order);
+                    }
                 }
             } else if ((st == OmsOrderStatus.PENDING_NEW || st == OmsOrderStatus.NEW
                     || st == OmsOrderStatus.PARTIALLY_FILLED)
