@@ -90,7 +90,8 @@ class Phase1IcebergGuardrailTest {
     private void makerFill(long omsOrderId, long qty) {
         engine.onTradeExecution(MARKET, nextTradeId++, /*takerOrderId*/ 1L, /*makerOrderId*/ 2L,
                 /*takerUserId*/ 200L, /*makerUserId*/ 100L, 100_00000000L, qty,
-                /*takerIsBuy*/ true, /*takerOmsOrderId*/ 0L, /*makerOmsOrderId*/ omsOrderId);
+                /*takerIsBuy*/ true, /*takerOmsOrderId*/ 0L, /*makerOmsOrderId*/ omsOrderId,
+                /*egressSeq*/ 0L);
     }
 
     @Test
