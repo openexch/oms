@@ -151,6 +151,41 @@ class OmsCoreEngineReconcileTest {
         assertEquals(OmsOrderStatus.NEW, open.getStatus());
     }
 
+    // ==================== MONEY-A: defer release-bearing terminalize while a fill may be in flight ====
+
+    @Test
+    void partiallyFilledVanishedWithRecentFillIsDeferredThenTerminalizedWhenQuiet() {
+        // MONEY-A: order 900 vanished from the cluster while a fill may still be in flight (recent
+        // fill activity — this repair is often gap-triggered, so filledQty can be stale). Marking it
+        // CANCELLED now would release a hold the cluster already consumed; the late fill's settlement
+        // then double-debits `locked`. It must be DEFERRED, not terminalized, while fills are recent.
+        OmsOrder o = activeOrder(150, OmsOrderStatus.PARTIALLY_FILLED, 900, OLD, 3_00000000L);
+        o.setUpdatedAtMs(FRESH); // fill activity 1s ago — inside ORPHAN_MIN_AGE
+
+        assertEquals(0, reconcile(new LongHashSet(), new Long2LongHashMap(0L)),
+                "recent fill activity: the release-bearing terminalize must be deferred");
+        assertEquals(OmsOrderStatus.PARTIALLY_FILLED, o.getStatus(),
+                "not terminalized while a late fill may still be settling");
+        assertFalse(persisted.contains(o), "nothing terminalized: nothing to persist");
+
+        // Once fill activity has been quiet past the gate, a genuinely-cancelled order terminalizes.
+        o.setUpdatedAtMs(OLD);
+        assertEquals(1, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
+        assertEquals(OmsOrderStatus.CANCELLED, o.getStatus());
+        assertTrue(persisted.contains(o));
+    }
+
+    @Test
+    void fullyFilledVanishedIsTerminalizedImmediatelyEvenWhenFillIsRecent() {
+        // A fully-filled vanished order releases no hold (→ FILLED), so it is always safe to
+        // terminalize now — the freshness gate applies only to the release-bearing (CANCELLED) case.
+        OmsOrder o = activeOrder(151, OmsOrderStatus.PARTIALLY_FILLED, 901, OLD, 10_00000000L);
+        o.setUpdatedAtMs(FRESH);
+
+        assertEquals(1, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
+        assertEquals(OmsOrderStatus.FILLED, o.getStatus());
+    }
+
     // ==================== Cancel-and-replace repair (oms#67) ====================
 
     @Test
