@@ -71,10 +71,13 @@ public class OmsCoreEngine {
      * @param rejectReason engine reject reason string (match#75), already mapped from the raw SBE
      *                     code by the transport adapter; null when the egress carried no reason.
      *                     The lifecycle manager applies it only on a genuine REJECTED terminal.
+     * @param egressSeq    Layer 2: order key threaded for future reorder handling; adapter tracks
+     *                     the reorder metric. Stored nowhere yet.
      */
     public void onClusterOrderStatus(int marketId, long clusterOrderId, long userId, int status,
                                       long price, long remainingQty, long filledQty,
-                                      boolean isBuy, long omsOrderId, String rejectReason) {
+                                      boolean isBuy, long omsOrderId, String rejectReason,
+                                      long egressSeq) {
         OmsOrder order = lifecycleManager.onClusterOrderStatus(omsOrderId, clusterOrderId, status,
             remainingQty, filledQty, rejectReason);
 
@@ -103,11 +106,15 @@ public class OmsCoreEngine {
     /**
      * Process TradeExecutionBatch entry from cluster egress.
      * Called on OMS Core Thread via Disruptor.
+     *
+     * @param egressSeq Layer 2: order key threaded for future reorder handling; adapter tracks
+     *                  the reorder metric. Stored nowhere yet.
      */
     public void onTradeExecution(int marketId, long tradeId, long takerOrderId, long makerOrderId,
                                   long takerUserId, long makerUserId, long tradePrice,
                                   long tradeQuantity, boolean takerIsBuy,
-                                  long takerOmsOrderId, long makerOmsOrderId) {
+                                  long takerOmsOrderId, long makerOmsOrderId,
+                                  long egressSeq) {
         // Settle the trade via ledger. settleTrade is idempotent on tradeId: the cluster re-delivers
         // egress to a client that reconnects across a leader switchover, so the same TradeExecution
         // can arrive more than once. `applied` is false for a duplicate.

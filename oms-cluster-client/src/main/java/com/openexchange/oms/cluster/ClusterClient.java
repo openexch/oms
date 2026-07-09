@@ -806,7 +806,8 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                         trade.quantity(),
                         takerIsBuy,
                         trade.takerOmsOrderId(),
-                        trade.makerOmsOrderId());
+                        trade.makerOmsOrderId(),
+                        normalizeEgressSeq(trade.egressSeq()));
             } catch (Exception e) {
                 log.error("EgressListener.onTradeExecution() threw exception for tradeId={}",
                         trade.tradeId(), e);
@@ -831,6 +832,17 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
     }
 
     /**
+     * Normalize the Layer 2 egressSeq order key (match#, schema v7+). A pre-v7 acting version makes
+     * the generated accessor return the SBE null (Long.MIN_VALUE); any negative is likewise treated
+     * as absent. Both collapse to 0 = "absent", the value downstream skips. Mirrors
+     * {@link #normalizeStatusSeq} / {@link #normalizeRejectReason}. Non-zero values keep their
+     * ORDER-KEY-only meaning: monotonic-in-log-order but sparse and non-unique — never a gap detector.
+     */
+    private static long normalizeEgressSeq(long raw) {
+        return raw < 0 ? 0L : raw;
+    }
+
+    /**
      * Decode an OrderStatusBatch and dispatch individual order status callbacks.
      */
     private void dispatchOrderStatusBatch(DirectBuffer buffer, int offset, EgressListener listener) {
@@ -851,7 +863,8 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                         isBuy,
                         order.omsOrderId(),
                         normalizeStatusSeq(order.statusSeq()),
-                        normalizeRejectReason(order.rejectReason()));
+                        normalizeRejectReason(order.rejectReason()),
+                        normalizeEgressSeq(order.egressSeq()));
             } catch (Exception e) {
                 log.error("EgressListener.onOrderStatusUpdate() threw exception for orderId={}",
                         order.orderId(), e);

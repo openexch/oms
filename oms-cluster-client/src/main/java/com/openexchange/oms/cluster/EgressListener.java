@@ -24,6 +24,12 @@ public interface EgressListener {
      * @param takerIsBuy     true if the taker side is BUY
      * @param takerOmsOrderId OMS-assigned order ID of the taker
      * @param makerOmsOrderId OMS-assigned order ID of the maker
+     * @param egressSeq      Layer 2 order key (match#, schema v7+): the Aeron cluster-log position
+     *                     of the ingress command that produced this event. Monotonic non-decreasing
+     *                     in log order, but SPARSE (gaps are normal) and NON-UNIQUE (all events of
+     *                     one command share one value; ties are normal). An ORDER KEY ONLY — never
+     *                     use it for dense gap detection (tradeId keeps that job). 0 when the stream
+     *                     predates schema v7 (SBE null normalized upstream).
      */
     void onTradeExecution(
             int marketId,
@@ -36,7 +42,8 @@ public interface EgressListener {
             long quantity,
             boolean takerIsBuy,
             long takerOmsOrderId,
-            long makerOmsOrderId);
+            long makerOmsOrderId,
+            long egressSeq);
 
     /**
      * Called for each individual order status update within an OrderStatusBatch.
@@ -56,6 +63,12 @@ public interface EgressListener {
      * @param rejectReasonRaw raw engine {@code OrderRejectReason} code (match#75, schema v6+):
      *                     0 = NONE (non-rejects), 1..N on rejects/terminals. -1 is the sentinel
      *                     for "no reason available": a pre-v6 stream or an explicit SBE null (255).
+     * @param egressSeq    Layer 2 order key (match#, schema v7+): the Aeron cluster-log position of
+     *                     the ingress command that produced this event. Monotonic non-decreasing in
+     *                     log order, but SPARSE (gaps are normal) and NON-UNIQUE (all events of one
+     *                     command share one value; ties are normal). An ORDER KEY ONLY — never use
+     *                     it for dense gap detection (statusSeq keeps that job). 0 when the stream
+     *                     predates schema v7 (SBE null normalized upstream).
      */
     void onOrderStatusUpdate(
             int marketId,
@@ -68,7 +81,8 @@ public interface EgressListener {
             boolean isBuy,
             long omsOrderId,
             long statusSeq,
-            int rejectReasonRaw);
+            int rejectReasonRaw,
+            long egressSeq);
 
     /**
      * Called for each OpenOrdersSnapshot chunk (match#31): the cluster's

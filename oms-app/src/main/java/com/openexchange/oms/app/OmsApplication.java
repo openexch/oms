@@ -418,6 +418,10 @@ public class OmsApplication {
                 .description("OrderStatus seq gaps detected on the egress wire").register(meterRegistry);
         FunctionCounter.builder("oms_egress_trade_gaps_total", egressAdapter, OmsEgressAdapter::getTradeGapCount)
                 .description("TradeExecution id gaps detected on the egress wire").register(meterRegistry);
+        FunctionCounter.builder("oms_egress_reorder_total", egressAdapter, OmsEgressAdapter::getEgressReorderCount)
+                .description("Layer 2: egress events arriving out of cluster-log order (order key only)").register(meterRegistry);
+        Gauge.builder("oms_egress_last_seq", egressAdapter, OmsEgressAdapter::getLastEgressSeq)
+                .description("Layer 2: highest egressSeq (cluster-log order key) seen on the egress wire").register(meterRegistry);
         FunctionCounter.builder("oms_reconcile_repaired_total", coreEngine, OmsCoreEngine::getTotalRepairedOrders)
                 .description("Orders terminalized by membership repair").register(meterRegistry);
         FunctionCounter.builder("oms_reconcile_relinked_total", coreEngine, OmsCoreEngine::getTotalRelinkedOrders)

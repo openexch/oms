@@ -34,6 +34,21 @@ public class OmsEgressAdapter implements EgressListener {
     private long lastResnapshotRequestMs;
     private static final long RESNAPSHOT_MIN_INTERVAL_MS = 5_000;
 
+    // ---- Layer 2 (match#): egressSeq reorder metric ----
+    // egressSeq is the Aeron cluster-log position of the ingress command that produced the event:
+    // monotonic non-decreasing in log order, but SPARSE (gaps are normal) and NON-UNIQUE (all
+    // events of one command share one value; ties are normal). It is an ORDER KEY ONLY — dense
+    // gap detection stays with statusSeq/tradeId above. The flush emits all trades before all
+    // statuses of a batch, so an event can arrive carrying a LOWER egressSeq than one already
+    // seen; counting those reorders tells us whether a reorder buffer would be warranted.
+    // Both counters mirror statusGapCount/tradeGapCount: plain long, mutated only on the single
+    // Aeron polling thread (no synchronization needed), read by the metrics scrape via the getters.
+
+    /** Highest egressSeq seen so far in arrival order (0 = none yet / stream is pre-v7). */
+    private long lastSeenEgressSeq;
+    /** Times a non-zero egressSeq arrived below lastSeenEgressSeq (a wire reorder) — for /metrics. */
+    private long reorderCount;
+
     /** Accumulates OpenOrdersSnapshot chunks for the active requestId. */
     private final LongHashSet snapshotOrderIds = new LongHashSet();
     /** omsOrderId → clusterOrderId of cluster-open orders, for orphan repair + re-linking (oms#53). */
@@ -60,10 +75,40 @@ public class OmsEgressAdapter implements EgressListener {
         return tradeGapCount;
     }
 
+    /** Layer 2: times a non-zero egressSeq arrived out of log order (a wire reorder) — for /metrics. */
+    public long getEgressReorderCount() {
+        return reorderCount;
+    }
+
+    /** Layer 2: highest egressSeq seen so far (0 = none / pre-v7 stream) — for /metrics. */
+    public long getLastEgressSeq() {
+        return lastSeenEgressSeq;
+    }
+
+    /**
+     * Layer 2 reorder metric. Called for every egress event (trade or status) on the single Aeron
+     * polling thread. A non-zero egressSeq below the highest seen is a reorder relative to log order
+     * (the flush emits trades before statuses); count it. A non-zero egressSeq at or above the high
+     * water mark advances it (equal = a tie, which is normal and does NOT count). Zero is absent
+     * (pre-v7 stream / SBE null, normalized upstream): skip entirely — no metric, no advance.
+     */
+    private void trackEgressSeq(long egressSeq) {
+        if (egressSeq == 0) {
+            return;
+        }
+        if (egressSeq < lastSeenEgressSeq) {
+            reorderCount++;
+        } else {
+            lastSeenEgressSeq = egressSeq;
+        }
+    }
+
     @Override
     public void onTradeExecution(int marketId, long tradeId, long takerOrderId, long makerOrderId,
                                   long takerUserId, long makerUserId, long price, long quantity,
-                                  boolean takerIsBuy, long takerOmsOrderId, long makerOmsOrderId) {
+                                  boolean takerIsBuy, long takerOmsOrderId, long makerOmsOrderId,
+                                  long egressSeq) {
+        trackEgressSeq(egressSeq); // Layer 2: order-key reorder metric (order-key only; not gap detection)
         marketDataProvider.updateLastTrade(marketId, price);
         // tradeIds are globally monotonic and gap-free from the engine: a gap on
         // the wire means TradeExecutions were shed. Fills cannot be conjured back,
@@ -79,14 +124,15 @@ public class OmsEgressAdapter implements EgressListener {
         }
         coreEngine.onTradeExecution(marketId, tradeId, takerOrderId, makerOrderId,
                 takerUserId, makerUserId, price, quantity, takerIsBuy,
-                takerOmsOrderId, makerOmsOrderId);
+                takerOmsOrderId, makerOmsOrderId, egressSeq);
     }
 
     @Override
     public void onOrderStatusUpdate(int marketId, long orderId, long userId, int status,
                                      long price, long remainingQty, long filledQty,
                                      boolean isBuy, long omsOrderId, long statusSeq,
-                                     int rejectReasonRaw) {
+                                     int rejectReasonRaw, long egressSeq) {
+        trackEgressSeq(egressSeq); // Layer 2: order-key reorder metric (order-key only; not gap detection)
         // Per-market contiguity: the publisher consumes a seq for every status,
         // dropped or not, so any wire gap means statuses were lost (match#31).
         // Seq counters reset on leader change; onConnected/onReconnected clears
@@ -105,7 +151,7 @@ public class OmsEgressAdapter implements EgressListener {
         }
         coreEngine.onClusterOrderStatus(marketId, orderId, userId, status,
                 price, remainingQty, filledQty, isBuy, omsOrderId,
-                mapRejectReason(rejectReasonRaw));
+                mapRejectReason(rejectReasonRaw), egressSeq);
     }
 
     /**

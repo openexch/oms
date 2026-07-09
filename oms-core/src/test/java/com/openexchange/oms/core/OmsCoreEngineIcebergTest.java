@@ -86,7 +86,8 @@ class OmsCoreEngineIcebergTest {
     private void makerFill(long omsOrderId, long qty) {
         engine.onTradeExecution(MARKET, nextTradeId++, /*takerOrderId*/ 1L, /*makerOrderId*/ 2L,
                 /*takerUserId*/ 200L, /*makerUserId*/ 100L, 100_00000000L, qty,
-                /*takerIsBuy*/ true, /*takerOmsOrderId*/ 0L, /*makerOmsOrderId*/ omsOrderId);
+                /*takerIsBuy*/ true, /*takerOmsOrderId*/ 0L, /*makerOmsOrderId*/ omsOrderId,
+                /*egressSeq*/ 0L);
     }
 
     @Test
@@ -131,7 +132,8 @@ class OmsCoreEngineIcebergTest {
         OmsOrder order = icebergResting(2L);
         // Same trade shape but the iceberg is the TAKER (e.g. a slice that crossed on entry).
         engine.onTradeExecution(MARKET, nextTradeId++, 1L, 2L, 100L, 300L, 100_00000000L,
-                DISPLAY, /*takerIsBuy*/ false, /*takerOmsOrderId*/ 2L, /*makerOmsOrderId*/ 0L);
+                DISPLAY, /*takerIsBuy*/ false, /*takerOmsOrderId*/ 2L, /*makerOmsOrderId*/ 0L,
+                /*egressSeq*/ 0L);
         assertEquals(2, sliceSubmissions.size(), "taker-side slice completion must refill too");
         assertEquals(OmsOrderStatus.PARTIALLY_FILLED, order.getStatus());
     }

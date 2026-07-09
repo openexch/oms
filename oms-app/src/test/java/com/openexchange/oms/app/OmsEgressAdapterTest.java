@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.oms.app;
 
+import com.openexchange.oms.core.OmsCoreEngine;
+import com.openexchange.oms.core.OrderLifecycleManager;
+import com.openexchange.oms.core.SyntheticOrderEngine;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -8,10 +11,82 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
  * Unit tests for the raw engine {@code OrderRejectReason} code to OMS rejectReason string mapping
- * (match#75). The mapping is the OMS-side vocabulary translation and must be total: every code maps
- * to a string or null, and no code (including unknown/future ones) throws.
+ * (match#75) and the Layer 2 egressSeq reorder metric.
+ *
+ * <p>The rejectReason mapping is the OMS-side vocabulary translation and must be total: every code
+ * maps to a string or null, and no code (including unknown/future ones) throws.</p>
  */
 class OmsEgressAdapterTest {
+
+    // ---- Layer 2: egressSeq reorder metric ----
+    // egressSeq is an ORDER KEY ONLY: monotonic non-decreasing in cluster-log order, but sparse
+    // (gaps normal) and non-unique (ties normal). It must NEVER be used for dense gap detection.
+    // These guardrails pin the metric semantics; they are deliberately kept separate from the
+    // statusSeq/tradeId gap-detection tests, whose logic must stay untouched.
+
+    private long nextTradeId = 1;
+
+    /** A fresh adapter over throwaway core state (omsOrderId 0 in the drivers → no side effects). */
+    private static OmsEgressAdapter newAdapter() {
+        OmsCoreEngine coreEngine = new OmsCoreEngine(new OrderLifecycleManager(), new SyntheticOrderEngine());
+        return new OmsEgressAdapter(coreEngine, new OmsMarketDataProvider());
+    }
+
+    /** Drive one status egress carrying {@code egressSeq}. omsOrderId 0 → core returns early;
+     *  statusSeq 0 → the statusSeq gap block is skipped, isolating the egressSeq metric. */
+    private static void status(OmsEgressAdapter a, long egressSeq) {
+        a.onOrderStatusUpdate(1, 1L, 1L, 0, 0L, 0L, 0L, true, 0L, 0L, 0, egressSeq);
+    }
+
+    /** Drive one trade egress carrying {@code egressSeq}. omsOrderIds 0 → no fill/settle side effects. */
+    private void trade(OmsEgressAdapter a, long egressSeq) {
+        a.onTradeExecution(1, nextTradeId++, 1L, 2L, 1L, 2L, 1L, 1L, true, 0L, 0L, egressSeq);
+    }
+
+    @Test
+    void outOfOrderNonZeroEgressSeqIncrementsReorderCount() {
+        OmsEgressAdapter a = newAdapter();
+        status(a, 100L);              // first non-zero: adopts the high-water mark, not a reorder
+        assertEquals(0L, a.getEgressReorderCount());
+        assertEquals(100L, a.getLastEgressSeq());
+
+        status(a, 150L);              // monotonic advance: no reorder, high-water mark moves up
+        assertEquals(0L, a.getEgressReorderCount());
+        assertEquals(150L, a.getLastEgressSeq());
+
+        status(a, 50L);               // below the high-water mark: a reorder
+        assertEquals(1L, a.getEgressReorderCount());
+        assertEquals(150L, a.getLastEgressSeq(), "a reorder must NOT regress the high-water mark");
+
+        trade(a, 40L);                // reorders count across the trade path too (shared order key)
+        assertEquals(2L, a.getEgressReorderCount());
+        assertEquals(150L, a.getLastEgressSeq());
+    }
+
+    @Test
+    void zeroEgressSeqNeverIncrementsAndNeverRegressesLastSeen() {
+        OmsEgressAdapter fresh = newAdapter();
+        status(fresh, 0L);            // v6/absent on a pristine adapter: no metric, no advance
+        assertEquals(0L, fresh.getEgressReorderCount());
+        assertEquals(0L, fresh.getLastEgressSeq());
+
+        OmsEgressAdapter a = newAdapter();
+        status(a, 100L);
+        status(a, 0L);                // absent: skipped entirely — not counted as a reorder below 100
+        trade(a, 0L);
+        assertEquals(0L, a.getEgressReorderCount());
+        assertEquals(100L, a.getLastEgressSeq(), "an absent (0) egressSeq must not disturb the high-water mark");
+    }
+
+    @Test
+    void tiedEgressSeqValuesDoNotIncrement() {
+        OmsEgressAdapter a = newAdapter();
+        status(a, 100L);              // all events of one command share one egressSeq: ties are normal
+        status(a, 100L);
+        trade(a, 100L);
+        assertEquals(0L, a.getEgressReorderCount(), "equal egressSeq (a tie) must not count as a reorder");
+        assertEquals(100L, a.getLastEgressSeq());
+    }
 
     @Test
     void sentinelAndNoneMapToNull() {
