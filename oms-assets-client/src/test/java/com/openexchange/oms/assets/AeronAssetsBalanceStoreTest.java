@@ -81,6 +81,12 @@ class AeronAssetsBalanceStoreTest {
         }
 
         @Override
+        public synchronized boolean submitRequestHoldSnapshot(long corr) {
+            submissions.add(new Submitted("HOLDSNAP", corr, 0, 0, 0, false));
+            return true;
+        }
+
+        @Override
         public boolean isConnected() {
             return connected;
         }

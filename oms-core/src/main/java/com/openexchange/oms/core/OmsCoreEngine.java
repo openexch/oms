@@ -402,6 +402,15 @@ public class OmsCoreEngine {
     public int reconcileAgainstOpenOrders(org.agrona.collections.LongHashSet clusterOpenOrderIds,
                                           org.agrona.collections.Long2LongHashMap clusterOmsToClusterId,
                                           long snapshotMaxOrderId, long requestTimeMs) {
+        // Retain the cluster-open omsOrderId set for the orphan-hold reconciler: a hold whose
+        // omsOrderId is OPEN ON THE CLUSTER but has no OMS record is a crash-lost resting order —
+        // it must be SURFACED, never released (its fills are still coming via the settlement feed).
+        final org.agrona.collections.LongHashSet openOms =
+                new org.agrona.collections.LongHashSet(clusterOmsToClusterId.size());
+        for (final long omsId : clusterOmsToClusterId.keySet()) {
+            openOms.add(omsId);
+        }
+        this.lastClusterOpenOmsOrderIds = openOms;
         ArrayList<OmsOrder> toTerminalize = new ArrayList<>();
         ArrayList<OmsOrder> toRelink = new ArrayList<>();
         lifecycleManager.forEachActiveOrder(order -> {
@@ -505,6 +514,15 @@ public class OmsCoreEngine {
             postReconcileHook.run();
         }
         return toTerminalize.size();
+    }
+
+    /** Cluster-open omsOrderIds from the LAST membership reconcile (volatile immutable copy). */
+    private volatile org.agrona.collections.LongHashSet lastClusterOpenOmsOrderIds =
+            new org.agrona.collections.LongHashSet(0);
+
+    /** TRUE when the last ME open-orders snapshot listed this omsOrderId as open on the cluster. */
+    public boolean isClusterOpenOmsOrderId(long omsOrderId) {
+        return lastClusterOpenOmsOrderIds.contains(omsOrderId);
     }
 
     /** See reconcileAgainstOpenOrders: runs after every membership reconcile. */

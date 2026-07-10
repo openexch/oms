@@ -53,6 +53,21 @@ public class SnowflakeIdGenerator {
              | sequence;
     }
 
+    /**
+     * Recover the wall-clock millisecond timestamp an id was minted at, inverting the layout above
+     * ({@code ts = (id >>> (NODE_BITS + SEQUENCE_BITS)) + EPOCH}). This is what lets the orphan-hold
+     * reconciler age-gate a hold whose order the OMS has NO record of: the omsOrderId still carries
+     * its own creation time. Only meaningful for ids from this generator; a value that decodes to a
+     * timestamp before {@link #EPOCH} or absurdly far in the future is not a real Snowflake id and
+     * callers should treat the age as unknown.
+     *
+     * @param id a Snowflake id from {@link #nextId()}
+     * @return the epoch-millis creation time encoded in the id
+     */
+    public static long timestampMillis(long id) {
+        return (id >>> (NODE_BITS + SEQUENCE_BITS)) + EPOCH;
+    }
+
     private long waitNextMillis(long lastTimestamp) {
         long timestamp = System.currentTimeMillis();
         while (timestamp <= lastTimestamp) {

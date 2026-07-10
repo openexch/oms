@@ -73,6 +73,8 @@ public class OmsApplication {
     private PrometheusMeterRegistry meterRegistry;
     /** Only set when {@code OMS_BALANCE_STORE=aeron}; a second, isolated Aeron client (E3/E4). */
     private AssetsClusterClient assetsClusterClient;
+    /** Only set when {@code OMS_BALANCE_STORE=aeron}; the Q3 orphan-hold reconciler (E5). */
+    private AssetsHoldReconciler assetsHoldReconciler;
 
     public static void main(String[] args) {
         OmsApplication app = new OmsApplication();
@@ -521,6 +523,29 @@ public class OmsApplication {
                     .description("AE settle-side-effect dedupe high-water tradeId").register(meterRegistry);
             Gauge.builder("oms_assets_projection_ready", aeStore, s -> s.isProjectionReady() ? 1 : 0)
                     .description("AE balance projection ready (1) / not ready (0)").register(meterRegistry);
+
+            // Q3 orphan-hold reconciler (E5): sweep the AE for holds with no live order and release
+            // ONLY the provably-never-submitted ones. PG is mandatory for the aeron store (enforced
+            // above), so orderRepo is non-null here; still guarded. The initial sweep is armed by the
+            // first ME open-orders reconcile (see the post-reconcile hook below).
+            final PostgresOrderRepository reconcilerOrderRepo = orderRepo;
+            AssetsHoldReconciler.OrderLookup pgLookup =
+                    reconcilerOrderRepo != null ? reconcilerOrderRepo::findById : null;
+            assetsHoldReconciler = new AssetsHoldReconciler(
+                    aeStore, lifecycleManager, pgLookup, java.time.Clock.systemUTC(),
+                    coreEngine::isClusterOpenOmsOrderId);
+            assetsHoldReconciler.start();
+            FunctionCounter.builder("oms_assets_orphan_releases_total", assetsHoldReconciler,
+                            AssetsHoldReconciler::getOrphanReleasesTotal)
+                    .description("AE holds released as provably-never-submitted orphans (E5)").register(meterRegistry);
+            FunctionCounter.builder("oms_assets_reconciler_sweeps_total", assetsHoldReconciler,
+                            AssetsHoldReconciler::getSweepsTotal)
+                    .description("AE orphan-hold reconciler sweeps run (E5)").register(meterRegistry);
+            Gauge.builder("oms_assets_unresolved_orphans", assetsHoldReconciler,
+                            AssetsHoldReconciler::getUnresolvedOrphansLastSweep)
+                    .description("AE holds not provably releasable at the last sweep (surfaced/pending) (E5)")
+                    .register(meterRegistry);
+            log.info("Assets orphan-hold reconciler started (initial sweep gated on the first ME open-orders reconcile)");
         }
 
         // 13. gRPC services (created before state listener so push methods can be called)
@@ -603,6 +628,13 @@ public class OmsApplication {
             if (drift != 0) {
                 log.warn("Open-order slot rebaseline corrected drift of {} across {} users (oms#49)",
                         drift, truth.size());
+            }
+            // E5: the FIRST completed ME open-orders reconcile is the moment the restored order set
+            // has been trued up against cluster reality (ack-lost orders re-linked). Arm the AE
+            // orphan-hold reconciler's initial sweep here so it never sweeps against a not-yet-repaired
+            // view. Idempotent — later reconciles are no-ops for the reconciler.
+            if (assetsHoldReconciler != null) {
+                assetsHoldReconciler.onStartupReconcileComplete();
             }
         });
 
@@ -715,6 +747,10 @@ public class OmsApplication {
         if (clusterClient != null) {
             clusterClient.stopPolling();
             clusterClient.close();
+        }
+
+        if (assetsHoldReconciler != null) {
+            assetsHoldReconciler.stop();
         }
 
         if (assetsClusterClient != null) {

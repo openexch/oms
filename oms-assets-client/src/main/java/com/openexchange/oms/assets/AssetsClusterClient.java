@@ -697,6 +697,7 @@ public class AssetsClusterClient
     }
 
     /** Read-only: ask the AE to stream every outstanding hold (HoldSnapshotEntry*, then HoldSnapshotEnd). */
+    @Override
     public boolean submitRequestHoldSnapshot(long correlationId) {
         PooledCommand cmd = acquire();
         if (cmd == null) {
