@@ -38,7 +38,7 @@
 
         <!-- Aeron (must match match-engine version) -->
         <aeron.version>1.52.1</aeron.version>
-        <agrona.version>2.4.1</agrona.version>
+        <agrona.version>2.5.0</agrona.version>
         <sbe.version>1.39.0</sbe.version>
 
         <!-- LMAX Disruptor -->
