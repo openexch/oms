@@ -574,6 +574,14 @@ public class OmsOrderServiceImpl implements OrderService {
     }
 
     @Override
+    public Boolean isAssetsProjectionReady() {
+        if (balanceStore instanceof com.openexchange.oms.assets.AeronAssetsBalanceStore aeronStore) {
+            return aeronStore.isProjectionReady();
+        }
+        return null;
+    }
+
+    @Override
     public void deposit(long userId, int assetId, long amount) {
         balanceStore.deposit(userId, assetId, amount);
     }

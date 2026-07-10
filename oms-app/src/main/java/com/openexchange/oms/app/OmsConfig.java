@@ -8,6 +8,14 @@ package com.openexchange.oms.app;
  * (secure default; with no keys configured every request is rejected),
  * "jwt" (HS256, requires jwtSecret), or "dev" (accepts everything — must be
  * opted into explicitly, never production).
+ *
+ * Balance store (E3/E4): balanceStore selects the {@code BalanceStore} —
+ * "redis" (default; a failed connectivity probe is FATAL, no silent
+ * in-memory fallback), "aeron" (the AE-backed money store; also gates on
+ * PG availability and boot-time balance-projection readiness), or "memory"
+ * (explicit non-durable opt-in, dev/test only). The AE tunables
+ * (aeHoldTimeoutMs/aeAckTimeoutMs/aeConnectTimeoutMs) only apply when
+ * balanceStore=aeron.
  */
 public record OmsConfig(
     int httpPort,
@@ -24,7 +32,11 @@ public record OmsConfig(
     String apiKeysFile,
     String jwtSecret,
     String corsOrigins,
-    String auditLogPath
+    String auditLogPath,
+    String balanceStore,
+    long aeHoldTimeoutMs,
+    long aeAckTimeoutMs,
+    long aeConnectTimeoutMs
 ) {
     public static OmsConfig loadDefaults() {
         return new OmsConfig(
@@ -44,7 +56,11 @@ public record OmsConfig(
             prop("OMS_API_KEYS_FILE", ""),
             secretProp("OMS_JWT_SECRET", ""),
             prop("OMS_CORS_ORIGINS", ""),
-            prop("OMS_AUDIT_LOG", "oms-audit.log")
+            prop("OMS_AUDIT_LOG", "oms-audit.log"),
+            prop("OMS_BALANCE_STORE", "redis"),
+            longProp("OMS_AE_HOLD_TIMEOUT_MS", 250L),
+            longProp("OMS_AE_ACK_TIMEOUT_MS", 1000L),
+            longProp("OMS_AE_CONNECT_TIMEOUT_MS", 30_000L)
         );
     }
 
@@ -71,5 +87,10 @@ public record OmsConfig(
     private static int intProp(String key, int defaultValue) {
         String val = prop(key, null);
         return val != null ? Integer.parseInt(val) : defaultValue;
+    }
+
+    private static long longProp(String key, long defaultValue) {
+        String val = prop(key, null);
+        return val != null ? Long.parseLong(val) : defaultValue;
     }
 }

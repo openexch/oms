@@ -54,6 +54,8 @@ public class PostgresExecutionRepository {
             HAVING SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) <> 0
             """;
 
+    private static final String MAX_TRADE_ID = "SELECT COALESCE(MAX(trade_id), 0) FROM executions";
+
     private final HikariDataSource dataSource;
 
     public PostgresExecutionRepository(HikariDataSource dataSource) {
@@ -188,6 +190,29 @@ public class PostgresExecutionRepository {
         } catch (SQLException e) {
             log.error("Failed to aggregate positions for userId={}", userId, e);
             throw new PersistenceException("Failed to aggregate positions for user", e);
+        }
+    }
+
+    /**
+     * The highest {@code trade_id} ever persisted, or 0 if the executions table is empty.
+     * Boot-time init for the AE-backed balance store's settle-side-effect dedupe high-water
+     * (E3/E4): the AE settles money asynchronously off the ME journal feed, so the OMS's local
+     * side effects (risk onFill, exec persist, applyFill) need their own floor to survive a
+     * restart without re-applying a trade whose execution row was already written.
+     */
+    public long maxTradeId() {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(MAX_TRADE_ID);
+             ResultSet rs = ps.executeQuery()) {
+
+            if (rs.next()) {
+                return rs.getLong(1);
+            }
+            return 0L;
+
+        } catch (SQLException e) {
+            log.error("Failed to read max(trade_id) from executions", e);
+            throw new PersistenceException("Failed to read max trade id", e);
         }
     }
 
