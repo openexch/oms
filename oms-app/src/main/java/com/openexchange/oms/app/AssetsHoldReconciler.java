@@ -147,6 +147,7 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
     private final OrderLifecycleManager lifecycle;
     private final OrderLookup pgLookup;
     private final Clock clock;
+    private final java.util.function.LongPredicate clusterOpenOmsOrderIds;
 
     private final AtomicLong correlationIds =
             new AtomicLong(ThreadLocalRandom.current().nextLong(1, 1L << 40));
@@ -172,10 +173,19 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
                                 final OrderLifecycleManager lifecycle,
                                 final OrderLookup pgLookup,
                                 final Clock clock) {
+        this(store, lifecycle, pgLookup, clock, omsOrderId -> false);
+    }
+
+    public AssetsHoldReconciler(final AeronAssetsBalanceStore store,
+                                final OrderLifecycleManager lifecycle,
+                                final OrderLookup pgLookup,
+                                final Clock clock,
+                                final java.util.function.LongPredicate clusterOpenOmsOrderIds) {
         this.store = store;
         this.lifecycle = lifecycle;
         this.pgLookup = pgLookup;
         this.clock = clock;
+        this.clusterOpenOmsOrderIds = clusterOpenOmsOrderIds;
     }
 
     /**
@@ -354,6 +364,18 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
         final OmsOrder inLifecycle = lifecycle.getOrder(h.orderId());
         if (inLifecycle != null && !inLifecycle.getStatus().isTerminal()) {
             return new Decision(Kind.ACTIVE_LEGIT, "live order in lifecycle");
+        }
+
+        // TIGHTENING (closes the crash-after-submit-before-first-persist residual): the latest ME
+        // open-orders snapshot is the authority on "reached the cluster". A hold whose omsOrderId
+        // is OPEN ON THE CLUSTER with no active OMS record is a crash-lost RESTING order: its fills
+        // are still coming via the settlement feed, so it is SURFACED for repair, never released.
+        // (Already-terminal-on-ME orders were handled by the lossless journal feed; genuinely
+        // never-submitted ids can never appear in the snapshot.)
+        if (clusterOpenOmsOrderIds.test(h.orderId())) {
+            return new Decision(Kind.SURFACE,
+                    "omsOrderId is OPEN on the cluster per the latest ME snapshot (crash-lost "
+                            + "resting order — needs repair, not release)");
         }
 
         // No active order. Gather the fullest record we have: a terminal straggler still in the map,

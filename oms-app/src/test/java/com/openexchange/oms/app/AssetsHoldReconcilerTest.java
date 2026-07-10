@@ -116,6 +116,7 @@ class AssetsHoldReconcilerTest {
     private OrderLifecycleManager lifecycle;
     private Map<Long, OmsOrder> pg;
     private AssetsHoldReconciler reconciler;
+    private final org.agrona.collections.LongHashSet clusterOpenOms = new org.agrona.collections.LongHashSet();
     private long baseMs; // "creation" wall-clock the ids/orders are anchored to
 
     @BeforeEach
@@ -126,7 +127,7 @@ class AssetsHoldReconcilerTest {
         store = new AeronAssetsBalanceStore(transport, 6, 50, 100);
         lifecycle = new OrderLifecycleManager();
         pg = new HashMap<>();
-        reconciler = new AssetsHoldReconciler(store, lifecycle, pg::get, clock);
+        reconciler = new AssetsHoldReconciler(store, lifecycle, pg::get, clock, clusterOpenOms::contains);
     }
 
     // ---- helpers ----
@@ -421,5 +422,18 @@ class AssetsHoldReconcilerTest {
         assertTrue(ts >= before && ts <= after, "decoded ts " + ts + " not in [" + before + "," + after + "]");
         // A synthetic id decodes exactly.
         assertEquals(1704067200000L + 90_000, SnowflakeIdGenerator.timestampMillis(idAtMs(1704067200000L + 90_000)));
+    }
+
+    @Test
+    void clusterOpenOmsOrderIdIsSurfacedNeverReleasedEvenWithNoRecordAnywhere() {
+        // Crash-after-submit-before-first-persist: no lifecycle entry, no PG row, but the latest
+        // ME open-orders snapshot lists the omsOrderId as OPEN — fills are still coming via the
+        // settlement feed. Must be SURFACED for repair, never released, no matter how old or how
+        // many sweeps observe it.
+        long orphan = idAtMs(clock.millis() - 120_000);
+        clusterOpenOms.add(orphan);
+        assertEquals(AssetsHoldReconciler.Kind.SURFACE, classifyNow(orphan));
+        // Second sweep: still surfaced (no candidate-promotion path for cluster-open ids).
+        assertEquals(AssetsHoldReconciler.Kind.SURFACE, classifyNow(orphan));
     }
 }

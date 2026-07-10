@@ -532,7 +532,8 @@ public class OmsApplication {
             AssetsHoldReconciler.OrderLookup pgLookup =
                     reconcilerOrderRepo != null ? reconcilerOrderRepo::findById : null;
             assetsHoldReconciler = new AssetsHoldReconciler(
-                    aeStore, lifecycleManager, pgLookup, java.time.Clock.systemUTC());
+                    aeStore, lifecycleManager, pgLookup, java.time.Clock.systemUTC(),
+                    coreEngine::isClusterOpenOmsOrderId);
             assetsHoldReconciler.start();
             FunctionCounter.builder("oms_assets_orphan_releases_total", assetsHoldReconciler,
                             AssetsHoldReconciler::getOrphanReleasesTotal)
