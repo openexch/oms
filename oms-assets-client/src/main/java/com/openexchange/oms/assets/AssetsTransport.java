@@ -19,6 +19,13 @@ public interface AssetsTransport {
 
     boolean submitRequestBalanceSnapshot(long correlationId);
 
+    /**
+     * Ask the AE to stream every outstanding hold ({@code HoldSnapshotEntry*}, then a
+     * {@code HoldSnapshotEnd}). The orphan-hold reconciler drives this to diff the AE's live holds
+     * against OMS order state. @return true if queued, false on back-pressure.
+     */
+    boolean submitRequestHoldSnapshot(long correlationId);
+
     boolean isConnected();
 
     void setEgressListener(AssetsEgressListener listener);

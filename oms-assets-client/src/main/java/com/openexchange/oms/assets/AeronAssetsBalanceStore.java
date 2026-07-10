@@ -67,6 +67,14 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
     private volatile boolean projectionReady;
     private volatile long snapshotCorrelationId;
 
+    /**
+     * Optional forwarding seam for the hold-snapshot stream (the Q3 orphan-hold reconciler). The
+     * store stays the sole {@link AssetsEgressListener}; when set, this consumer is fed the same
+     * {@code onHoldSnapshotEntry}/{@code onHoldSnapshotEnd} events on the poll thread. Volatile:
+     * installed once at startup, read on the poll thread.
+     */
+    private volatile HoldSnapshotConsumer holdSnapshotConsumer;
+
     // Anomaly counters (single-writer or monotonic; scraped by metrics).
     private volatile long holdTimeouts;
     private volatile long amendOrphans;
@@ -90,6 +98,24 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
 
     public boolean isProjectionReady() {
         return projectionReady;
+    }
+
+    /**
+     * Install the hold-snapshot forwarding seam (the orphan-hold reconciler). Idempotent; the last
+     * consumer set wins. Passing {@code null} detaches. See {@link HoldSnapshotConsumer}.
+     */
+    public void setHoldSnapshotConsumer(final HoldSnapshotConsumer consumer) {
+        this.holdSnapshotConsumer = consumer;
+    }
+
+    /**
+     * Ask the AE to stream its outstanding holds (answered by {@code onHoldSnapshotEntry*} then
+     * {@code onHoldSnapshotEnd}, forwarded to the {@link HoldSnapshotConsumer}). The reconciler owns
+     * the correlationId; a {@code false} return means the request was back-pressured and no snapshot
+     * will arrive for it.
+     */
+    public boolean requestHoldSnapshot(final long correlationId) {
+        return transport.submitRequestHoldSnapshot(correlationId);
     }
 
     // ==================== BalanceStore ====================
@@ -320,13 +346,20 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
 
     @Override
     public void onHoldSnapshotEntry(final long orderId, final long userId, final int assetId, final long remaining) {
-        // The reconciler consumes these; the store only keeps its acked-hold set warm.
+        // The store keeps its acked-hold set warm; the reconciler (if attached) consumes the stream.
         ackedHoldOrderIds.add(orderId);
+        final HoldSnapshotConsumer consumer = holdSnapshotConsumer;
+        if (consumer != null) {
+            consumer.onHoldSnapshotEntry(orderId, userId, assetId, remaining);
+        }
     }
 
     @Override
     public void onHoldSnapshotEnd(final long correlationId, final int entryCount) {
-        // Reconciler-facing.
+        final HoldSnapshotConsumer consumer = holdSnapshotConsumer;
+        if (consumer != null) {
+            consumer.onHoldSnapshotEnd(correlationId, entryCount);
+        }
     }
 
     @Override
