@@ -54,7 +54,7 @@
         <lettuce.version>7.6.0.RELEASE</lettuce.version>
 
         <!-- PostgreSQL -->
-        <postgresql.version>42.7.11</postgresql.version>
+        <postgresql.version>42.7.13</postgresql.version>
         <hikari.version>7.1.0</hikari.version>
 
         <!-- gRPC -->
