@@ -365,7 +365,7 @@ public class AssetsClusterClient
                 .egressChannel(egressChannel)
                 // mtu=8k requires loopback or a jumbo-frame path (MTU >= 8192). Drop to 1408 (Aeron
                 // default) before pointing at AE nodes off 127.0.0.1 without jumbo frames.
-                .ingressChannel("aeron:udp?term-length=16m|mtu=8k")
+                .ingressChannel("aeron:udp?term-length=4m|mtu=8k")
                 .aeronDirectoryName(mediaDriver.aeronDirectoryName())
                 .ingressEndpoints(ingressEndpoints)
                 .messageTimeoutNs(TimeUnit.SECONDS.toNanos(5))
