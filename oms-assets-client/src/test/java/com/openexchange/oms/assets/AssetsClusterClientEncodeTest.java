@@ -38,7 +38,7 @@ class AssetsClusterClientEncodeTest {
 
     @Test
     void holdEncodesAndRoundTrips() {
-        assertTrue(client.submitHold(111L, 222L, 333L, 7, 5_00000000L));
+        assertTrue(client.submitHold(111L, 222L, 333L, 7, 5_00000000L, true));
         drainOne();
         assertEquals(HoldDecoder.TEMPLATE_ID, header.templateId());
         HoldDecoder d = new HoldDecoder();
@@ -48,6 +48,7 @@ class AssetsClusterClientEncodeTest {
         assertEquals(333L, d.userId());
         assertEquals(7, d.assetId());
         assertEquals(5_00000000L, d.amount());
+        assertEquals(com.openexchange.assets.infrastructure.generated.BoolFlag.TRUE, d.omsManagedRelease());
     }
 
     @Test
@@ -132,7 +133,7 @@ class AssetsClusterClientEncodeTest {
 
     @Test
     void queueIsFifoAndDrainsEmpty() {
-        assertTrue(client.submitHold(1L, 1L, 1L, 1, 1L));
+        assertTrue(client.submitHold(1L, 1L, 1L, 1, 1L, false));
         assertTrue(client.submitDeposit(2L, 2L, 2, 2L));
 
         // First out is the Hold, second is the Deposit (FIFO), then the queue is empty.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.oms.assets;
 
+import com.openexchange.assets.infrastructure.generated.BoolFlag;
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndDecoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateDecoder;
 import com.openexchange.assets.infrastructure.generated.DepositAckDecoder;
@@ -617,14 +618,16 @@ public class AssetsClusterClient implements io.aeron.cluster.client.EgressListen
     // ==================== Ingress submit API (thread-safe) ====================
 
     /** Reserve funds for an order (available -> locked). @return true if queued, false on back-pressure. */
-    public boolean submitHold(long correlationId, long orderId, long userId, int assetId, long amount) {
+    public boolean submitHold(long correlationId, long orderId, long userId, int assetId, long amount,
+                              boolean omsManagedRelease) {
         PooledCommand cmd = acquire();
         if (cmd == null) {
             return false;
         }
         Encoders e = encoders.get();
         e.hold.wrapAndApplyHeader(cmd.buffer, 0, e.header)
-                .correlationId(correlationId).orderId(orderId).userId(userId).assetId(assetId).amount(amount);
+                .correlationId(correlationId).orderId(orderId).userId(userId).assetId(assetId).amount(amount)
+                .omsManagedRelease(omsManagedRelease ? BoolFlag.TRUE : BoolFlag.FALSE);
         cmd.length = MessageHeaderEncoder.ENCODED_LENGTH + e.hold.encodedLength();
         return enqueue(cmd);
     }

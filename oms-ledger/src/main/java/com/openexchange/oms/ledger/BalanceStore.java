@@ -44,6 +44,17 @@ public interface BalanceStore {
     boolean hold(long userId, int assetId, long amount, long orderId);
 
     /**
+     * Hold with a release-ownership policy. {@code omsManagedRelease=true} marks the hold as
+     * OMS-owned at terminal (iceberg/stop PARENT holds: their ME-level slices/children share the
+     * parent's omsOrderId, so a feed terminal must not release the parent's residual). Stores
+     * without per-hold policy (Redis/in-memory) ignore the flag — their releases are always
+     * OMS-computed anyway.
+     */
+    default boolean hold(long userId, int assetId, long amount, long orderId, boolean omsManagedRelease) {
+        return hold(userId, assetId, amount, orderId);
+    }
+
+    /**
      * Atomically releases a hold: decrements locked balance, increments available balance.
      * Used when an order is cancelled or partially unfilled.
      *
@@ -89,6 +100,23 @@ public interface BalanceStore {
      */
     default long getOversettleCount() {
         return 0;
+    }
+
+    /**
+     * Whether this store tracks per-order RESIDUAL holds authoritatively (the Assets Engine).
+     * When true: terminal releases use {@link #releaseAll} (the residual model is truth, and buy
+     * price-improvement returns with it) and LedgerService skips the per-fill overlock release.
+     */
+    default boolean supportsResidualHolds() {
+        return false;
+    }
+
+    /**
+     * Release the FULL residual of an order's hold (only meaningful when
+     * {@link #supportsResidualHolds()}); amount-computing stores never see this call.
+     */
+    default boolean releaseAll(long userId, int assetId, long orderId) {
+        throw new UnsupportedOperationException("residual holds not supported by " + getClass().getSimpleName());
     }
 
     /**

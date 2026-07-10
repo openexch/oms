@@ -16,6 +16,12 @@
 
     <dependencies>
         <!-- Money-schema v2 SBE codecs (Hold/Release/Deposit/Withdraw ingress, HoldAck/BalanceUpdate/... egress) -->
+        <!-- The BalanceStore seam the AeronAssetsBalanceStore implements. -->
+        <dependency>
+            <groupId>com.openexchange.oms</groupId>
+            <artifactId>oms-ledger</artifactId>
+            <version>${project.version}</version>
+        </dependency>
         <dependency>
             <groupId>com.openexchange.assets</groupId>
             <artifactId>assets-common</artifactId>

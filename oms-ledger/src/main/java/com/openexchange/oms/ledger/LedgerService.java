@@ -70,7 +70,10 @@ public class LedgerService {
             return Collections.emptyList();
         }
 
-        boolean success = balanceStore.hold(order.getUserId(), holdAssetId, holdAmount, order.getOmsOrderId());
+        // Synthetic parents (iceberg/stop/trailing) own their terminal release OMS-side: their
+        // cluster-level slices/children share this omsOrderId, so the feed must not release it.
+        boolean success = balanceStore.hold(order.getUserId(), holdAssetId, holdAmount,
+                order.getOmsOrderId(), order.getOrderType().isSynthetic());
         if (!success) {
             log.warn("Hold failed for order: orderId={}, userId={}, assetId={}, amount={}",
                     order.getOmsOrderId(), order.getUserId(), holdAssetId, holdAmount);
@@ -272,7 +275,12 @@ public class LedgerService {
             return Collections.emptyList();
         }
 
-        boolean success = balanceStore.release(order.getUserId(), holdAssetId, releaseAmount, order.getOmsOrderId());
+        // Residual-hold stores (the Assets Engine) know the exact remaining reservation — release
+        // it all (this is also how buy price-improvement comes back). Amount-computing stores keep
+        // the netted math below.
+        boolean success = balanceStore.supportsResidualHolds()
+                ? balanceStore.releaseAll(order.getUserId(), holdAssetId, order.getOmsOrderId())
+                : balanceStore.release(order.getUserId(), holdAssetId, releaseAmount, order.getOmsOrderId());
         if (!success) {
             log.error("Release failed for order: orderId={}, userId={}, assetId={}, amount={}",
                     order.getOmsOrderId(), order.getUserId(), holdAssetId, releaseAmount);
@@ -401,6 +409,11 @@ public class LedgerService {
      */
     public List<LedgerEntry> handleOverlock(long omsOrderId, long userId, int marketId,
                                              long holdPrice, long fillPrice, long fillQty) {
+        if (balanceStore.supportsResidualHolds()) {
+            // The store settles at fill price from the specific hold: the price-improvement
+            // residual stays in the hold and returns at the order's terminal release.
+            return Collections.emptyList();
+        }
         if (fillPrice >= holdPrice) {
             // No overlock: filled at or above hold price
             return Collections.emptyList();
