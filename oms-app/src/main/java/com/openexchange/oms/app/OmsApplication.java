@@ -50,6 +50,7 @@ import io.lettuce.core.RedisClient;
 import com.openexchange.oms.persistence.PostgresOrderRepository;
 import com.openexchange.oms.persistence.PostgresExecutionRepository;
 import com.openexchange.oms.persistence.PostgresUserRepository;
+import com.openexchange.oms.persistence.PostgresBalanceReadModelStore;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import com.openexchange.oms.risk.RiskConfig;
@@ -75,6 +76,8 @@ public class OmsApplication {
     private AssetsClusterClient assetsClusterClient;
     /** Only set when {@code OMS_BALANCE_STORE=aeron}; the Q3 orphan-hold reconciler (E5). */
     private AssetsHoldReconciler assetsHoldReconciler;
+    /** Only set when {@code OMS_BALANCE_STORE=aeron} + PG present; the CQRS balance read-model writer (E6). */
+    private PgBalanceReadModelWriter balanceReadModelWriter;
 
     public static void main(String[] args) {
         OmsApplication app = new OmsApplication();
@@ -546,6 +549,32 @@ public class OmsApplication {
                     .description("AE holds not provably releasable at the last sweep (surfaced/pending) (E5)")
                     .register(meterRegistry);
             log.info("Assets orphan-hold reconciler started (initial sweep gated on the first ME open-orders reconcile)");
+
+            // E6: CQRS balance read model — a durable, queryable PG mirror of AE balances for
+            // ops/analytics. Fed by the store's change-tap on the poll thread; drained off-thread to
+            // the account_balances table. NOT money-authoritative and NEVER read by the money path.
+            // Attached here, strictly AFTER awaitProjectionReady() above, so the tap only sees
+            // post-bootstrap changes; the full balance set is (re)seeded on the next reconnect
+            // snapshot, and every live mutation is captured meanwhile. PG is mandatory for the aeron
+            // store (enforced above), so dataSource is non-null here; still guarded.
+            if (dataSource != null) {
+                balanceReadModelWriter = new PgBalanceReadModelWriter(
+                        new PostgresBalanceReadModelStore(dataSource));
+                aeStore.setBalanceChangeConsumer(balanceReadModelWriter);
+                balanceReadModelWriter.start();
+                FunctionCounter.builder("oms_balance_readmodel_rows_written_total", balanceReadModelWriter,
+                                PgBalanceReadModelWriter::getRowsWritten)
+                        .description("Rows upserted into the CQRS balance read model (E6)").register(meterRegistry);
+                FunctionCounter.builder("oms_balance_readmodel_flush_failures_total", balanceReadModelWriter,
+                                PgBalanceReadModelWriter::getFlushFailures)
+                        .description("Balance read-model flush ticks that failed (PG unavailable etc.) (E6)").register(meterRegistry);
+                Gauge.builder("oms_balance_readmodel_dirty", balanceReadModelWriter,
+                                PgBalanceReadModelWriter::getDirtyCount)
+                        .description("Balance read-model (user,asset) keys awaiting flush (E6)").register(meterRegistry);
+                log.info("CQRS balance read-model writer started (mirroring AE balances to account_balances)");
+            } else {
+                log.warn("PG unavailable — CQRS balance read model disabled (no durable balance mirror)");
+            }
         }
 
         // 13. gRPC services (created before state listener so push methods can be called)
@@ -756,6 +785,12 @@ public class OmsApplication {
         if (assetsClusterClient != null) {
             assetsClusterClient.stopPolling();
             assetsClusterClient.close();
+        }
+
+        // E6: after the assets poll thread is stopped (no more change-tap events), drain whatever is
+        // still dirty so the mirror is current at graceful shutdown.
+        if (balanceReadModelWriter != null) {
+            balanceReadModelWriter.stop();
         }
 
         if (auditLog != null) {

@@ -75,6 +75,13 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
      */
     private volatile HoldSnapshotConsumer holdSnapshotConsumer;
 
+    /**
+     * Optional change-tap on the balance projection (the CQRS PG read-model writer). Fed the absolute
+     * post-change {@code (available, locked)} for every {@code (user, asset)} that mutates on the poll
+     * thread. Volatile: installed once at startup, read on the poll thread. Zero work when unset.
+     */
+    private volatile BalanceChangeConsumer balanceChangeConsumer;
+
     // Anomaly counters (single-writer or monotonic; scraped by metrics).
     private volatile long holdTimeouts;
     private volatile long amendOrphans;
@@ -106,6 +113,24 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
      */
     public void setHoldSnapshotConsumer(final HoldSnapshotConsumer consumer) {
         this.holdSnapshotConsumer = consumer;
+    }
+
+    /**
+     * Install the balance change-tap (the CQRS PG read-model writer). Idempotent; the last consumer
+     * set wins. Passing {@code null} detaches. See {@link BalanceChangeConsumer}. Zero cost when
+     * unset (a single volatile null check on the poll thread).
+     */
+    public void setBalanceChangeConsumer(final BalanceChangeConsumer consumer) {
+        this.balanceChangeConsumer = consumer;
+    }
+
+    /** Forward the projection's absolute post-change values to the change-tap, if one is attached. */
+    private void fireBalanceChange(final long userId, final int assetId, final long available,
+                                   final long locked) {
+        final BalanceChangeConsumer consumer = balanceChangeConsumer;
+        if (consumer != null) {
+            consumer.onBalanceChange(userId, assetId, available, locked);
+        }
     }
 
     /**
@@ -291,6 +316,9 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
         ackedHoldOrderIds.add(orderId);
         // Read-your-hold: the projection reflects the hold BEFORE the waiting caller is released.
         projection.applyHoldDelta(userId, assetId, amount);
+        // Change-tap: the delta case forwards the projection's current absolutes AFTER applying.
+        fireBalanceChange(userId, assetId, projection.available(userId, assetId),
+                projection.locked(userId, assetId));
         completePending(correlationId, Ack.OK);
     }
 
@@ -303,12 +331,16 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
     @Override
     public void onBalanceUpdate(final long userId, final int assetId, final long available, final long locked) {
         projection.set(userId, assetId, available, locked);
+        // Absolute values straight from the AE — forward them verbatim to the change-tap.
+        fireBalanceChange(userId, assetId, available, locked);
     }
 
     @Override
     public void onDepositAck(final long correlationId, final long userId, final int assetId,
                              final long amount, final long newAvailable) {
         projection.setAvailable(userId, assetId, newAvailable);
+        // Deposit never touches locked; forward the new available with the projection's current locked.
+        fireBalanceChange(userId, assetId, newAvailable, projection.locked(userId, assetId));
         completePending(correlationId, new Ack(true, 0, newAvailable));
     }
 
@@ -316,6 +348,8 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
     public void onWithdrawAck(final long correlationId, final long userId, final int assetId,
                               final long amount, final long newAvailable) {
         projection.setAvailable(userId, assetId, newAvailable);
+        // Withdraw never touches locked; forward the new available with the projection's current locked.
+        fireBalanceChange(userId, assetId, newAvailable, projection.locked(userId, assetId));
         completePending(correlationId, new Ack(true, 0, newAvailable));
     }
 
