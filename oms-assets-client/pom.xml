@@ -43,5 +43,21 @@
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- OMS↔AE integration test only: boots a REAL in-process single-node AE cluster
+             (AssetsClusteredService + ClusterConfig) to exercise the real client/store end to end.
+             Test-scoped so the money client's production classpath still depends on assets-common only,
+             never on the heavyweight cluster server module. -->
+        <dependency>
+            <groupId>com.openexchange.assets</groupId>
+            <artifactId>assets-cluster</artifactId>
+            <version>${assets.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- A concrete SLF4J binding so the client/store/cluster logs are visible during the test. -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>
