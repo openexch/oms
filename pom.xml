@@ -15,6 +15,7 @@
     <modules>
         <module>oms-common</module>
         <module>oms-cluster-client</module>
+        <module>oms-assets-client</module>
         <module>oms-risk</module>
         <module>oms-ledger</module>
         <module>oms-core</module>
@@ -31,6 +32,9 @@
 
         <!-- Match engine dependency -->
         <match.version>1.0</match.version>
+
+        <!-- Assets Engine dependency (money-schema v2 SBE codecs, FixedPoint) -->
+        <assets.version>0.1.0-SNAPSHOT</assets.version>
 
         <!-- Aeron (must match match-engine version) -->
         <aeron.version>1.51.0</aeron.version>
@@ -113,6 +117,13 @@
                 <groupId>com.match</groupId>
                 <artifactId>match-common</artifactId>
                 <version>${match.version}</version>
+            </dependency>
+
+            <!-- Assets Engine common (money-schema v2 SBE codecs, FixedPoint, Asset/Market) -->
+            <dependency>
+                <groupId>com.openexchange.assets</groupId>
+                <artifactId>assets-common</artifactId>
+                <version>${assets.version}</version>
             </dependency>
 
             <!-- Aeron -->
