@@ -394,6 +394,11 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         health.put("status", "ok");
         health.put("clusterConnected", orderService.isClusterConnected());
         health.put("activeOrders", orderService.getActiveOrderCount());
+        // E3/E4: only present when an AE-backed balance store is active (null otherwise).
+        Boolean assetsProjectionReady = orderService.isAssetsProjectionReady();
+        if (assetsProjectionReady != null) {
+            health.put("assetsProjectionReady", assetsProjectionReady);
+        }
         sendResponse(rc, HttpResponseStatus.OK, MAPPER.writeValueAsString(health));
     }
 

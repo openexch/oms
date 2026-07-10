@@ -33,6 +33,7 @@ import com.openexchange.oms.cluster.OrderSubmission;
 import com.openexchange.oms.common.domain.Market;
 import com.openexchange.oms.common.domain.OmsOrder;
 import com.openexchange.oms.common.domain.SnowflakeIdGenerator;
+import com.openexchange.oms.common.enums.Asset;
 import com.openexchange.oms.common.enums.OrderSide;
 import com.openexchange.oms.common.enums.OmsOrderStatus;
 import com.openexchange.oms.core.OmsCoreEngine;
@@ -43,6 +44,8 @@ import com.openexchange.oms.ledger.BalanceStore;
 import com.openexchange.oms.ledger.InMemoryBalanceStore;
 import com.openexchange.oms.ledger.LedgerService;
 import com.openexchange.oms.ledger.RedisBalanceStore;
+import com.openexchange.oms.assets.AeronAssetsBalanceStore;
+import com.openexchange.oms.assets.AssetsClusterClient;
 import io.lettuce.core.RedisClient;
 import com.openexchange.oms.persistence.PostgresOrderRepository;
 import com.openexchange.oms.persistence.PostgresExecutionRepository;
@@ -68,6 +71,8 @@ public class OmsApplication {
     private ClusterClient clusterClient;
     private AuditLog auditLog;
     private PrometheusMeterRegistry meterRegistry;
+    /** Only set when {@code OMS_BALANCE_STORE=aeron}; a second, isolated Aeron client (E3/E4). */
+    private AssetsClusterClient assetsClusterClient;
 
     public static void main(String[] args) {
         OmsApplication app = new OmsApplication();
@@ -115,17 +120,89 @@ public class OmsApplication {
             log.warn("PostgreSQL not available — running without persistence: {}", e.getMessage());
         }
 
-        // 2. Create balance store (Redis if available, otherwise in-memory)
+        // 2. Create balance store (E3/E4): explicit selection via OMS_BALANCE_STORE, built and
+        // (for aeron) fully ready BEFORE anything below can serve traffic — a wrong balance is a
+        // wrong dollar, so every failure path here is FATAL rather than a silent fallback.
         BalanceStore balanceStore;
-        try {
-            String redisUri = "redis://" + config.redisHost() + ":" + config.redisPort();
-            RedisClient redisClient = RedisClient.create(redisUri);
-            redisClient.connect().close(); // test connectivity
-            balanceStore = new RedisBalanceStore(redisClient);
-            log.info("Balance store initialized (Redis: {})", redisUri);
-        } catch (Exception e) {
-            log.warn("Redis not available — using in-memory balance store: {}", e.getMessage());
-            balanceStore = new InMemoryBalanceStore();
+        AeronAssetsBalanceStore aeronBalanceStore = null; // non-null only for metrics registration below
+        BalanceStoreKind balanceStoreKind = BalanceStoreKind.fromConfigValue(config.balanceStore());
+        switch (balanceStoreKind) {
+            case REDIS -> {
+                try {
+                    String redisUri = "redis://" + config.redisHost() + ":" + config.redisPort();
+                    RedisClient redisClient = RedisClient.create(redisUri);
+                    redisClient.connect().close(); // test connectivity
+                    balanceStore = new RedisBalanceStore(redisClient);
+                    log.info("Balance store initialized (Redis: {})", redisUri);
+                } catch (Exception e) {
+                    // The old behavior silently fell back to InMemoryBalanceStore here — a standing
+                    // money bug (balances vanish on restart with no operator signal). Redis being
+                    // down at boot is now FATAL; opt into non-durable balances explicitly instead
+                    // (OMS_BALANCE_STORE=memory) if that is really what's wanted.
+                    log.error("FATAL: Redis balance store unavailable at boot ({}:{}) — refusing to "
+                                    + "start with a silent in-memory fallback. Fix Redis, or set "
+                                    + "OMS_BALANCE_STORE=memory to opt into non-durable balances "
+                                    + "explicitly.",
+                            config.redisHost(), config.redisPort(), e);
+                    System.exit(1);
+                    return; // unreachable; satisfies definite-assignment of balanceStore below
+                }
+            }
+            case AERON -> {
+                log.info("Balance store: aeron (Assets Engine cluster)");
+                AssetsClusterClient assetsClient = new AssetsClusterClient();
+                AeronAssetsBalanceStore store = new AeronAssetsBalanceStore(
+                        assetsClient, Asset.values().length, config.aeHoldTimeoutMs(), config.aeAckTimeoutMs());
+                // The store's constructor above already called assetsClient.setEgressListener(store),
+                // so the listener is attached BEFORE polling starts. Ordering this the other way
+                // around (start polling, then construct the store) is a real race, not a theoretical
+                // one: the AE cluster is typically local, and the polling loop's first tryReconnect()
+                // can complete in well under a millisecond — onConnected() would fire with no
+                // listener attached yet, the balance-snapshot bootstrap request would never be sent,
+                // and isProjectionReady() would then wait out the full connect timeout for nothing
+                // (recovering only on a later leader change, if one ever happens).
+                Thread aePollingThread = new Thread(assetsClient::startPolling, "oms-assets-poll");
+                aePollingThread.setDaemon(true);
+                aePollingThread.start();
+                assetsClusterClient = assetsClient; // for graceful shutdown in stop()
+
+                if (!awaitProjectionReady(store, config.aeConnectTimeoutMs())) {
+                    log.error("FATAL: AE balance projection not ready within {}ms — refusing to "
+                                    + "serve traffic against a stale/unknown balance view",
+                            config.aeConnectTimeoutMs());
+                    System.exit(1);
+                    return; // unreachable
+                }
+
+                // Boot-time dedupe floor for the local settle side effects (risk onFill, exec
+                // persist, applyFill) — the AE itself settles money asynchronously off the ME
+                // journal feed, so this floor is what stops the OMS re-applying a trade whose
+                // execution row already made it to Postgres before a restart. PG is therefore
+                // mandatory for this store, unlike the general "PG is optional" posture above.
+                if (executionRepo == null) {
+                    log.error("FATAL: PostgreSQL is unavailable but OMS_BALANCE_STORE=aeron — the "
+                            + "settle dedupe high-water floor (PG max(trade_id)) is money-relevant "
+                            + "and cannot start unseeded.");
+                    System.exit(1);
+                    return; // unreachable
+                }
+                store.initSettleHighWater(executionRepo.maxTradeId());
+
+                balanceStore = store;
+                aeronBalanceStore = store;
+            }
+            case MEMORY -> {
+                log.warn("NON-DURABLE BALANCE STORE (explicit): OMS_BALANCE_STORE=memory — balances "
+                        + "live only in process memory and are LOST on every restart. This is only "
+                        + "for local dev/testing; never run production traffic on it.");
+                balanceStore = new InMemoryBalanceStore();
+            }
+            default -> {
+                log.error("FATAL: unknown OMS_BALANCE_STORE '{}' (expected redis, aeron, or memory)",
+                        config.balanceStore());
+                System.exit(1);
+                return; // unreachable
+            }
         }
 
         // 3. ID generator
@@ -429,6 +506,23 @@ public class OmsApplication {
         FunctionCounter.builder("oms_ledger_oversettle_total", balanceStore, BalanceStore::getOversettleCount)
                 .description("Settlements where locked was under-held and clamped (accounting-invariant break, oms#84)").register(meterRegistry);
 
+        // 12c. AE balance store metrics (E3/E4) — only registered when OMS_BALANCE_STORE=aeron.
+        if (aeronBalanceStore != null) {
+            final AeronAssetsBalanceStore aeStore = aeronBalanceStore;
+            FunctionCounter.builder("oms_assets_hold_timeouts_total", aeStore, AeronAssetsBalanceStore::getHoldTimeouts)
+                    .description("AE hold requests that timed out awaiting HoldAck/HoldReject").register(meterRegistry);
+            FunctionCounter.builder("oms_assets_amend_orphans_total", aeStore, AeronAssetsBalanceStore::getAmendOrphans)
+                    .description("AE amend-delta hold timeouts where the compensator was suppressed (possible transient over-lock until terminal)").register(meterRegistry);
+            FunctionCounter.builder("oms_assets_late_acks_total", aeStore, AeronAssetsBalanceStore::getLateAcks)
+                    .description("AE acks that arrived after their correlation id was already reaped").register(meterRegistry);
+            FunctionCounter.builder("oms_assets_compensators_total", aeStore, AeronAssetsBalanceStore::getCompensatorsSent)
+                    .description("AE compensating releases sent for unknown-outcome holds").register(meterRegistry);
+            Gauge.builder("oms_assets_settle_high_water", aeStore, AeronAssetsBalanceStore::getSettleHighWater)
+                    .description("AE settle-side-effect dedupe high-water tradeId").register(meterRegistry);
+            Gauge.builder("oms_assets_projection_ready", aeStore, s -> s.isProjectionReady() ? 1 : 0)
+                    .description("AE balance projection ready (1) / not ready (0)").register(meterRegistry);
+        }
+
         // 13. gRPC services (created before state listener so push methods can be called)
         GrpcOrderService grpcOrderSvc = new GrpcOrderService(orderService, authorizer, auditLog);
         GrpcAccountService grpcAccountSvc = new GrpcAccountService(orderService, authorizer);
@@ -553,6 +647,30 @@ public class OmsApplication {
         log.info("OMS Application started successfully");
     }
 
+    /**
+     * Poll {@link AeronAssetsBalanceStore#isProjectionReady()} until it flips true or
+     * {@code timeoutMs} elapses. Blocks the caller (the startup thread) so nothing below it in
+     * {@link #start()} — HTTP/gRPC servers included — can run until the balance projection is
+     * bootstrapped, or the process is about to exit fatally.
+     */
+    private static boolean awaitProjectionReady(AeronAssetsBalanceStore store, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (store.isProjectionReady()) {
+                log.info("AE balance projection ready");
+                return true;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("Interrupted while awaiting AE balance projection readiness");
+                return false;
+            }
+        }
+        return store.isProjectionReady(); // one last check in case readiness landed at the wire
+    }
+
     private static AuthenticationProvider buildAuthProvider(OmsConfig config, AuthService demoAuthService) {
         switch (config.authMode()) {
             case "dev":
@@ -597,6 +715,11 @@ public class OmsApplication {
         if (clusterClient != null) {
             clusterClient.stopPolling();
             clusterClient.close();
+        }
+
+        if (assetsClusterClient != null) {
+            assetsClusterClient.stopPolling();
+            assetsClusterClient.close();
         }
 
         if (auditLog != null) {

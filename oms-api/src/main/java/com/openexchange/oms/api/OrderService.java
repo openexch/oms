@@ -44,6 +44,13 @@ public interface OrderService {
 
     int getActiveOrderCount();
 
+    /**
+     * AE-backed balance store's boot-time projection readiness (E3/E4), or {@code null} when a
+     * different {@code BalanceStore} (redis/memory) is active — the health payload surfaces this
+     * field only when non-null so it never falsely implies an AE store is in play.
+     */
+    Boolean isAssetsProjectionReady();
+
     void deposit(long userId, int assetId, long amount);
 
     void withdraw(long userId, int assetId, long amount);

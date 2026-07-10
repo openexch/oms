@@ -77,7 +77,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * detection. A leader change ({@link #onNewLeader}) fires {@link AssetsEgressListener#onReconnected()}
  * so the store above can re-sync balances/holds across the switchover seam.</p>
  */
-public class AssetsClusterClient implements io.aeron.cluster.client.EgressListener, AutoCloseable {
+public class AssetsClusterClient
+        implements AssetsTransport, io.aeron.cluster.client.EgressListener, AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(AssetsClusterClient.class);
 

@@ -43,6 +43,12 @@
             <groupId>com.openexchange.oms</groupId>
             <artifactId>oms-api</artifactId>
         </dependency>
+        <!-- Not in the root dependencyManagement (like oms-assets-client's own oms-ledger dep) -->
+        <dependency>
+            <groupId>com.openexchange.oms</groupId>
+            <artifactId>oms-assets-client</artifactId>
+            <version>${project.version}</version>
+        </dependency>
         <dependency>
             <groupId>com.match</groupId>
             <artifactId>match-common</artifactId>
