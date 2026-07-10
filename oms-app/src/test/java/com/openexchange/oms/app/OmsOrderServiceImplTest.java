@@ -23,6 +23,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -411,6 +413,46 @@ class OmsOrderServiceImplTest {
         Map<String, Object> balances = orderService.getBalances(1L);
         assertEquals(1L, balances.get("userId"));
         assertNotNull(balances.get("assets"));
+    }
+
+    // ---- markets discovery exposes the engine's price band + tick (match#64 pt2) ----
+    //
+    // GET /api/v1/markets now carries tickSize/minPrice/maxPrice sourced from the shared
+    // match-common MarketPriceRules (the same numbers the match engine's PriceRules
+    // enforces). They render as EXACT decimal strings (oms#39), 8dp fixed-point. Pin the
+    // two tick extremes: BTC (1.0) and DOGE (0.0001).
+
+    @Test
+    void testGetMarketsExposesEnginePriceRulesAsDecimalStrings() {
+        List<Map<String, Object>> markets = orderService.getMarkets();
+        assertEquals(Market.ALL.length, markets.size());
+
+        Map<Integer, Map<String, Object>> byId = new HashMap<>();
+        for (Map<String, Object> m : markets) {
+            byId.put((Integer) m.get("marketId"), m);
+        }
+
+        // Field order is stable (LinkedHashMap): identity first, then price rules.
+        Map<String, Object> btc = byId.get(1);
+        assertEquals("BTC-USD", btc.get("symbol"));
+        assertEquals("BTC", btc.get("baseAsset"));
+        assertEquals("USD", btc.get("quoteAsset"));
+        assertEquals("1.00000000", btc.get("tickSize"));
+        assertEquals("50000.00000000", btc.get("minPrice"));
+        assertEquals("150000.00000000", btc.get("maxPrice"));
+
+        Map<String, Object> doge = byId.get(5);
+        assertEquals("DOGE-USD", doge.get("symbol"));
+        assertEquals("0.00010000", doge.get("tickSize"));
+        assertEquals("0.05000000", doge.get("minPrice"));
+        assertEquals("1.00000000", doge.get("maxPrice"));
+
+        // Every market carries the three rule fields as decimal strings.
+        for (Map<String, Object> m : markets) {
+            assertInstanceOf(String.class, m.get("tickSize"), "tickSize must be a decimal string");
+            assertInstanceOf(String.class, m.get("minPrice"), "minPrice must be a decimal string");
+            assertInstanceOf(String.class, m.get("maxPrice"), "maxPrice must be a decimal string");
+        }
     }
 
     @Test

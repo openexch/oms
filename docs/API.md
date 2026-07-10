@@ -88,8 +88,12 @@ scoped **per user across their ACTIVE orders**:
 ### Market price rules
 
 The engine enforces a hard price band and tick size per market; off-tick or
-out-of-band prices are rejected engine-side (see the gap above). Current
-values (`match-cluster` `MarketConfig`, discoverability tracked in match#64):
+out-of-band prices are rejected engine-side (see the gap above). These rules
+are now **served live** by `GET /api/v1/markets` — each market carries
+`tickSize`, `minPrice` and `maxPrice` as exact decimal strings. The numbers
+come from the engine's shared constants (`match-common` `MarketPriceRules`,
+the same values `match-cluster` `MarketConfig`/`PriceRules` enforce), so the
+API can never drift from what the engine rejects on (match#64 pt2).
 
 | Market | id | Range (USD) | Tick |
 |--------|----|-------------|------|
@@ -140,7 +144,7 @@ request/response schemas.
 | `GET` | `/api/v1/accounts/{userId}` | Balances (decimal strings) |
 | `POST` | `/api/v1/accounts/{userId}/deposit` | Credit balance (`{assetId, amount}`) |
 | `POST` | `/api/v1/accounts/{userId}/withdraw` | Debit balance; `400 REJECTED` when exceeding available |
-| `GET` | `/api/v1/markets` | Market list |
+| `GET` | `/api/v1/markets` | Market list incl. `tickSize`/`minPrice`/`maxPrice` (decimal strings, from the engine's shared price rules) |
 | `GET` | `/api/v1/health` | Liveness (no auth) |
 | `GET` | `/metrics` | Prometheus (no auth) |
 | `GET/PUT` | `/api/v1/admin/risk/config[/{marketId}]` | Risk config (ADMIN role) |

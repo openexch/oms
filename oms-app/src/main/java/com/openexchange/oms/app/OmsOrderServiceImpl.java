@@ -2,6 +2,7 @@
 package com.openexchange.oms.app;
 
 import com.match.domain.FixedPoint;
+import com.match.domain.MarketPriceRules;
 import com.openexchange.oms.api.OrderService;
 import com.openexchange.oms.api.dto.*;
 import com.openexchange.oms.cluster.ClusterClient;
@@ -558,6 +559,14 @@ public class OmsOrderServiceImpl implements OrderService {
             mkt.put("symbol", m.symbol());
             mkt.put("baseAsset", m.baseAsset().name());
             mkt.put("quoteAsset", m.quoteAsset().name());
+            // Engine's hard price band + tick, from the shared match-common
+            // MarketPriceRules (enforced by the match engine's PriceRules) so the
+            // discovery surface can never drift from what the engine rejects on
+            // (match#64 pt2). Exact decimal strings on the wire, 8dp (oms#39).
+            MarketPriceRules rules = MarketPriceRules.forId(m.marketId());
+            mkt.put("tickSize", FixedPoint.format(rules.tickSize()));
+            mkt.put("minPrice", FixedPoint.format(rules.minPrice()));
+            mkt.put("maxPrice", FixedPoint.format(rules.maxPrice()));
             markets.add(mkt);
         }
         return markets;
