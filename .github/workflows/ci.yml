@@ -22,6 +22,13 @@ jobs:
           ref: main
           path: _match
 
+      - name: Check out assets (for assets-common/assets-cluster dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: openexch/assets
+          ref: main
+          path: _assets
+
       - name: Set up Java 21
         uses: actions/setup-java@v5
         with:
@@ -31,6 +38,9 @@ jobs:
 
       - name: Install match-common into local Maven repo
         run: mvn -B -f _match/pom.xml install -DskipTests -pl match-common -am
+
+      - name: Install assets modules into local Maven repo
+        run: mvn -B -f _assets/pom.xml install -DskipTests -pl assets-common,assets-cluster -am
 
       - name: Build and test
         run: mvn -B clean verify
@@ -71,6 +81,13 @@ jobs:
           ref: main
           path: _match
 
+      - name: Check out assets (for assets-common/assets-cluster dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: openexch/assets
+          ref: main
+          path: _assets
+
       - name: Set up Java 21
         uses: actions/setup-java@v5
         with:
@@ -88,6 +105,9 @@ jobs:
 
       - name: Build match-cluster jar
         run: mvn -B -f _match/pom.xml install -DskipTests -pl match-cluster -am
+
+      - name: Install assets modules into local Maven repo
+        run: mvn -B -f _assets/pom.xml install -DskipTests -pl assets-common,assets-cluster -am
 
       - name: Build OMS app jar
         run: mvn -B package -DskipTests
