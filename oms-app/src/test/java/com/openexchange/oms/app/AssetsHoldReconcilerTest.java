@@ -382,6 +382,37 @@ class AssetsHoldReconcilerTest {
         assertTrue(store.isProjectionReady());
     }
 
+    @org.junit.jupiter.api.Test
+    void zeroRemainingTombstonesAreIgnoredAtIngest() throws Exception {
+        // Settle-consumed hold records (remaining=0) are AE-side tombstones (assets#5): no money,
+        // not releasable. They must never enter the sweep — during the 2026-07-11 storm 159k of
+        // them drowned the orphan metric. Two identically-classified unknown-aged holds, one a
+        // tombstone: only the money-bearing one may flow to release.
+        reconciler.start();
+        try {
+            makeProjectionReady();
+            long moneyId = idAtMs(baseMs);
+            long tombId = idAtMs(baseMs + 1);
+            clock.set(baseMs + 120_000);
+
+            for (int sweep = 0; sweep < 2; sweep++) { // candidate sweep, then release sweep
+                reconciler.sweep();
+                long corr = transport.lastHoldSnapCorr;
+                store.onHoldSnapshotEntry(tombId, USER, ASSET, 0L);    // tombstone: filtered
+                store.onHoldSnapshotEntry(moneyId, USER, ASSET, 400L); // money-bearing: swept
+                store.onHoldSnapshotEnd(corr, 2);
+                if (sweep == 0) {
+                    awaitUnresolved(1); // ONLY the money-bearing hold was classified
+                }
+            }
+            awaitReleases(1);
+            assertEquals(moneyId, transport.releases.get(0)[0]);
+            assertEquals(1, transport.releases.size()); // the tombstone never released
+        } finally {
+            reconciler.stop();
+        }
+    }
+
     /** Runs a manual sweep and hands the AE's one-entry snapshot answer back through the store. */
     private void driveSweep(long orderId) {
         reconciler.sweep();                         // -> store.requestHoldSnapshot -> fake records corr
