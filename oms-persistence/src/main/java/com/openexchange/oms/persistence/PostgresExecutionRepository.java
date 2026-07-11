@@ -73,9 +73,12 @@ public class PostgresExecutionRepository {
             ps.executeUpdate();
 
         } catch (SQLException e) {
-            log.error("Failed to save execution tradeId={} omsOrderId={}",
-                    execution.getTradeId(), execution.getOmsOrderId(), e);
-            throw new PersistenceException("Failed to save execution", e);
+            // No log here: the FIRST attempt failing is the NORMAL oms#23 FK race (an instant
+            // crossing fill reaching PG before the order row's first upsert) and the caller
+            // recovers it — during the 2026-07-11 storm this line burned thousands of stack
+            // traces per hour for saves that succeeded on retry. The caller logs final failures.
+            throw new PersistenceException("Failed to save execution tradeId="
+                    + execution.getTradeId() + " omsOrderId=" + execution.getOmsOrderId(), e);
         }
     }
 

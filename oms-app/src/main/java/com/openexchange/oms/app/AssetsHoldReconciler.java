@@ -265,6 +265,12 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
     @Override
     public void onHoldSnapshotEntry(final long orderId, final long userId, final int assetId,
                                     final long remaining) {
+        // Zero-remaining records are settle-consumed TOMBSTONES the AE never removes (assets#5):
+        // they hold no money, cannot be released, and at storm scale (150k+) they drown the
+        // orphan metric and the sweep in noise. Money-bearing holds only.
+        if (remaining <= 0) {
+            return;
+        }
         final List<HoldEntry> acc = currentSnapshot;
         if (acc != null) {
             acc.add(new HoldEntry(orderId, userId, assetId, remaining));
