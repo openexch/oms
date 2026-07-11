@@ -500,6 +500,11 @@ public class OmsApplication {
                 .description("OrderStatus seq gaps detected on the egress wire").register(meterRegistry);
         FunctionCounter.builder("oms_egress_trade_gaps_total", egressAdapter, OmsEgressAdapter::getTradeGapCount)
                 .description("TradeExecution id gaps detected on the egress wire").register(meterRegistry);
+        FunctionCounter.builder("oms_egress_late_healed_total", egressAdapter, OmsEgressAdapter::getLateHealedCount)
+                .description("Trades that arrived out of order and healed their pending hole (benign interleave)")
+                .register(meterRegistry);
+        Gauge.builder("oms_egress_pending_holes", egressAdapter, OmsEgressAdapter::getPendingHoleCount)
+                .description("Open tradeId holes awaiting their late trade").register(meterRegistry);
         FunctionCounter.builder("oms_egress_reorder_total", egressAdapter, OmsEgressAdapter::getEgressReorderCount)
                 .description("Layer 2: egress events arriving out of cluster-log order (order key only)").register(meterRegistry);
         Gauge.builder("oms_egress_last_seq", egressAdapter, OmsEgressAdapter::getLastEgressSeq)

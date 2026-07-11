@@ -182,6 +182,36 @@ class AeronAssetsBalanceStoreTest {
     }
 
     @Test
+    void settleAppliesLateOutOfOrderTrades() {
+        // The 2026-07-11 gap storm: per-market flush timers interleave global-dense tradeIds,
+        // so trades routinely arrive a few ids LATE. The old high-water dedupe silently
+        // swallowed every one of them (~16% of all fills). Late-but-new trades must APPLY.
+        store.initSettleHighWater(100L);
+        assertTrue(store.settle(1, 2, 1, 0, 10, 10, 103L)); // jumps ahead
+        assertTrue(store.settle(1, 2, 1, 0, 10, 10, 101L)); // LATE: was swallowed before the fix
+        assertTrue(store.settle(1, 2, 1, 0, 10, 10, 102L)); // LATE: was swallowed before the fix
+        assertFalse(store.settle(1, 2, 1, 0, 10, 10, 101L)); // true duplicate still rejected
+        assertFalse(store.settle(1, 2, 1, 0, 10, 10, 103L)); // true duplicate still rejected
+        assertFalse(store.settle(1, 2, 1, 0, 10, 10, 99L));  // below the boot floor: duplicate
+        assertEquals(103L, store.getSettleHighWater());
+    }
+
+    @Test
+    void settleFloorAdvancesAndKeepsTheDedupSetBounded() {
+        store.initSettleHighWater(0L);
+        final long total = 20_000; // > 2x the window: forces at least one floor advance
+        for (long id = 1; id <= total; id++) {
+            assertTrue(store.settle(1, 2, 1, 0, 10, 10, id), "id " + id + " must apply");
+        }
+        assertEquals(total, store.getSettleHighWater());
+        // Far behind the advanced floor: treated as an already-applied duplicate.
+        assertFalse(store.settle(1, 2, 1, 0, 10, 10, 1L));
+        // Recent ids: still explicitly deduped.
+        assertFalse(store.settle(1, 2, 1, 0, 10, 10, total));
+        assertFalse(store.settle(1, 2, 1, 0, 10, 10, total - 100));
+    }
+
+    @Test
     void releaseAllSendsTheFullResidualSentinelAndSupportsResidualHolds() {
         assertTrue(store.supportsResidualHolds());
         assertTrue(store.releaseAll(7L, 0, 42L));
