@@ -64,6 +64,20 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
 
     /** Settle-side-effect dedupe high-water; single-writer (the OMS cluster-poll thread). */
     private volatile long settleHighWater;
+    /**
+     * Out-of-order settle dedupe (the 2026-07-11 gap storm). tradeId is GLOBAL-dense but each
+     * market flushes egress on its own timer into one queue, so cross-market arrival is routinely
+     * a few ids out of global order. The old {@code tradeId <= settleHighWater} check silently
+     * swallowed every late trade (~16% of all fills: no execution row, no fill accounting).
+     * Now: everything at or below {@code settleFloor} is a known-applied duplicate (boot floor
+     * from PG max(trade_id); failover overlap); above the floor an explicit applied-id set
+     * dedupes, so late arrivals within {@link #SETTLE_WINDOW} ids of the high-water APPLY.
+     * Single-writer (the OMS cluster-poll thread), like the fields above.
+     */
+    private static final long SETTLE_WINDOW = 8_192;
+    private long settleFloor;
+    private final org.agrona.collections.LongHashSet settledAboveFloor =
+            new org.agrona.collections.LongHashSet();
     private volatile boolean projectionReady;
     private volatile long snapshotCorrelationId;
 
@@ -100,6 +114,8 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
     /** Boot-time init from PG max(trade_id): replaces the processed:{tradeId} cross-restart dedupe. */
     public void initSettleHighWater(final long maxAppliedTradeId) {
         this.settleHighWater = maxAppliedTradeId;
+        this.settleFloor = maxAppliedTradeId;
+        this.settledAboveFloor.clear();
         log.info("settle high-water initialized to {}", maxAppliedTradeId);
     }
 
@@ -246,12 +262,26 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
     public boolean settle(final long buyerUserId, final long sellerUserId, final int baseAssetId,
                           final int quoteAssetId, final long baseAmount, final long quoteAmount,
                           final long tradeId) {
-        // Local dedupe only — the AE settles from the ME journal feed. Trades arrive in tradeId
-        // order on the single poll thread; failover overlap re-delivers only <= high-water.
-        if (tradeId <= settleHighWater) {
+        // Local dedupe only — the AE settles from the ME journal feed, so nothing is sent here.
+        // NOT a high-water check: trades arrive slightly out of global-tradeId order by design
+        // (per-market flush timers), and a high-water dedupe swallowed every late fill (the
+        // 2026-07-11 gap storm). Floor + applied-set instead: duplicates (failover overlap,
+        // boot-floor history) still return false; late-but-new trades apply.
+        if (tradeId <= settleFloor || !settledAboveFloor.add(tradeId)) {
             return false;
         }
-        settleHighWater = tradeId;
+        if (tradeId > settleHighWater) {
+            settleHighWater = tradeId;
+        }
+        // Advance the floor lazily so the set stays bounded: everything more than SETTLE_WINDOW
+        // ids behind the high-water is by then either applied or abandoned (a >window-late trade
+        // is treated as a duplicate — same swallow as before, but now only past ~7 minutes of
+        // lateness instead of 20 milliseconds).
+        if (settleHighWater - settleFloor > SETTLE_WINDOW * 2) {
+            final long newFloor = settleHighWater - SETTLE_WINDOW;
+            settledAboveFloor.removeIfLong(id -> id <= newFloor);
+            settleFloor = newFloor;
+        }
         return true;
     }
 

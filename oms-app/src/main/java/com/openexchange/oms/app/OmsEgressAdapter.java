@@ -34,6 +34,31 @@ public class OmsEgressAdapter implements EgressListener {
     private long lastResnapshotRequestMs;
     private static final long RESNAPSHOT_MIN_INTERVAL_MS = 5_000;
 
+    // ---- Out-of-order tolerance for the tradeId detector (the 2026-07-11 gap storm) ----
+    // tradeId is GLOBAL-dense, but each market flushes its egress on an independent ~20ms timer
+    // into one shared queue, so cross-market arrival is routinely a few ids out of global order.
+    // A jump past lastTradeId+1 therefore opens PENDING holes rather than counting a gap: the
+    // late trade arriving heals its hole (normal, counted in lateHealedCount); only a hole that
+    // survives HOLE_PATIENCE_MS is a real loss — counted in tradeGapCount + snapshot repair.
+    /** How long a tradeId hole may stay open before it is declared a real gap. */
+    private static final long HOLE_PATIENCE_MS = 2_000;
+    /** Jump size past which holes are not tracked individually (mass shed / seam): gap immediately. */
+    private static final long MAX_TRACKED_HOLE_JUMP = 10_000;
+    /** Expiry scan cadence; the map stays tiny (holes usually heal within one flush interval). */
+    private static final long HOLE_EXPIRY_CHECK_INTERVAL_MS = 250;
+    /** Open holes: missing tradeId -> deadline millis; MISSING (-1) = not a pending hole. */
+    private final Long2LongHashMap pendingTradeHoles = new Long2LongHashMap(-1L);
+    private long lateHealedCount;
+    private long nextHoleExpiryCheckMs;
+    private long holePatienceMs = HOLE_PATIENCE_MS;
+    private long holeExpiryCheckIntervalMs = HOLE_EXPIRY_CHECK_INTERVAL_MS;
+
+    /** Test hook: shrink the hole-expiry timings so unit tests need no multi-second sleeps. */
+    void tuneHoleTrackingForTest(final long patienceMs, final long checkIntervalMs) {
+        this.holePatienceMs = patienceMs;
+        this.holeExpiryCheckIntervalMs = checkIntervalMs;
+    }
+
     // ---- Layer 2 (match#): egressSeq reorder metric ----
     // egressSeq is the Aeron cluster-log position of the ingress command that produced the event:
     // monotonic non-decreasing in log order, but SPARSE (gaps are normal) and NON-UNIQUE (all
@@ -75,6 +100,16 @@ public class OmsEgressAdapter implements EgressListener {
         return tradeGapCount;
     }
 
+    /** Trades that arrived out of order and healed their pending hole (benign interleave) — for /metrics. */
+    public long getLateHealedCount() {
+        return lateHealedCount;
+    }
+
+    /** Currently-open tradeId holes awaiting their late trade — for /metrics. */
+    public long getPendingHoleCount() {
+        return pendingTradeHoles.size();
+    }
+
     /** Layer 2: times a non-zero egressSeq arrived out of log order (a wire reorder) — for /metrics. */
     public long getEgressReorderCount() {
         return reorderCount;
@@ -110,21 +145,65 @@ public class OmsEgressAdapter implements EgressListener {
                                   long egressSeq) {
         trackEgressSeq(egressSeq); // Layer 2: order-key reorder metric (order-key only; not gap detection)
         marketDataProvider.updateLastTrade(marketId, price);
-        // tradeIds are globally monotonic and gap-free from the engine: a gap on
-        // the wire means TradeExecutions were shed. Fills cannot be conjured back,
-        // but terminality can converge — trigger the membership repair (match#31).
-        if (lastTradeId > 0 && tradeId > lastTradeId + 1) {
-            tradeGapCount += tradeId - lastTradeId - 1;
-            log.warn("TradeExecution gap: lastTradeId={} received={} (missing {}); requesting open-orders snapshot",
-                    lastTradeId, tradeId, tradeId - lastTradeId - 1);
-            requestOpenOrdersResnapshot("tradeId gap");
+        // tradeIds are globally monotonic and gap-free FROM THE ENGINE, but not in arrival order:
+        // per-market flush timers interleave them by a few ids constantly. So a jump opens
+        // pending holes; a hole healed by its late trade is normal, and only a hole that outlives
+        // HOLE_PATIENCE_MS means TradeExecutions were truly shed. Fills cannot be conjured back,
+        // but terminality can converge — the expiry triggers the membership repair (match#31).
+        final long nowMs = System.currentTimeMillis();
+        if (pendingTradeHoles.remove(tradeId) != -1L) {
+            lateHealedCount++; // an expected out-of-order arrival, not a gap
+        } else if (lastTradeId > 0 && tradeId > lastTradeId + 1) {
+            final long missing = tradeId - lastTradeId - 1;
+            if (missing > MAX_TRACKED_HOLE_JUMP) {
+                // Mass shed or a seam artifact: don't build a huge hole map — count and repair now.
+                tradeGapCount += missing;
+                log.warn("TradeExecution gap (untracked mass jump): lastTradeId={} received={} (missing {}); "
+                        + "requesting open-orders snapshot", lastTradeId, tradeId, missing);
+                requestOpenOrdersResnapshot("tradeId mass gap");
+            } else {
+                final long deadline = nowMs + holePatienceMs;
+                for (long id = lastTradeId + 1; id < tradeId; id++) {
+                    pendingTradeHoles.put(id, deadline);
+                }
+            }
         }
         if (tradeId > lastTradeId) {
             lastTradeId = tradeId;
         }
+        expirePendingHoles(nowMs);
         coreEngine.onTradeExecution(marketId, tradeId, takerOrderId, makerOrderId,
                 takerUserId, makerUserId, price, quantity, takerIsBuy,
                 takerOmsOrderId, makerOmsOrderId, egressSeq);
+    }
+
+    /**
+     * Declare every pending hole past its deadline a real gap (count + snapshot repair). Runs at
+     * most every {@link #HOLE_EXPIRY_CHECK_INTERVAL_MS} on the polling thread; the map holds the
+     * handful of in-flight interleave holes, so the scan is trivially cheap.
+     */
+    private void expirePendingHoles(final long nowMs) {
+        if (nowMs < nextHoleExpiryCheckMs || pendingTradeHoles.isEmpty()) {
+            return;
+        }
+        nextHoleExpiryCheckMs = nowMs + holeExpiryCheckIntervalMs;
+        long expired = 0;
+        long exampleId = 0;
+        final var it = pendingTradeHoles.entrySet().iterator();
+        while (it.hasNext()) {
+            final var entry = it.next();
+            if (entry.getValue() <= nowMs) {
+                exampleId = entry.getKey();
+                it.remove();
+                expired++;
+            }
+        }
+        if (expired > 0) {
+            tradeGapCount += expired;
+            log.warn("TradeExecution gap: {} hole(s) unhealed after {}ms (e.g. tradeId={}); "
+                    + "requesting open-orders snapshot", expired, holePatienceMs, exampleId);
+            requestOpenOrdersResnapshot("tradeId gap");
+        }
     }
 
     @Override
@@ -303,6 +382,7 @@ public class OmsEgressAdapter implements EgressListener {
     private void rebaselineAndRepair() {
         lastStatusSeq.clear();
         lastTradeId = 0;
+        pendingTradeHoles.clear(); // holes from the old seam's id space are meaningless now
         lastResnapshotRequestMs = 0; // seams always repair, regardless of rate limit
         requestOpenOrdersResnapshot("session seam");
     }

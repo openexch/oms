@@ -120,4 +120,77 @@ class OmsEgressAdapterTest {
         // 254 is the last non-null code (255 is the SBE null, normalized to -1 upstream).
         assertEquals("ENGINE_REJECT_254", OmsEgressAdapter.mapRejectReason(254));
     }
+
+    // ---- Out-of-order tolerance for the tradeId gap detector (the 2026-07-11 gap storm) ----
+    // tradeId is GLOBAL-dense but per-market flush timers interleave arrival by a few ids
+    // constantly. The detector must treat a healed hole as normal (lateHealed), and only an
+    // unhealed hole as a real gap.
+
+    /** Drive one trade egress with an EXPLICIT tradeId (egressSeq 0 keeps the Layer-2 metric out). */
+    private static void tradeId(OmsEgressAdapter a, long tradeId) {
+        a.onTradeExecution(1, tradeId, 1L, 2L, 1L, 2L, 1L, 1L, true, 0L, 0L, 0L);
+    }
+
+    @Test
+    void interleavedArrivalHealsHolesWithoutCountingGaps() {
+        OmsEgressAdapter a = newAdapter();
+        tradeId(a, 1);
+        tradeId(a, 2);
+        tradeId(a, 4); // opens hole 3 (cross-market interleave)
+        tradeId(a, 3); // heals it
+        tradeId(a, 5);
+        assertEquals(0L, a.getTradeGapCount());
+        assertEquals(1L, a.getLateHealedCount());
+        assertEquals(0L, a.getPendingHoleCount());
+    }
+
+    @Test
+    void multiHoleJumpHealsInAnyOrder() {
+        OmsEgressAdapter a = newAdapter();
+        tradeId(a, 10);
+        tradeId(a, 14); // holes 11,12,13
+        assertEquals(3L, a.getPendingHoleCount());
+        tradeId(a, 12);
+        tradeId(a, 11);
+        tradeId(a, 13);
+        assertEquals(0L, a.getTradeGapCount());
+        assertEquals(3L, a.getLateHealedCount());
+        assertEquals(0L, a.getPendingHoleCount());
+    }
+
+    @Test
+    void unhealedHoleExpiresIntoAGap() throws InterruptedException {
+        OmsEgressAdapter a = newAdapter();
+        a.tuneHoleTrackingForTest(30, 5);
+        tradeId(a, 1);
+        tradeId(a, 3); // hole 2 never arrives
+        assertEquals(1L, a.getPendingHoleCount());
+        assertEquals(0L, a.getTradeGapCount());
+        Thread.sleep(60);
+        tradeId(a, 4); // next arrival runs the expiry scan
+        assertEquals(1L, a.getTradeGapCount());
+        assertEquals(0L, a.getPendingHoleCount());
+        assertEquals(0L, a.getLateHealedCount());
+    }
+
+    @Test
+    void massJumpCountsImmediatelyWithoutTrackingHoles() {
+        OmsEgressAdapter a = newAdapter();
+        tradeId(a, 1);
+        tradeId(a, 20_000); // 19,998 missing > MAX_TRACKED_HOLE_JUMP
+        assertEquals(19_998L, a.getTradeGapCount());
+        assertEquals(0L, a.getPendingHoleCount());
+    }
+
+    @Test
+    void duplicateRedeliveryNeitherHealsNorCounts() {
+        OmsEgressAdapter a = newAdapter();
+        tradeId(a, 1);
+        tradeId(a, 2);
+        tradeId(a, 3);
+        tradeId(a, 2); // failover overlap redelivery: not a hole, not a gap
+        assertEquals(0L, a.getTradeGapCount());
+        assertEquals(0L, a.getLateHealedCount());
+        assertEquals(0L, a.getPendingHoleCount());
+    }
 }

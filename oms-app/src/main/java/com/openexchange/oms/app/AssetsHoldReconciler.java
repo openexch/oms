@@ -12,8 +12,10 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -291,12 +293,24 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
 
     // ==================== predicate + release (scheduler thread) ====================
 
+    /** Per-sweep exemplar budget for the aggregated SURFACE/PENDING/candidate classes. */
+    private static final int LOG_EXEMPLARS_PER_SWEEP = 3;
+
     void processSnapshot(final List<HoldEntry> entries) {
         final long now = clock.millis();
         final Set<Long> newCandidates = new HashSet<>();
         long unresolved = 0;
         long released = 0;
         long activeLegit = 0;
+        // The steady-state classes (SURFACE/PENDING/first-observation) are AGGREGATED: with a
+        // large orphan backlog the old per-hold line logged every orphan every sweep — 13M+
+        // lines/hour, ~1MB/s of disk (the 2026-07-11 storm). A few exemplars + per-reason counts
+        // carry the same diagnostic signal. RELEASED and back-pressure stay per-hold (rare, and
+        // each one is a money-state action that must be individually auditable).
+        long surfaced = 0;
+        long pending = 0;
+        long firstObservations = 0;
+        final Map<String, Long> unresolvedByReason = new HashMap<>();
 
         for (HoldEntry h : entries) {
             final Decision d = classify(h, now);
@@ -329,30 +343,44 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
                         // First eligible observation -> hold as a candidate for the next sweep.
                         newCandidates.add(h.orderId());
                         unresolved++;
-                        log.info("Orphan hold candidate (1st confirmed observation, releases next sweep if "
-                                        + "still present): orderId={} user={} asset={} remaining={} reason={}",
-                                h.orderId(), h.userId(), h.assetId(), h.remaining(), d.reason());
+                        firstObservations++;
+                        if (firstObservations <= LOG_EXEMPLARS_PER_SWEEP) {
+                            log.info("Orphan hold candidate (1st confirmed observation, releases next sweep if "
+                                            + "still present): orderId={} user={} asset={} remaining={} reason={}",
+                                    h.orderId(), h.userId(), h.assetId(), h.remaining(), d.reason());
+                        }
                     }
                 }
                 case SURFACE -> {
                     unresolved++;
-                    log.warn("Orphan hold UNRESOLVED (not provably releasable — surfaced for a human): "
-                                    + "orderId={} user={} asset={} remaining={} reason={}",
-                            h.orderId(), h.userId(), h.assetId(), h.remaining(), d.reason());
+                    surfaced++;
+                    unresolvedByReason.merge(d.reason(), 1L, Long::sum);
+                    if (surfaced <= LOG_EXEMPLARS_PER_SWEEP) {
+                        log.warn("Orphan hold UNRESOLVED (not provably releasable — surfaced for a human): "
+                                        + "orderId={} user={} asset={} remaining={} reason={}",
+                                h.orderId(), h.userId(), h.assetId(), h.remaining(), d.reason());
+                    }
                 }
                 case PENDING -> {
                     unresolved++;
-                    log.info("Orphan hold pending (not yet release-eligible): orderId={} user={} asset={} "
-                                    + "remaining={} reason={}",
-                            h.orderId(), h.userId(), h.assetId(), h.remaining(), d.reason());
+                    pending++;
+                    if (pending <= LOG_EXEMPLARS_PER_SWEEP) {
+                        log.info("Orphan hold pending (not yet release-eligible): orderId={} user={} asset={} "
+                                        + "remaining={} reason={}",
+                                h.orderId(), h.userId(), h.assetId(), h.remaining(), d.reason());
+                    }
                 }
             }
         }
 
         this.priorCandidates = newCandidates;
         this.unresolvedOrphansLastSweep = unresolved;
-        log.info("Orphan-hold sweep processed {} holds: {} live, {} released, {} unresolved, {} candidates carried",
-                entries.size(), activeLegit, released, unresolved, newCandidates.size());
+        log.info("Orphan-hold sweep processed {} holds: {} live, {} released, {} unresolved "
+                        + "({} surfaced, {} pending, {} first-observations; exemplars capped at {}/class), "
+                        + "{} candidates carried; surfaced by reason: {}",
+                entries.size(), activeLegit, released, unresolved,
+                surfaced, pending, firstObservations, LOG_EXEMPLARS_PER_SWEEP,
+                newCandidates.size(), unresolvedByReason);
     }
 
     /**
