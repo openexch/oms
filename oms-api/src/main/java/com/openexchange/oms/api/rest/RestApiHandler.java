@@ -84,6 +84,18 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
                 return t;
             });
 
+    // Risk-config/breaker persists do JDBC, so they hop here (same pattern as
+    // AUTH_EXECUTOR). The in-memory apply happens first on the event loop; the
+    // response is sent only after the persist attempt so the caller learns
+    // whether the change is durable ("persisted": true/false). Single thread:
+    // persists for the same market stay ordered.
+    private static final java.util.concurrent.ExecutorService RISK_PERSIST_EXECUTOR =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "oms-risk-persist");
+                t.setDaemon(true);
+                return t;
+            });
+
     /**
      * Per-request state carried through the response writers. Under keep-alive
      * one handler instance serves many requests, so the Origin (for CORS) and
@@ -775,10 +787,19 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         adminService.updateRiskConfig(marketId, fields);
         audit(rc, "admin.risk.update", "market:" + marketId, true, String.valueOf(fields.keySet()));
 
-        ObjectNode resp = MAPPER.createObjectNode();
-        resp.put("success", true);
-        resp.put("marketId", marketId);
-        sendResponse(rc, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
+        RISK_PERSIST_EXECUTOR.execute(() -> {
+            try {
+                boolean persisted = adminService.persistRiskConfig(marketId);
+                ObjectNode resp = MAPPER.createObjectNode();
+                resp.put("success", true);
+                resp.put("marketId", marketId);
+                resp.put("persisted", persisted);
+                sendResponse(rc, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
+            } catch (Exception e) {
+                log.error("Risk config persist dispatch failed for market {}", marketId, e);
+                sendError(rc, HttpResponseStatus.INTERNAL_SERVER_ERROR, ERR_INTERNAL, rootMessage(e));
+            }
+        });
     }
 
     private void handleCircuitBreaker(RequestContext rc, String uri) throws Exception {
@@ -793,21 +814,33 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         int marketId = Integer.parseInt(parts[0]);
         String action = parts[1];
 
+        final boolean tripped;
         if ("trip".equals(action)) {
-            adminService.tripCircuitBreaker(marketId);
+            adminService.tripCircuitBreaker(marketId); // this endpoint is the manual path
+            tripped = true;
         } else if ("reset".equals(action)) {
             adminService.resetCircuitBreaker(marketId);
+            tripped = false;
         } else {
             sendError(rc, HttpResponseStatus.BAD_REQUEST, ERR_VALIDATION, "Unknown action: " + action);
             return;
         }
         audit(rc, "admin.circuit-breaker", "market:" + marketId, true, action);
 
-        ObjectNode resp = MAPPER.createObjectNode();
-        resp.put("success", true);
-        resp.put("marketId", marketId);
-        resp.put("action", action);
-        sendResponse(rc, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
+        RISK_PERSIST_EXECUTOR.execute(() -> {
+            try {
+                boolean persisted = adminService.persistManualTrip(marketId, tripped);
+                ObjectNode resp = MAPPER.createObjectNode();
+                resp.put("success", true);
+                resp.put("marketId", marketId);
+                resp.put("action", action);
+                resp.put("persisted", persisted);
+                sendResponse(rc, HttpResponseStatus.OK, MAPPER.writeValueAsString(resp));
+            } catch (Exception e) {
+                log.error("Circuit-breaker persist dispatch failed for market {}", marketId, e);
+                sendError(rc, HttpResponseStatus.INTERNAL_SERVER_ERROR, ERR_INTERNAL, rootMessage(e));
+            }
+        });
     }
 
     private void sendResponse(RequestContext rc, HttpResponseStatus status, String json) {

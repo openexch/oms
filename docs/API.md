@@ -147,8 +147,8 @@ request/response schemas.
 | `GET` | `/api/v1/markets` | Market list incl. `tickSize`/`minPrice`/`maxPrice` (decimal strings, from the engine's shared price rules) |
 | `GET` | `/api/v1/health` | Liveness (no auth) |
 | `GET` | `/metrics` | Prometheus (no auth) |
-| `GET/PUT` | `/api/v1/admin/risk/config[/{marketId}]` | Risk config (ADMIN role) |
-| `POST` | `/api/v1/admin/risk/circuit-breaker/{marketId}/{trip\|reset}` | Circuit breaker (ADMIN role) |
+| `GET/PUT` | `/api/v1/admin/risk/config[/{marketId}]` | Risk config (ADMIN role); PUT survives restarts when Postgres is configured and reports `persisted` in the response |
+| `POST` | `/api/v1/admin/risk/circuit-breaker/{marketId}/{trip\|reset}` | Circuit breaker (ADMIN role); manual trips survive restarts, response reports `persisted` |
 
 Order statuses: `PENDING_RISK → PENDING_HOLD → PENDING_NEW → NEW →
 PARTIALLY_FILLED → FILLED | CANCELLED | REJECTED` (+ `PENDING_TRIGGER` for

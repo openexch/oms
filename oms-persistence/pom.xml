@@ -20,8 +20,16 @@
             <artifactId>oms-common</artifactId>
         </dependency>
         <dependency>
+            <groupId>com.openexchange.oms</groupId>
+            <artifactId>oms-risk</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.lettuce</groupId>
             <artifactId>lettuce-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
         </dependency>
         <dependency>
             <groupId>org.postgresql</groupId>

@@ -63,6 +63,10 @@ public final class RiskEngine {
     // by the risk-check thread. Visibility is guaranteed by the happens-before from the volatile
     // circuitBreakerGeneration fence.
     private final boolean[] circuitBreakerTripped;
+    // Parallel flag: true only when the trip came from an operator (admin endpoint or
+    // boot re-arm). Manual trips are persisted and survive restart; automatic
+    // (price-move) trips do not. Published via the same generation fence.
+    private final boolean[] circuitBreakerManual;
     @SuppressWarnings("unused")
     private volatile long circuitBreakerGeneration;
 
@@ -122,6 +126,7 @@ public final class RiskEngine {
 
         this.rateLimitStates = new Long2ObjectHashMap<>();
         this.circuitBreakerTripped = new boolean[maxMarkets];
+        this.circuitBreakerManual = new boolean[maxMarkets];
         this.openOrderCounts = new Long2LongHashMap(MISSING_VALUE);
         this.userPositions = new Long2ObjectHashMap<>();
     }
@@ -285,6 +290,7 @@ public final class RiskEngine {
     /**
      * Trip the circuit breaker for a market. Called externally when price
      * move exceeds the configured threshold within the observation window.
+     * Automatic trips are not durable and do not clear a standing manual trip.
      */
     public void tripCircuitBreaker(int marketId) {
         circuitBreakerTripped[marketId] = true;
@@ -293,11 +299,25 @@ public final class RiskEngine {
     }
 
     /**
+     * Trip the circuit breaker for a market by operator action (admin endpoint
+     * or boot re-arm of a persisted trip). Unlike automatic trips, manual trips
+     * are persisted and stay tripped across restarts until an operator resets.
+     */
+    public void tripCircuitBreakerManual(int marketId) {
+        circuitBreakerTripped[marketId] = true;
+        circuitBreakerManual[marketId] = true;
+        circuitBreakerGeneration++; // volatile write, publishes both array element stores
+        log.warn("Circuit breaker manually tripped for market {}", marketId);
+    }
+
+    /**
      * Reset the circuit breaker for a market, allowing orders to flow again.
+     * Clears the manual flag too: a reset is always an operator decision.
      */
     public void resetCircuitBreaker(int marketId) {
         circuitBreakerTripped[marketId] = false;
-        circuitBreakerGeneration++; // volatile write — publishes the array element store
+        circuitBreakerManual[marketId] = false;
+        circuitBreakerGeneration++; // volatile write, publishes both array element stores
         log.info("Circuit breaker reset for market {}", marketId);
     }
 
@@ -306,6 +326,14 @@ public final class RiskEngine {
      */
     public boolean isCircuitBreakerTripped(int marketId) {
         return circuitBreakerTripped[marketId];
+    }
+
+    /**
+     * Query whether the current trip (if any) was manual. Only manual trips
+     * are persisted for re-arm after restart.
+     */
+    public boolean isCircuitBreakerManuallyTripped(int marketId) {
+        return circuitBreakerManual[marketId];
     }
 
     // -- Check 3: Order Size Limits --
@@ -613,6 +641,7 @@ public final class RiskEngine {
         userPositions.clear();
         for (int i = 0; i < maxMarkets; i++) {
             circuitBreakerTripped[i] = false;
+            circuitBreakerManual[i] = false;
         }
     }
 
