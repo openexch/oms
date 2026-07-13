@@ -4,32 +4,25 @@ package com.openexchange.oms.ledger;
 import com.match.domain.FixedPoint;
 import com.openexchange.oms.common.domain.Market;
 import com.openexchange.oms.common.domain.OmsOrder;
-import com.openexchange.oms.common.domain.SnowflakeIdGenerator;
-import com.openexchange.oms.common.enums.LedgerEntryType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-
 /**
- * Orchestrates ledger operations, coordinating between the {@link BalanceStore} and
- * the double-entry accounting log ({@link LedgerEntry}).
+ * Orchestrates ledger operations against the {@link BalanceStore}.
  * <p>
- * Each operation mutates balances in the store and returns a list of {@link LedgerEntry}
- * records for the persistence layer to batch-write to the journal.
+ * Each operation mutates balances in the store and reports whether the mutation
+ * was applied. The Assets Engine is the book of record for money movements; the
+ * old derived double-entry journal this service used to emit was never persisted
+ * anywhere and has been removed.
  */
 public class LedgerService {
 
     private static final Logger log = LoggerFactory.getLogger(LedgerService.class);
 
     private final BalanceStore balanceStore;
-    private final SnowflakeIdGenerator idGenerator;
 
-    public LedgerService(BalanceStore balanceStore, SnowflakeIdGenerator idGenerator) {
+    public LedgerService(BalanceStore balanceStore) {
         this.balanceStore = balanceStore;
-        this.idGenerator = idGenerator;
     }
 
     /**
@@ -39,9 +32,10 @@ public class LedgerService {
      * Sell orders hold base asset: {@code quantity}.
      *
      * @param order the order to hold funds for
-     * @return ledger entries (debit available, credit locked), or empty list if hold failed
+     * @return true if the hold was placed; false if it failed (insufficient
+     *         balance, non-positive or overflowing hold amount)
      */
-    public List<LedgerEntry> holdForOrder(OmsOrder order) {
+    public boolean holdForOrder(OmsOrder order) {
         Market market = Market.fromId(order.getMarketId());
         int holdAssetId;
         long holdAmount;
@@ -56,7 +50,7 @@ public class LedgerService {
             } catch (ArithmeticException e) {
                 log.error("Hold amount overflows fixed-point: orderId={}, price={}, qty={}",
                         order.getOmsOrderId(), order.getPrice(), order.getQuantity());
-                return Collections.emptyList();
+                return false;
             }
         } else {
             // Sell: hold base asset (quantity)
@@ -67,7 +61,7 @@ public class LedgerService {
         if (holdAmount <= 0) {
             log.error("Calculated hold amount is non-positive: orderId={}, holdAmount={}",
                     order.getOmsOrderId(), holdAmount);
-            return Collections.emptyList();
+            return false;
         }
 
         // Synthetic parents (iceberg/stop/trailing) own their terminal release OMS-side: their
@@ -77,33 +71,14 @@ public class LedgerService {
         if (!success) {
             log.warn("Hold failed for order: orderId={}, userId={}, assetId={}, amount={}",
                     order.getOmsOrderId(), order.getUserId(), holdAssetId, holdAmount);
-            return Collections.emptyList();
+            return false;
         }
 
         // Update order with hold metadata
         order.setHoldAmount(holdAmount);
 
-        long now = System.currentTimeMillis();
-        long journalId = idGenerator.nextId();
-
-        List<LedgerEntry> entries = new ArrayList<>(2);
-
-        // Debit: decrease available
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), journalId,
-                order.getUserId(), holdAssetId, holdAmount,
-                LedgerEntryType.ORDER_HOLD, true,
-                order.getOmsOrderId(), now));
-
-        // Credit: increase locked
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), journalId,
-                order.getUserId(), holdAssetId, holdAmount,
-                LedgerEntryType.ORDER_HOLD, false,
-                order.getOmsOrderId(), now));
-
         log.debug("Hold created: orderId={}, assetId={}, amount={}", order.getOmsOrderId(), holdAssetId, holdAmount);
-        return entries;
+        return true;
     }
 
     /**
@@ -132,9 +107,9 @@ public class LedgerService {
      * Runs at amend submit — this is the amend's funds check: an under-funded amend is
      * rejected here before anything reaches the cluster.
      *
-     * @return ledger entries, or empty list when the user lacks available funds
+     * @return true if the incremental hold was placed; false when the user lacks available funds
      */
-    public List<LedgerEntry> holdAmendDelta(OmsOrder order, long delta) {
+    public boolean holdAmendDelta(OmsOrder order, long delta) {
         return moveAmendDelta(order, delta, true);
     }
 
@@ -143,13 +118,13 @@ public class LedgerService {
      * back {@link #holdAmendDelta} when the amend fails (oms#67). Runs at resolution or
      * abort — never at submit, where the amend could still fail.
      */
-    public List<LedgerEntry> releaseAmendDelta(OmsOrder order, long amount) {
+    public boolean releaseAmendDelta(OmsOrder order, long amount) {
         return moveAmendDelta(order, amount, false);
     }
 
-    private List<LedgerEntry> moveAmendDelta(OmsOrder order, long amount, boolean hold) {
+    private boolean moveAmendDelta(OmsOrder order, long amount, boolean hold) {
         if (amount <= 0) {
-            return Collections.emptyList();
+            return false;
         }
         Market market = Market.fromId(order.getMarketId());
         int holdAssetId = order.isBuy() ? market.quoteAsset().id() : market.baseAsset().id();
@@ -161,28 +136,12 @@ public class LedgerService {
             log.warn("Amend hold {} failed: orderId={}, userId={}, assetId={}, amount={}",
                     hold ? "increase" : "release", order.getOmsOrderId(), order.getUserId(),
                     holdAssetId, amount);
-            return Collections.emptyList();
+            return false;
         }
-
-        long now = System.currentTimeMillis();
-        long journalId = idGenerator.nextId();
-        LedgerEntryType type = hold ? LedgerEntryType.ORDER_HOLD : LedgerEntryType.ORDER_RELEASE;
-
-        List<LedgerEntry> entries = new ArrayList<>(2);
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), journalId,
-                order.getUserId(), holdAssetId, amount,
-                type, true,
-                order.getOmsOrderId(), now));
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), journalId,
-                order.getUserId(), holdAssetId, amount,
-                type, false,
-                order.getOmsOrderId(), now));
 
         log.debug("Amend hold {}: orderId={}, assetId={}, amount={}",
                 hold ? "increase" : "release", order.getOmsOrderId(), holdAssetId, amount);
-        return entries;
+        return true;
     }
 
     /**
@@ -249,9 +208,9 @@ public class LedgerService {
      * For sell orders: {@code remainingQty}.
      *
      * @param order the cancelled order
-     * @return ledger entries (debit locked, credit available), or empty list if nothing to release
+     * @return true if funds were released; false if there was nothing to release or the release failed
      */
-    public List<LedgerEntry> releaseForCancel(OmsOrder order) {
+    public boolean releaseForCancel(OmsOrder order) {
         Market market = Market.fromId(order.getMarketId());
         int holdAssetId;
         long releaseAmount;
@@ -272,7 +231,7 @@ public class LedgerService {
 
         if (releaseAmount <= 0) {
             log.debug("Nothing to release for order: orderId={}", order.getOmsOrderId());
-            return Collections.emptyList();
+            return false;
         }
 
         // Residual-hold stores (the Assets Engine) know the exact remaining reservation — release
@@ -284,30 +243,11 @@ public class LedgerService {
         if (!success) {
             log.error("Release failed for order: orderId={}, userId={}, assetId={}, amount={}",
                     order.getOmsOrderId(), order.getUserId(), holdAssetId, releaseAmount);
-            return Collections.emptyList();
+            return false;
         }
 
-        long now = System.currentTimeMillis();
-        long journalId = idGenerator.nextId();
-
-        List<LedgerEntry> entries = new ArrayList<>(2);
-
-        // Debit: decrease locked
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), journalId,
-                order.getUserId(), holdAssetId, releaseAmount,
-                LedgerEntryType.ORDER_RELEASE, true,
-                order.getOmsOrderId(), now));
-
-        // Credit: increase available
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), journalId,
-                order.getUserId(), holdAssetId, releaseAmount,
-                LedgerEntryType.ORDER_RELEASE, false,
-                order.getOmsOrderId(), now));
-
         log.debug("Release completed: orderId={}, assetId={}, amount={}", order.getOmsOrderId(), holdAssetId, releaseAmount);
-        return entries;
+        return true;
     }
 
     /**
@@ -324,13 +264,13 @@ public class LedgerService {
      * @param quantity         execution quantity (fixed-point)
      * @param takerOmsOrderId  taker's OMS order ID
      * @param makerOmsOrderId  maker's OMS order ID
-     * @return ledger entries for both sides of the trade; an EMPTY list if the trade was a duplicate
-     *         (already-seen tradeId) or had invalid amounts. Callers use emptiness to detect that the
-     *         trade was NOT newly applied and must skip fill/risk side effects.
+     * @return true if the trade was newly applied; false if it was a duplicate (already-seen
+     *         tradeId) or had invalid amounts. Callers use this to detect that the trade was
+     *         NOT newly applied and must skip fill/risk side effects.
      */
-    public List<LedgerEntry> settleTradeExecution(long tradeId, long buyerUserId, long sellerUserId,
-                                                   int marketId, long price, long quantity,
-                                                   long takerOmsOrderId, long makerOmsOrderId) {
+    public boolean settleTradeExecution(long tradeId, long buyerUserId, long sellerUserId,
+                                        int marketId, long price, long quantity,
+                                        long takerOmsOrderId, long makerOmsOrderId) {
         Market market = Market.fromId(marketId);
         int baseAssetId = market.baseAsset().id();
         int quoteAssetId = market.quoteAsset().id();
@@ -341,7 +281,7 @@ public class LedgerService {
         if (baseAmount <= 0 || quoteAmount <= 0) {
             log.error("Invalid trade amounts: tradeId={}, baseAmount={}, quoteAmount={}",
                     tradeId, baseAmount, quoteAmount);
-            return Collections.emptyList();
+            return false;
         }
 
         // Idempotent on tradeId: the cluster re-delivers egress on leader switchover, so the same
@@ -349,50 +289,13 @@ public class LedgerService {
         boolean applied = balanceStore.settle(buyerUserId, sellerUserId, baseAssetId, quoteAssetId,
                 baseAmount, quoteAmount, tradeId);
         if (!applied) {
-            log.debug("Duplicate trade ignored (no ledger entries): tradeId={}", tradeId);
-            return Collections.emptyList();
+            log.debug("Duplicate trade ignored: tradeId={}", tradeId);
+            return false;
         }
-
-        long now = System.currentTimeMillis();
-        List<LedgerEntry> entries = new ArrayList<>(4);
-
-        // --- Buyer side ---
-        long buyerJournalId = idGenerator.nextId();
-
-        // Buyer debit: locked quote decreases (trade debit on quote asset)
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), buyerJournalId,
-                buyerUserId, quoteAssetId, quoteAmount,
-                LedgerEntryType.TRADE_DEBIT, true,
-                tradeId, now));
-
-        // Buyer credit: available base increases (trade credit on base asset)
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), buyerJournalId,
-                buyerUserId, baseAssetId, baseAmount,
-                LedgerEntryType.TRADE_CREDIT, false,
-                tradeId, now));
-
-        // --- Seller side ---
-        long sellerJournalId = idGenerator.nextId();
-
-        // Seller debit: locked base decreases (trade debit on base asset)
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), sellerJournalId,
-                sellerUserId, baseAssetId, baseAmount,
-                LedgerEntryType.TRADE_DEBIT, true,
-                tradeId, now));
-
-        // Seller credit: available quote increases (trade credit on quote asset)
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), sellerJournalId,
-                sellerUserId, quoteAssetId, quoteAmount,
-                LedgerEntryType.TRADE_CREDIT, false,
-                tradeId, now));
 
         log.debug("Trade settled: tradeId={}, buyer={}, seller={}, market={}, price={}, qty={}",
                 tradeId, buyerUserId, sellerUserId, marketId, price, quantity);
-        return entries;
+        return true;
     }
 
     /**
@@ -405,18 +308,18 @@ public class LedgerService {
      * @param holdPrice  the price at which funds were originally held (fixed-point)
      * @param fillPrice  the actual execution price (fixed-point)
      * @param fillQty    the fill quantity (fixed-point)
-     * @return ledger entries for the release, or empty list if no overlock or release failed
+     * @return true if an overlock was released; false if there was no overlock or the release failed
      */
-    public List<LedgerEntry> handleOverlock(long omsOrderId, long userId, int marketId,
-                                             long holdPrice, long fillPrice, long fillQty) {
+    public boolean handleOverlock(long omsOrderId, long userId, int marketId,
+                                  long holdPrice, long fillPrice, long fillQty) {
         if (balanceStore.supportsResidualHolds()) {
             // The store settles at fill price from the specific hold: the price-improvement
             // residual stays in the hold and returns at the order's terminal release.
-            return Collections.emptyList();
+            return false;
         }
         if (fillPrice >= holdPrice) {
             // No overlock: filled at or above hold price
-            return Collections.emptyList();
+            return false;
         }
 
         Market market = Market.fromId(marketId);
@@ -426,37 +329,18 @@ public class LedgerService {
         long overlockAmount = FixedPoint.multiply(priceDelta, fillQty);
 
         if (overlockAmount <= 0) {
-            return Collections.emptyList();
+            return false;
         }
 
         boolean success = balanceStore.release(userId, quoteAssetId, overlockAmount, omsOrderId);
         if (!success) {
             log.error("Overlock release failed: omsOrderId={}, userId={}, quoteAssetId={}, amount={}",
                     omsOrderId, userId, quoteAssetId, overlockAmount);
-            return Collections.emptyList();
+            return false;
         }
-
-        long now = System.currentTimeMillis();
-        long journalId = idGenerator.nextId();
-
-        List<LedgerEntry> entries = new ArrayList<>(2);
-
-        // Debit: decrease locked
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), journalId,
-                userId, quoteAssetId, overlockAmount,
-                LedgerEntryType.ORDER_RELEASE, true,
-                omsOrderId, now));
-
-        // Credit: increase available
-        entries.add(new LedgerEntry(
-                idGenerator.nextId(), journalId,
-                userId, quoteAssetId, overlockAmount,
-                LedgerEntryType.ORDER_RELEASE, false,
-                omsOrderId, now));
 
         log.debug("Overlock released: omsOrderId={}, holdPrice={}, fillPrice={}, fillQty={}, released={}",
                 omsOrderId, holdPrice, fillPrice, fillQty, overlockAmount);
-        return entries;
+        return true;
     }
 }

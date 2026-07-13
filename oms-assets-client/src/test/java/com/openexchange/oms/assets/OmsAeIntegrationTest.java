@@ -14,12 +14,10 @@ import com.openexchange.assets.infrastructure.generated.TerminalReleaseEncoder;
 import com.openexchange.assets.infrastructure.persistence.AssetsClusteredService;
 import com.openexchange.assets.infrastructure.persistence.ClusterConfig;
 import com.openexchange.oms.common.domain.OmsOrder;
-import com.openexchange.oms.common.domain.SnowflakeIdGenerator;
 import com.openexchange.oms.common.enums.Asset;
 import com.openexchange.oms.common.enums.OmsOrderType;
 import com.openexchange.oms.common.enums.OrderSide;
 import com.openexchange.oms.common.enums.TimeInForce;
-import com.openexchange.oms.ledger.LedgerEntry;
 import com.openexchange.oms.ledger.LedgerService;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.client.AeronCluster;
@@ -131,7 +129,7 @@ class OmsAeIntegrationTest {
         client = new AssetsClusterClient(INGRESS_ENDPOINTS, STORE_EGRESS_CHANNEL);
         store = new AeronAssetsBalanceStore(client, Asset.count(), 5_000, 5_000);
         store.initSettleHighWater(0L);
-        ledger = new LedgerService(store, new SnowflakeIdGenerator(0));
+        ledger = new LedgerService(store);
 
         client.connect();
         pollThread = new Thread(client::startPolling, "oms-assets-poll");
@@ -184,9 +182,7 @@ class OmsAeIntegrationTest {
         store.deposit(user, USD, fp(100_000));
 
         final OmsOrder buy = order(20_001L, user, OrderSide.BUY, OmsOrderType.LIMIT, 50_000, 1.0);
-        final List<LedgerEntry> entries = ledger.holdForOrder(buy);
-
-        assertFalse(entries.isEmpty(), "hold should have succeeded");
+        assertTrue(ledger.holdForOrder(buy), "hold should have succeeded");
         final long held = fp(50_000); // price * qty
         assertEquals(held, buy.getHoldAmount());
         // Synchronous hold: the ack path applied the projection delta before holdForOrder returned.
@@ -194,7 +190,7 @@ class OmsAeIntegrationTest {
         assertEquals(held, store.getLocked(user, USD));
     }
 
-    /** 3. Hold rejected on insufficient funds → the order-create path (holdForOrder) sees false / empty. */
+    /** 3. Hold rejected on insufficient funds → the order-create path (holdForOrder) sees false. */
     @Test
     @Order(3)
     void insufficientFundsHoldRejected() {
@@ -202,9 +198,7 @@ class OmsAeIntegrationTest {
         store.deposit(user, USD, fp(100)); // far short of a 50k notional
 
         final OmsOrder buy = order(30_001L, user, OrderSide.BUY, OmsOrderType.LIMIT, 50_000, 1.0);
-        final List<LedgerEntry> entries = ledger.holdForOrder(buy);
-
-        assertTrue(entries.isEmpty(), "under-funded hold must be rejected");
+        assertFalse(ledger.holdForOrder(buy), "under-funded hold must be rejected");
         assertEquals(fp(100), store.getAvailable(user, USD), "reject moves no money");
         assertEquals(0L, store.getLocked(user, USD));
     }
@@ -221,16 +215,16 @@ class OmsAeIntegrationTest {
         store.deposit(user, USD, fp(100_000));
 
         final OmsOrder buy = order(40_001L, user, OrderSide.BUY, OmsOrderType.LIMIT, 50_000, 1.0);
-        assertFalse(ledger.holdForOrder(buy).isEmpty());
+        assertTrue(ledger.holdForOrder(buy));
         assertEquals(fp(50_000), store.getLocked(user, USD));
 
         // Grow the reservation by 10k (top-up under the same orderId).
-        assertFalse(ledger.holdAmendDelta(buy, fp(10_000)).isEmpty(), "grow top-up should succeed");
+        assertTrue(ledger.holdAmendDelta(buy, fp(10_000)), "grow top-up should succeed");
         assertEquals(fp(60_000), store.getLocked(user, USD), "top-up visible immediately");
         assertEquals(fp(100_000) - fp(60_000), store.getAvailable(user, USD));
 
         // Shrink by 20k (partial residual release — async).
-        assertFalse(ledger.releaseAmendDelta(buy, fp(20_000)).isEmpty(), "shrink release should be enqueued");
+        assertTrue(ledger.releaseAmendDelta(buy, fp(20_000)), "shrink release should be enqueued");
         awaitTrue("amend shrink applied",
                 () -> store.getLocked(user, USD) == fp(40_000), SETTLE_TIMEOUT_MS);
         assertEquals(fp(100_000) - fp(40_000), store.getAvailable(user, USD));
@@ -253,8 +247,8 @@ class OmsAeIntegrationTest {
         // protected by the hold-before-submit gate and the test protects itself the same way.
         store.deposit(buyer, USD, fp(60_000));
         store.deposit(seller, BTC, fp(1.0));
-        assertFalse(ledger.holdForOrder(order(buyOrder, buyer, OrderSide.BUY, OmsOrderType.LIMIT, 60_000, 1.0)).isEmpty());
-        assertFalse(ledger.holdForOrder(order(sellOrder, seller, OrderSide.SELL, OmsOrderType.LIMIT, 60_000, 1.0)).isEmpty());
+        assertTrue(ledger.holdForOrder(order(buyOrder, buyer, OrderSide.BUY, OmsOrderType.LIMIT, 60_000, 1.0)));
+        assertTrue(ledger.holdForOrder(order(sellOrder, seller, OrderSide.SELL, OmsOrderType.LIMIT, 60_000, 1.0)));
         assertEquals(fp(60_000), store.getLocked(buyer, USD));
         assertEquals(fp(1.0), store.getLocked(seller, BTC));
 
@@ -292,8 +286,8 @@ class OmsAeIntegrationTest {
         store.deposit(buyer, USD, fp(60_000));
         store.deposit(seller, BTC, fp(0.5));
         final OmsOrder buy = order(buyOrder, buyer, OrderSide.BUY, OmsOrderType.LIMIT, 60_000, 1.0);
-        assertFalse(ledger.holdForOrder(buy).isEmpty());
-        assertFalse(ledger.holdForOrder(order(sellOrder, seller, OrderSide.SELL, OmsOrderType.LIMIT, 55_000, 0.5)).isEmpty());
+        assertTrue(ledger.holdForOrder(buy));
+        assertTrue(ledger.holdForOrder(order(sellOrder, seller, OrderSide.SELL, OmsOrderType.LIMIT, 55_000, 0.5)));
         assertEquals(fp(60_000), buy.getHoldAmount());
 
         // Partial fill 0.5 BTC @ 55,000 (fill BELOW the 60k hold price → 2,500 price improvement).
@@ -309,7 +303,7 @@ class OmsAeIntegrationTest {
         // Cancel the remainder. releaseForCancel → releaseAll (residual store) returns the FULL residual.
         buy.setFilledQty(fp(0.5));
         buy.setRemainingQty(fp(0.5));
-        assertFalse(ledger.releaseForCancel(buy).isEmpty(), "cancel release should be enqueued");
+        assertTrue(ledger.releaseForCancel(buy), "cancel release should be enqueued");
 
         awaitTrue("residual fully released",
                 () -> store.getLocked(buyer, USD) == 0L, SETTLE_TIMEOUT_MS);
@@ -333,7 +327,7 @@ class OmsAeIntegrationTest {
         store.deposit(user, USD, held);
         final OmsOrder iceberg = order(parent, user, OrderSide.BUY, OmsOrderType.ICEBERG, 60_000, 1.0);
         assertTrue(iceberg.getOrderType().isSynthetic());
-        assertFalse(ledger.holdForOrder(iceberg).isEmpty());
+        assertTrue(ledger.holdForOrder(iceberg));
         assertEquals(held, store.getLocked(user, USD));
 
         // The AE's own hold snapshot shows the parent hold with its full remaining.

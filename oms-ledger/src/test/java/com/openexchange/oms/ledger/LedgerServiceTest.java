@@ -4,14 +4,11 @@ package com.openexchange.oms.ledger;
 import com.match.domain.FixedPoint;
 import com.openexchange.oms.common.domain.Market;
 import com.openexchange.oms.common.domain.OmsOrder;
-import com.openexchange.oms.common.domain.SnowflakeIdGenerator;
 import com.openexchange.oms.common.enums.OmsOrderType;
 import com.openexchange.oms.common.enums.OrderSide;
 import com.openexchange.oms.common.enums.TimeInForce;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-
-import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -27,7 +24,7 @@ class LedgerServiceTest {
     @BeforeEach
     void setUp() {
         balanceStore = new InMemoryBalanceStore();
-        ledgerService = new LedgerService(balanceStore, new SnowflakeIdGenerator(0));
+        ledgerService = new LedgerService(balanceStore);
     }
 
     @Test
@@ -36,10 +33,7 @@ class LedgerServiceTest {
         balanceStore.deposit(USER_1, Market.BTC_USD.quoteAsset().id(), FixedPoint.fromDouble(100000.0));
 
         OmsOrder order = createOrder(USER_1, BTC_USD_MARKET, OrderSide.BUY, FixedPoint.fromDouble(50000.0), FixedPoint.fromDouble(1.0));
-        List<LedgerEntry> entries = ledgerService.holdForOrder(order);
-
-        assertFalse(entries.isEmpty());
-        assertEquals(2, entries.size());
+        assertTrue(ledgerService.holdForOrder(order));
 
         // Available should decrease, locked should increase
         long expectedHold = FixedPoint.multiply(FixedPoint.fromDouble(50000.0), FixedPoint.fromDouble(1.0));
@@ -55,9 +49,8 @@ class LedgerServiceTest {
         balanceStore.deposit(USER_1, Market.BTC_USD.quoteAsset().id(), FixedPoint.fromDouble(100.0));
 
         OmsOrder order = createOrder(USER_1, BTC_USD_MARKET, OrderSide.BUY, FixedPoint.fromDouble(50000.0), FixedPoint.fromDouble(1.0));
-        List<LedgerEntry> entries = ledgerService.holdForOrder(order);
+        assertFalse(ledgerService.holdForOrder(order));
 
-        assertTrue(entries.isEmpty());
         // Balance unchanged
         assertEquals(FixedPoint.fromDouble(100.0), balanceStore.getAvailable(USER_1, Market.BTC_USD.quoteAsset().id()));
     }
@@ -68,9 +61,8 @@ class LedgerServiceTest {
         balanceStore.deposit(USER_1, Market.BTC_USD.baseAsset().id(), FixedPoint.fromDouble(10.0));
 
         OmsOrder order = createOrder(USER_1, BTC_USD_MARKET, OrderSide.SELL, FixedPoint.fromDouble(50000.0), FixedPoint.fromDouble(2.0));
-        List<LedgerEntry> entries = ledgerService.holdForOrder(order);
+        assertTrue(ledgerService.holdForOrder(order));
 
-        assertFalse(entries.isEmpty());
         assertEquals(FixedPoint.fromDouble(8.0), balanceStore.getAvailable(USER_1, Market.BTC_USD.baseAsset().id()));
         assertEquals(FixedPoint.fromDouble(2.0), balanceStore.getLocked(USER_1, Market.BTC_USD.baseAsset().id()));
     }
@@ -84,9 +76,8 @@ class LedgerServiceTest {
 
         // Cancel — no fills
         order.setFilledQty(0L);
-        List<LedgerEntry> releaseEntries = ledgerService.releaseForCancel(order);
+        assertTrue(ledgerService.releaseForCancel(order));
 
-        assertFalse(releaseEntries.isEmpty());
         assertEquals(FixedPoint.fromDouble(100000.0), balanceStore.getAvailable(USER_1, Market.BTC_USD.quoteAsset().id()));
         assertEquals(0L, balanceStore.getLocked(USER_1, Market.BTC_USD.quoteAsset().id()));
     }
@@ -102,11 +93,9 @@ class LedgerServiceTest {
         balanceStore.deposit(USER_2, Market.BTC_USD.baseAsset().id(), FixedPoint.fromDouble(1.0));
         balanceStore.hold(USER_2, Market.BTC_USD.baseAsset().id(), FixedPoint.fromDouble(1.0), 200L);
 
-        List<LedgerEntry> entries = ledgerService.settleTradeExecution(
+        assertTrue(ledgerService.settleTradeExecution(
                 999L, USER_1, USER_2, BTC_USD_MARKET,
-                FixedPoint.fromDouble(50000.0), FixedPoint.fromDouble(1.0), 100L, 200L);
-
-        assertEquals(4, entries.size());
+                FixedPoint.fromDouble(50000.0), FixedPoint.fromDouble(1.0), 100L, 200L));
 
         // Buyer gets BTC
         assertEquals(FixedPoint.fromDouble(1.0), balanceStore.getAvailable(USER_1, Market.BTC_USD.baseAsset().id()));
@@ -129,8 +118,7 @@ class LedgerServiceTest {
         long priceDelta = holdPrice - fillPrice;
         long expectedOverlock = FixedPoint.multiply(priceDelta, qty);
 
-        List<LedgerEntry> entries = ledgerService.handleOverlock(100L, USER_1, BTC_USD_MARKET, holdPrice, fillPrice, qty);
-        assertFalse(entries.isEmpty());
+        assertTrue(ledgerService.handleOverlock(100L, USER_1, BTC_USD_MARKET, holdPrice, fillPrice, qty));
 
         // The overlock amount should be released from locked to available
         assertEquals(expectedOverlock, balanceStore.getAvailable(USER_1, Market.BTC_USD.quoteAsset().id()));

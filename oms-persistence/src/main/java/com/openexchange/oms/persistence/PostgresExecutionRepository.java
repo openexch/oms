@@ -83,39 +83,6 @@ public class PostgresExecutionRepository {
     }
 
     /**
-     * Persists a batch of execution reports in a single transaction.
-     * Uses JDBC batch for maximum throughput.
-     */
-    public void saveBatch(List<ExecutionReport> executions) {
-        if (executions.isEmpty()) {
-            return;
-        }
-
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(INSERT_EXECUTION)) {
-
-            conn.setAutoCommit(false);
-            try {
-                for (ExecutionReport exec : executions) {
-                    bindExecution(ps, exec);
-                    ps.addBatch();
-                }
-                ps.executeBatch();
-                conn.commit();
-            } catch (SQLException e) {
-                conn.rollback();
-                throw e;
-            } finally {
-                conn.setAutoCommit(true);
-            }
-
-        } catch (SQLException e) {
-            log.error("Failed to save execution batch size={}", executions.size(), e);
-            throw new PersistenceException("Failed to save execution batch", e);
-        }
-    }
-
-    /**
      * Returns all executions for a given order, ordered by execution time ascending.
      */
     public List<ExecutionReport> findByOrder(long omsOrderId) {

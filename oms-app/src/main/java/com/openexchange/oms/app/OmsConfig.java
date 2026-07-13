@@ -56,7 +56,9 @@ public record OmsConfig(
             prop("OMS_API_KEYS_FILE", ""),
             secretProp("OMS_JWT_SECRET", ""),
             prop("OMS_CORS_ORIGINS", ""),
-            prop("OMS_AUDIT_LOG", "oms-audit.log"),
+            // Default under ~/.local/log/oms (AuditLog.open creates the directories),
+            // not the working directory where it used to land in the repo root.
+            prop("OMS_AUDIT_LOG", System.getProperty("user.home") + "/.local/log/oms/oms-audit.log"),
             prop("OMS_BALANCE_STORE", "redis"),
             longProp("OMS_AE_HOLD_TIMEOUT_MS", 250L),
             longProp("OMS_AE_ACK_TIMEOUT_MS", 1000L),

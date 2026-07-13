@@ -12,7 +12,6 @@ import com.openexchange.oms.common.enums.*;
 import com.openexchange.oms.core.OmsCoreEngine;
 import com.openexchange.oms.core.OrderLifecycleManager;
 import com.openexchange.oms.ledger.BalanceStore;
-import com.openexchange.oms.ledger.LedgerEntry;
 import com.openexchange.oms.ledger.LedgerService;
 import com.openexchange.oms.risk.RiskEngine;
 import com.openexchange.oms.risk.RiskResult;
@@ -197,11 +196,11 @@ public class OmsOrderServiceImpl implements OrderService {
 
             // 4. Place ledger hold
             long holdStart = System.nanoTime();
-            List<LedgerEntry> holdEntries = ledgerService.holdForOrder(order);
+            boolean holdPlaced = ledgerService.holdForOrder(order);
             if (ledgerHoldTimer != null) {
                 ledgerHoldTimer.record(System.nanoTime() - holdStart, java.util.concurrent.TimeUnit.NANOSECONDS);
             }
-            if (holdEntries.isEmpty()) {
+            if (!holdPlaced) {
                 lcm.onHoldFailed(order.getOmsOrderId(), "Insufficient balance");
                 return CreateOrderResponse.rejected("Insufficient balance");
             }
@@ -398,7 +397,7 @@ public class OmsOrderServiceImpl implements OrderService {
         }
 
         if (holdDelta > 0) {
-            if (ledgerService.holdAmendDelta(order, holdDelta).isEmpty()) {
+            if (!ledgerService.holdAmendDelta(order, holdDelta)) {
                 lcm.abortReplace(order, "insufficient balance for the amend delta");
                 return Map.of("accepted", false, "message", "Insufficient balance for amend");
             }

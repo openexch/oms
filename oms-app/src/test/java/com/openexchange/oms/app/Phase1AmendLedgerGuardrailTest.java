@@ -50,7 +50,7 @@ class Phase1AmendLedgerGuardrailTest {
     void setUp() {
         balanceStore = new InMemoryBalanceStore();
         SnowflakeIdGenerator idGenerator = new SnowflakeIdGenerator(0);
-        ledgerService = new LedgerService(balanceStore, idGenerator);
+        ledgerService = new LedgerService(balanceStore);
 
         OmsMarketDataProvider marketDataProvider = new OmsMarketDataProvider();
         OmsBalanceChecker balanceChecker = new OmsBalanceChecker(balanceStore);
