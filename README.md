@@ -124,9 +124,9 @@ oms/
 ├── oms-common/           # Shared domain models, enums, utilities
 ├── oms-cluster-client/   # Aeron Cluster integration (ingress/egress)
 ├── oms-risk/             # Pre-trade risk engine (7-check pipeline)
-├── oms-ledger/           # Double-entry ledger, balance store, settlement
+├── oms-ledger/           # Balance store (hold/release/settle), settlement
 ├── oms-core/             # Order lifecycle manager, synthetic order engine
-├── oms-persistence/      # PostgreSQL repositories (batch writer)
+├── oms-persistence/      # PostgreSQL repositories
 ├── oms-api/              # REST, gRPC, and WebSocket API layer
 ├── oms-app/              # Application entry point, component wiring
 └── oms-loadtest/         # HTTP load generator with metrics

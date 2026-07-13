@@ -214,7 +214,7 @@ public class OmsApplication {
         SnowflakeIdGenerator idGenerator = new SnowflakeIdGenerator(config.nodeId());
 
         // 4. Ledger service
-        LedgerService ledgerService = new LedgerService(balanceStore, idGenerator);
+        LedgerService ledgerService = new LedgerService(balanceStore);
         log.info("Ledger service initialized");
 
         // 5. Market data provider and balance checker
@@ -290,11 +290,11 @@ public class OmsApplication {
         coreEngine.setSettlementHandler((tradeId, buyerUserId, sellerUserId, marketId,
                                           price, quantity, buyerOmsOrderId, sellerOmsOrderId) -> {
             long settleStart = System.nanoTime();
-            // settleTradeExecution is idempotent on tradeId; an empty result means the trade was a
+            // settleTradeExecution is idempotent on tradeId; false means the trade was a
             // duplicate (re-delivered on leader switchover) and was NOT newly applied. Skip all
             // side effects so risk positions / open-order counts / overlock are not double-applied.
-            boolean applied = !ledgerService.settleTradeExecution(tradeId, buyerUserId, sellerUserId,
-                    marketId, price, quantity, buyerOmsOrderId, sellerOmsOrderId).isEmpty();
+            boolean applied = ledgerService.settleTradeExecution(tradeId, buyerUserId, sellerUserId,
+                    marketId, price, quantity, buyerOmsOrderId, sellerOmsOrderId);
             if (!applied) {
                 return false;
             }

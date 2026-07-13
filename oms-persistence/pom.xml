@@ -12,7 +12,7 @@
 
     <artifactId>oms-persistence</artifactId>
     <name>OMS Persistence</name>
-    <description>Redis + PostgreSQL data access layer, batch writer</description>
+    <description>Redis + PostgreSQL data access layer</description>
 
     <dependencies>
         <dependency>
@@ -38,10 +38,6 @@
         <dependency>
             <groupId>com.zaxxer</groupId>
             <artifactId>HikariCP</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.lmax</groupId>
-            <artifactId>disruptor</artifactId>
         </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
