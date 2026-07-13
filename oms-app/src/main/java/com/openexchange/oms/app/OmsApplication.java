@@ -284,17 +284,12 @@ public class OmsApplication {
             riskEngine.onFill(buyerUserId, marketId, OrderSide.BUY, quantity);
             riskEngine.onFill(sellerUserId, marketId, OrderSide.SELL, quantity);
 
-            // Decrement open order counts for filled orders. (Note: this runs before applyFill
-            // updates remainingQty in onTradeExecution, so it reflects pre-fill state — open-order
-            // count accuracy is risk bookkeeping, out of scope for the fill-exactness fix.)
+            // Open-order slot release moved to the terminal-status listener (oms#111):
+            // FILLED now decrements the slot there like every other terminal. The old
+            // fill-path check tested PRE-fill remainingQty, which a full fill never
+            // satisfies, so it never fired and the slot leaked +1 per fill (openOrderCounts
+            // drifted up at ~the fill rate until users hit the cap → false OPEN_ORDER_LIMIT).
             OmsOrder buyerOrder = lifecycleManager.getOrder(buyerOmsOrderId);
-            if (buyerOrder != null && buyerOrder.getRemainingQty() == 0) {
-                riskEngine.onOrderClosed(buyerUserId);
-            }
-            OmsOrder sellerOrder = lifecycleManager.getOrder(sellerOmsOrderId);
-            if (sellerOrder != null && sellerOrder.getRemainingQty() == 0) {
-                riskEngine.onOrderClosed(sellerUserId);
-            }
 
             // Handle overlock for buy orders (per-fill price-improvement hold release; independent
             // of remainingQty so ordering vs applyFill does not matter)
@@ -620,15 +615,14 @@ public class OmsApplication {
             // found by the #10 chaos soak as OPEN_ORDER_LIMIT storms with
             // openOrderCounts ≥500 while only ~37 orders were really open,
             // self-healing only on OMS restart (state rebuild resets counters).
-            boolean heldResources = oldStatus == OmsOrderStatus.NEW
-                    || oldStatus == OmsOrderStatus.PARTIALLY_FILLED
-                    || oldStatus == OmsOrderStatus.PENDING_NEW
-                    || oldStatus == OmsOrderStatus.PENDING_TRIGGER;
-            boolean releasingTerminal = newStatus == OmsOrderStatus.CANCELLED
-                    || newStatus == OmsOrderStatus.EXPIRED
-                    || newStatus == OmsOrderStatus.REJECTED;
-            if (heldResources && releasingTerminal) {
+            // Release the balance hold only when the order terminated WITHOUT filling, but
+            // release the open-order SLOT on EVERY terminal incl. FILLED (oms#111 — FILLED
+            // was leaking a slot per fill because neither this listener nor the fill path
+            // decremented it). See OpenOrderSlotPolicy.
+            if (OpenOrderSlotPolicy.releasesHold(oldStatus, newStatus)) {
                 ledgerService.releaseForCancel(order);
+            }
+            if (OpenOrderSlotPolicy.releasesSlot(oldStatus, newStatus)) {
                 riskEngine.onOrderClosed(order.getUserId());
             }
             // Iceberg terminal cleanup (oms#86): drop the parent from the synthetic
