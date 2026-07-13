@@ -88,6 +88,38 @@ class RiskEngineTest {
         assertTrue(result.isPassed());
     }
 
+    @Test
+    void testManualTripDistinguishedFromAutomatic() {
+        riskEngine.tripCircuitBreaker(MARKET_ID); // automatic (price-move) trip
+        assertTrue(riskEngine.isCircuitBreakerTripped(MARKET_ID));
+        assertFalse(riskEngine.isCircuitBreakerManuallyTripped(MARKET_ID));
+
+        riskEngine.resetCircuitBreaker(MARKET_ID);
+        riskEngine.tripCircuitBreakerManual(MARKET_ID); // operator trip (or boot re-arm)
+        assertTrue(riskEngine.isCircuitBreakerTripped(MARKET_ID));
+        assertTrue(riskEngine.isCircuitBreakerManuallyTripped(MARKET_ID));
+
+        RiskResult result = riskEngine.check(USER_ID, MARKET_ID, OrderSide.BUY, OmsOrderType.LIMIT, PRICE, QTY);
+        assertFalse(result.isPassed());
+        assertEquals(RiskRejectReason.CIRCUIT_BREAKER_OPEN, result.getRejectReason());
+    }
+
+    @Test
+    void testResetClearsManualTrip() {
+        riskEngine.tripCircuitBreakerManual(MARKET_ID);
+        riskEngine.resetCircuitBreaker(MARKET_ID);
+        assertFalse(riskEngine.isCircuitBreakerTripped(MARKET_ID));
+        assertFalse(riskEngine.isCircuitBreakerManuallyTripped(MARKET_ID));
+        assertTrue(riskEngine.check(USER_ID, MARKET_ID, OrderSide.BUY, OmsOrderType.LIMIT, PRICE, QTY).isPassed());
+    }
+
+    @Test
+    void testAutomaticTripDoesNotClearManualFlag() {
+        riskEngine.tripCircuitBreakerManual(MARKET_ID);
+        riskEngine.tripCircuitBreaker(MARKET_ID);
+        assertTrue(riskEngine.isCircuitBreakerManuallyTripped(MARKET_ID));
+    }
+
     // -- Order size --
 
     @Test

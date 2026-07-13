@@ -3,7 +3,6 @@ package com.openexchange.oms.app;
 
 import com.openexchange.oms.api.HttpServer;
 import com.openexchange.oms.api.OrderService;
-import com.openexchange.oms.api.AdminService;
 import com.openexchange.oms.api.auth.ApiKeyAuthenticationProvider;
 import com.openexchange.oms.api.auth.AuthService;
 import com.openexchange.oms.api.auth.AuthenticationProvider;
@@ -51,6 +50,7 @@ import com.openexchange.oms.persistence.PostgresOrderRepository;
 import com.openexchange.oms.persistence.PostgresExecutionRepository;
 import com.openexchange.oms.persistence.PostgresUserRepository;
 import com.openexchange.oms.persistence.PostgresBalanceReadModelStore;
+import com.openexchange.oms.persistence.PostgresRiskConfigStore;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import com.openexchange.oms.risk.RiskConfig;
@@ -243,6 +243,25 @@ public class OmsApplication {
             configManager.setConfig(m.marketId(), defaultConfig);
         }
         log.info("Risk engine initialized with {} markets", Market.ALL.length);
+
+        // 6b. Durable risk config: the defaults above are the baseline; stored rows
+        // (admin updates + manual circuit-breaker trips) replay on top via the
+        // manager's merge path. Memory-only when PG is not configured.
+        PostgresRiskConfigStore riskConfigStore = null;
+        if (dataSource != null) {
+            riskConfigStore = new PostgresRiskConfigStore(dataSource);
+            try {
+                RiskConfigBootstrap.Result restored =
+                        RiskConfigBootstrap.replay(riskConfigStore.loadAll(), configManager, riskEngine);
+                log.info("Risk config restored from PG: {} markets loaded, {} manual circuit-breaker "
+                        + "trips re-armed", restored.marketsLoaded(), restored.tripsRearmed());
+            } catch (Exception e) {
+                log.warn("Risk config load failed (running on hardcoded defaults until the next "
+                        + "admin update): {}", e.toString());
+            }
+        } else {
+            log.warn("PostgreSQL not configured: risk config is not durable");
+        }
 
         // 7. Core engine (lifecycle + synthetic)
         OrderLifecycleManager lifecycleManager = new OrderLifecycleManager();
@@ -666,8 +685,12 @@ public class OmsApplication {
             }
         });
 
-        // 15. Admin service
-        AdminService adminService = new OmsAdminServiceImpl(configManager, riskEngine);
+        // 15. Admin service (holds the risk-config persist seam; null store = memory-only)
+        OmsAdminServiceImpl adminService = new OmsAdminServiceImpl(configManager, riskEngine, riskConfigStore);
+        FunctionCounter.builder("oms_risk_config_persist_failures_total", adminService,
+                        OmsAdminServiceImpl::getPersistFailures)
+                .description("Admin risk-config/breaker persists that failed (change applied in memory only)")
+                .register(meterRegistry);
 
         // 16. HTTP server
         httpServer = new HttpServer(config.httpPort(), orderService, wsHandler, adminService,
