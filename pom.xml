@@ -45,7 +45,7 @@
         <disruptor.version>4.0.0</disruptor.version>
 
         <!-- Netty -->
-        <netty.version>4.2.15.Final</netty.version>
+        <netty.version>4.2.16.Final</netty.version>
 
         <!-- Jackson -->
         <jackson.version>2.22.0</jackson.version>
