@@ -356,7 +356,7 @@ public class AssetsClusterClient
     /** Connect to the AE cluster. Closes any existing connection first. */
     private void connectToCluster() {
         if (cluster != null) {
-            CloseHelper.quietClose(cluster);
+            closeAbandonedCluster(cluster, "pre-connect cleanup");
             cluster = null;
         }
 
@@ -401,7 +401,9 @@ public class AssetsClusterClient
         }
         lastReconnectAttempt = now;
 
-        CloseHelper.quietClose(cluster);
+        // Close old cluster connection (guaranteed teardown so the abandoned egress
+        // subscription's image mappings are released; see closeAbandonedCluster).
+        closeAbandonedCluster(cluster, "reconnect");
         cluster = null;
         notifyDisconnected();
 
@@ -608,11 +610,71 @@ public class AssetsClusterClient
 
         if (egressAgeMs > STALE_EGRESS_TIMEOUT_MS && egressMessageCount > 0) {
             log.warn("AE STALE EGRESS: no egress for {}ms while connected. Forcing reconnect.", egressAgeMs);
-            CloseHelper.quietClose(currentCluster);
+            final long staleSessionId = currentCluster.clusterSessionId();
+            closeAbandonedCluster(currentCluster, "stale-egress forced reconnect");
             cluster = null;
+            // Live verification signal: images= in the AE STATS line above must stop climbing
+            // once every forced reconnect actually releases the old instance.
+            log.info("Old AE AeronCluster instance closed on forced reconnect (sessionId={}); " +
+                    "egress subscription and image mappings released", staleSessionId);
             notifyDisconnected();
             lastReconnectAttempt = 0;
             reconnectBackoffMs = INITIAL_RECONNECT_BACKOFF_MS;
+        }
+    }
+
+    /**
+     * Close an abandoned {@link AeronCluster} instance so its egress subscription and mapped
+     * image log buffers are guaranteed to be released before a replacement is connected.
+     * Mirrors the ME {@code ClusterClient} helper (the two clients are deliberate structural
+     * clones on isolated drivers; see class doc).
+     *
+     * <p>{@code AeronCluster.close()} first sends a session-close request over the ingress
+     * publication and only then closes the owned Aeron client, and it is that second step
+     * which unmaps the egress image log buffers in /dev/shm. On the reconnect paths the
+     * session is typically already broken (stale egress, dead leader, timed-out client
+     * conductor), so the first step can throw; a bare {@code CloseHelper.quietClose(cluster)}
+     * then swallows the failure and leaks one ~50MB egress image mapping per reconnect cycle.
+     * The fallback here closes {@code cluster.context()} directly, which closes the owned
+     * Aeron client exactly as the tail of {@code AeronCluster.close()} would have.
+     *
+     * <p>The embedded MediaDriver is deliberately untouched: cycling the cluster session must
+     * not tear down the driver (driver recovery is the separate reset path in
+     * {@link #tryReconnect()}).
+     *
+     * <p>Must only be called from the single polling thread, or before polling starts /
+     * during shutdown; AeronCluster lifecycle is single-threaded by design. Idempotence is
+     * delegated to {@code AeronCluster.close()} (a no-op once closed); callers null the
+     * {@link #cluster} field right after so no path closes the same instance twice.
+     */
+    private static void closeAbandonedCluster(AeronCluster clusterToClose, String reason) {
+        // Context has close() but does not implement AutoCloseable, hence the method reference.
+        closeWithFallback(clusterToClose,
+                clusterToClose != null ? clusterToClose.context()::close : null, reason);
+    }
+
+    /**
+     * Close {@code graceful}; if that throws, close {@code fallback} to force resource
+     * release. Never throws and is null-safe. Package-private so the close ordering and
+     * fallback semantics are unit-testable without a live cluster.
+     */
+    static void closeWithFallback(AutoCloseable graceful, AutoCloseable fallback, String reason) {
+        if (graceful == null) {
+            return;
+        }
+        try {
+            graceful.close();
+        } catch (Throwable t) {
+            log.warn("AE graceful close failed during {} ({}: {}); forcing underlying resource teardown",
+                    reason, t.getClass().getSimpleName(), t.getMessage());
+            try {
+                if (fallback != null) {
+                    fallback.close();
+                }
+            } catch (Throwable ft) {
+                log.warn("AE fallback resource teardown also failed during {} ({}: {})",
+                        reason, ft.getClass().getSimpleName(), ft.getMessage());
+            }
         }
     }
 
@@ -931,7 +993,7 @@ public class AssetsClusterClient
     @Override
     public void close() {
         running.set(false);
-        CloseHelper.quietClose(cluster);
+        closeAbandonedCluster(cluster, "shutdown");
         CloseHelper.quietClose(mediaDriver);
         cluster = null;
         mediaDriver = null;
