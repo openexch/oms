@@ -156,10 +156,13 @@ public class OmsCoreEngine {
         // Apply the fill to per-order filledQty from the AUTHORITATIVE TradeExecution stream.
         // (The cluster OrderStatus egress is coalesced/lossy and must not drive filledQty — it is
         // only a monotonic backstop in OrderLifecycleManager.onClusterOrderStatus.)
+        // oms#110: pass each side's ME-assigned cluster leg id (taker's = takerOrderId, maker's =
+        // makerOrderId) so an order filling in the same batch as its accept records its real
+        // clusterOrderId here, BEFORE the trade-driven persist below — otherwise it persists as 0.
         OmsOrder takerOrder = takerOmsOrderId != 0
-                ? lifecycleManager.applyFill(takerOmsOrderId, tradeQuantity) : null;
+                ? lifecycleManager.applyFill(takerOmsOrderId, takerOrderId, tradeQuantity) : null;
         OmsOrder makerOrder = makerOmsOrderId != 0
-                ? lifecycleManager.applyFill(makerOmsOrderId, tradeQuantity) : null;
+                ? lifecycleManager.applyFill(makerOmsOrderId, makerOrderId, tradeQuantity) : null;
 
         if (persistenceHandler != null) {
             if (takerOrder != null) persistenceHandler.persistOrderUpdate(takerOrder);

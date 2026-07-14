@@ -507,15 +507,32 @@ public class OrderLifecycleManager {
      * Callers must gate this on the per-tradeId settle() dedup so re-delivered trades (which the
      * cluster replays on a leader switchover) are not double-counted here.
      *
-     * @param omsOrderId the order to apply the fill to
-     * @param fillQty    fixed-point fill quantity from this trade
+     * @param omsOrderId     the order to apply the fill to
+     * @param clusterOrderId the ME-assigned id of THIS order's cluster leg, carried on the
+     *                       TradeExecution (taker's = takerOrderId, maker's = makerOrderId). Set +
+     *                       indexed here when the order does not yet carry one (see oms#110 below);
+     *                       0 or an already-linked order is a no-op on the index.
+     * @param fillQty        fixed-point fill quantity from this trade
      * @return the affected order (FILLED orders are returned even though they are removed from the
      *         active map), or null if the order is unknown or already terminal (safe no-op)
      */
-    public OmsOrder applyFill(long omsOrderId, long fillQty) {
+    public OmsOrder applyFill(long omsOrderId, long clusterOrderId, long fillQty) {
         OmsOrder order = activeOrders.get(omsOrderId);
         if (order == null || order.getStatus().isTerminal()) {
             return null;
+        }
+        // oms#110: an order that crosses on entry fills fully in the SAME egress batch as its
+        // accept, and the flush emits TradeExecution BEFORE OrderStatus — so this trade-driven path
+        // is where such an order FIRST learns its ME-assigned clusterOrderId. Set + index it here,
+        // BEFORE a full fill removes the order, or the trade-driven persistOrderUpdate writes
+        // cluster_order_id=0 and the later FILLED status can no longer correlate the (removed) order
+        // to correct it (byClusterOrderId miss -> "Unknown order"). Indexing byClusterOrderId also
+        // links a partial fill for egress correlation and membership repair. Guarded on 0 so a
+        // resting maker — or a replace / iceberg leg — that already carries its cid is never
+        // overwritten (onClusterOrderStatus keeps its set-on-first-status behavior as the fallback).
+        if (clusterOrderId != 0 && order.getClusterOrderId() == 0) {
+            order.setClusterOrderId(clusterOrderId);
+            byClusterOrderId.put(clusterOrderId, order);
         }
         long newFilled = order.getFilledQty() + fillQty;
         order.setFilledQty(newFilled);

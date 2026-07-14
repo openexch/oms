@@ -135,7 +135,7 @@ class Phase1AmendGuardrailTest {
         order.setPendingHoldDelta(50L);
 
         // The old leg fully fills via the trade stream before the amend resolves.
-        lcm.applyFill(20L, order.getQuantity());
+        lcm.applyFill(20L, 1000L, order.getQuantity());
 
         assertEquals(OmsOrderStatus.FILLED, order.getStatus());
         assertEquals(1, hooks.aborted,

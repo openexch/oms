@@ -158,13 +158,13 @@ class OrderLifecycleManagerTest {
         lcm.onHoldPlaced(order.getOmsOrderId());
         lcm.onClusterOrderStatus(order.getOmsOrderId(), 530L, 0, 0, 0); // NEW
 
-        OmsOrder afterPartial = lcm.applyFill(order.getOmsOrderId(), 30_000_000L);
+        OmsOrder afterPartial = lcm.applyFill(order.getOmsOrderId(), 530L, 30_000_000L);
         assertSame(order, afterPartial);
         assertEquals(OmsOrderStatus.PARTIALLY_FILLED, order.getStatus());
         assertEquals(30_000_000L, order.getFilledQty());
         assertEquals(70_000_000L, order.getRemainingQty());
 
-        OmsOrder afterFull = lcm.applyFill(order.getOmsOrderId(), 70_000_000L);
+        OmsOrder afterFull = lcm.applyFill(order.getOmsOrderId(), 530L, 70_000_000L);
         assertSame(order, afterFull);                 // returned even though removed
         assertEquals(OmsOrderStatus.FILLED, order.getStatus());
         assertEquals(100_000_000L, order.getFilledQty());
@@ -174,11 +174,11 @@ class OrderLifecycleManagerTest {
 
     @Test
     void testApplyFillOnTerminalOrUnknownIsNoOp() {
-        assertNull(lcm.applyFill(999L, 10_000_000L)); // unknown
+        assertNull(lcm.applyFill(999L, 0L, 10_000_000L)); // unknown
         OmsOrder order = createOrder(31L);
         lcm.registerOrder(order);
         lcm.onRiskRejected(order.getOmsOrderId(), "x"); // terminal + removed
-        assertNull(lcm.applyFill(order.getOmsOrderId(), 10_000_000L));
+        assertNull(lcm.applyFill(order.getOmsOrderId(), 0L, 10_000_000L));
     }
 
     @Test
@@ -189,7 +189,7 @@ class OrderLifecycleManagerTest {
         lcm.onHoldPlaced(order.getOmsOrderId());
         lcm.onClusterOrderStatus(order.getOmsOrderId(), 532L, 0, 0, 0); // NEW
 
-        lcm.applyFill(order.getOmsOrderId(), 60_000_000L);
+        lcm.applyFill(order.getOmsOrderId(), 532L, 60_000_000L);
         assertEquals(60_000_000L, order.getFilledQty());
 
         // A stale/coalesced OrderStatus reporting only 20M filled must NOT regress filledQty.
@@ -207,13 +207,71 @@ class OrderLifecycleManagerTest {
         lcm.onHoldPlaced(order.getOmsOrderId());
 
         // Trade arrives before the cluster NEW status (reordered egress)
-        lcm.applyFill(order.getOmsOrderId(), 40_000_000L);
+        lcm.applyFill(order.getOmsOrderId(), 533L, 40_000_000L);
         assertEquals(OmsOrderStatus.PARTIALLY_FILLED, order.getStatus());
 
         // A late NEW status must not regress the order back to NEW
         lcm.onClusterOrderStatus(order.getOmsOrderId(), 533L, 0, 60_000_000L, 0);
         assertEquals(OmsOrderStatus.PARTIALLY_FILLED, order.getStatus());
         assertEquals(40_000_000L, order.getFilledQty()); // monotonic guard preserves it
+    }
+
+    // ==================== oms#110: clusterOrderId on trade-driven (instant) fills ====================
+
+    @Test
+    void testApplyFillRecordsClusterOrderIdOnInstantFullFill() {
+        // An order that crosses on entry: its TradeExecution arrives BEFORE any OrderStatus, so
+        // applyFill is where the order first learns its ME-assigned clusterOrderId. It must be set on
+        // the (returned) order before removal, so the trade-driven persist writes the real id, not 0.
+        OmsOrder order = createOrder(60L);              // quantity = 100_000_000, not yet on cluster
+        lcm.registerOrder(order);
+        lcm.onRiskPassed(order.getOmsOrderId());
+        lcm.onHoldPlaced(order.getOmsOrderId());
+        assertEquals(0L, order.getClusterOrderId());    // no status seen yet
+
+        OmsOrder filled = lcm.applyFill(order.getOmsOrderId(), 7777L, 100_000_000L);
+
+        assertSame(order, filled);
+        assertEquals(OmsOrderStatus.FILLED, order.getStatus());
+        assertEquals(7777L, order.getClusterOrderId(),
+                "the persisted order must carry the ME clusterOrderId, not 0");
+        assertNull(lcm.getOrder(order.getOmsOrderId()));    // removed on FILLED
+    }
+
+    @Test
+    void testApplyFillIndexesByClusterOrderIdOnPartialFill() {
+        // A partial fill arriving before the NEW status must both record AND index the cid, so a
+        // later cancel / membership repair (byClusterOrderId) can still find the resting order.
+        OmsOrder order = createOrder(61L);
+        lcm.registerOrder(order);
+        lcm.onRiskPassed(order.getOmsOrderId());
+        lcm.onHoldPlaced(order.getOmsOrderId());
+
+        OmsOrder partial = lcm.applyFill(order.getOmsOrderId(), 8888L, 40_000_000L);
+
+        assertSame(order, partial);
+        assertEquals(OmsOrderStatus.PARTIALLY_FILLED, order.getStatus());
+        assertEquals(8888L, order.getClusterOrderId());
+        assertSame(order, lcm.getByClusterOrderId(8888L),
+                "byClusterOrderId must be indexed for a partial fill too");
+    }
+
+    @Test
+    void testApplyFillDoesNotOverwriteAnExistingClusterOrderId() {
+        // A resting maker (or a replace / iceberg leg) already carries its cid: applyFill's set is
+        // defensive (only when 0) and must NOT clobber the live leg's id.
+        OmsOrder order = createOrder(62L);
+        lcm.registerOrder(order);
+        lcm.onRiskPassed(order.getOmsOrderId());
+        lcm.onHoldPlaced(order.getOmsOrderId());
+        lcm.onSentToCluster(order.getOmsOrderId(), 620L);   // cid already assigned
+        assertSame(order, lcm.getByClusterOrderId(620L));
+
+        lcm.applyFill(order.getOmsOrderId(), 999L, 40_000_000L); // trade carries a different id
+
+        assertEquals(620L, order.getClusterOrderId(), "existing cid must not be overwritten");
+        assertSame(order, lcm.getByClusterOrderId(620L));
+        assertNull(lcm.getByClusterOrderId(999L), "the spurious id must not be indexed");
     }
 
     private OmsOrder createOrder(long id) {
