@@ -96,7 +96,7 @@ class StartupStateRebuilderTest {
         lifecycleA.onHoldPlaced(101);
         lifecycleA.onSentToCluster(101, 501);
         riskA.onOrderOpened(1);
-        lifecycleA.applyFill(101, 30);
+        lifecycleA.applyFill(101, 501, 30);
         riskA.onFill(1, MARKET, OrderSide.BUY, 30);
         riskA.onFill(2, MARKET, OrderSide.SELL, 30); // counterparty, order fully filled → not open
 
