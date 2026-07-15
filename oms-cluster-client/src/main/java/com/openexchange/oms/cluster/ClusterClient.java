@@ -469,10 +469,19 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                 // Market-data flushing is cluster-driven, so no ingress ping is needed.
                 long nowNs = System.nanoTime();
                 if (nowNs - lastKeepAliveNs >= KEEPALIVE_INTERVAL_NS) {
-                    if (!currentCluster.isClosed()) {
-                        boolean sent = currentCluster.sendKeepAlive();
-                        if (!sent && keepAliveCount % 10 == 0) {
-                            log.warn("Session keep-alive failed (back-pressured); will retry next interval");
+                    // oms#116: a throwing keep-alive must NOT skip drainOrderQueue or the
+                    // stale-egress watchdog (logStats) below, or a wedged session would never
+                    // get force-reconnected. Contain the throw here.
+                    try {
+                        if (!currentCluster.isClosed()) {
+                            boolean sent = currentCluster.sendKeepAlive();
+                            if (!sent && keepAliveCount % 10 == 0) {
+                                log.warn("Session keep-alive failed (back-pressured); will retry next interval");
+                            }
+                        }
+                    } catch (RuntimeException e) {
+                        if (keepAliveCount % 10 == 0) {
+                            log.warn("Session keep-alive threw ({}); watchdog still runs", e.toString());
                         }
                     }
                     lastKeepAliveNs = nowNs;
@@ -480,8 +489,10 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                     work++;
                 }
 
-                // Drain order queue: encode and offer submissions from API threads
-                work += drainOrderQueue(currentCluster, idleStrategy);
+                // Drain order queue: encode and offer submissions from API threads. On
+                // back-pressure a submission is held and this returns immediately so the loop
+                // polls egress again before retrying — never starving egress under load.
+                work += drainOrderQueue(currentCluster);
 
                 // Periodic stats and stale egress detection
                 long nowMs = System.currentTimeMillis();
@@ -530,7 +541,7 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
      *
      * @return the number of orders processed (success + dropped, but not held)
      */
-    private int drainOrderQueue(AeronCluster currentCluster, IdleStrategy idle) {
+    private int drainOrderQueue(AeronCluster currentCluster) {
         int count = 0;
         while (true) {
             final OrderSubmission submission;
@@ -561,22 +572,16 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                 continue;
             }
 
-            // Transient back-pressure: retry with polling-thread idle strategy.
-            if (result == Publication.BACK_PRESSURED || result == Publication.ADMIN_ACTION) {
-                long retried = retryOffer(currentCluster, length, idle);
-                if (retried >= 0) {
-                    pendingSubmission = null;
-                    ordersSent++;
-                    offerRetriedCount++;
-                    count++;
-                    continue;
-                }
-                result = retried;
-            }
-
-            // Connection-level error: hold the submission for the next polling iteration so we
-            // don't drop it while the reconnect logic at the top of the loop runs.
-            if (result == Publication.NOT_CONNECTED || result == Publication.CLOSED) {
+            // Back-pressure or a connection-level error: HOLD the submission and return to the
+            // poll loop so pollEgress() runs before we retry it (the held submission is retried
+            // first on the next iteration via pendingSubmission). The old path spun in retryOffer
+            // for ~10ms PER back-pressured order while draining the whole queue, so a burst under
+            // ingress back-pressure starved egress polling for seconds — long enough for our
+            // egress session's flow-control to lapse and the leader to mark it NOT_CONNECTED and
+            // silently stop delivering (match#140). Interleaving offer with pollEgress removes
+            // that coupling: egress is polled every loop iteration regardless of ingress pressure.
+            if (result == Publication.BACK_PRESSURED || result == Publication.ADMIN_ACTION
+                    || result == Publication.NOT_CONNECTED || result == Publication.CLOSED) {
                 if (pendingSubmission == null) {
                     pendingSubmission = submission;
                     pendingLength = length;
@@ -585,38 +590,15 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                 return count;
             }
 
-            // MAX_POSITION_EXCEEDED or back-pressure that survived all retries — give up on this
-            // submission so we don't head-of-line block subsequent orders behind it.
-            log.warn("Order offer failed for {}: {} (dropped after retries)",
+            // MAX_POSITION_EXCEEDED or any other hard failure — give up on this submission so it
+            // doesn't head-of-line block subsequent orders behind it.
+            log.warn("Order offer failed for {}: {} (dropped)",
                     submission, offerResultName(result));
             offerDroppedCount++;
             pendingSubmission = null;
             count++;
         }
         return count;
-    }
-
-    /** Max iterations to retry a back-pressured offer. ~10 ms with the current idle strategy. */
-    private static final int OFFER_RETRY_LIMIT = 100;
-
-    /**
-     * Retry an offer using the polling-thread idle strategy. Bails out early on connection-level
-     * errors so the caller can take the held-pending path.
-     */
-    private long retryOffer(AeronCluster currentCluster, int length, IdleStrategy idle) {
-        idle.reset();
-        for (int i = 0; i < OFFER_RETRY_LIMIT; i++) {
-            long result = currentCluster.offer(encodeBuffer, 0, length);
-            if (result >= 0) {
-                return result;
-            }
-            if (result == Publication.NOT_CONNECTED || result == Publication.CLOSED
-                    || result == Publication.MAX_POSITION_EXCEEDED) {
-                return result;
-            }
-            idle.idle();
-        }
-        return Publication.BACK_PRESSURED;
     }
 
     /**
