@@ -108,8 +108,6 @@ public class AssetsClusterClient
     private static final int COMMAND_QUEUE_CAPACITY = 4096;
     /** Buffer bytes per pooled command. Largest money-schema ingress message (Hold) is 44 bytes. */
     private static final int MAX_COMMAND_LENGTH = 128;
-    /** Max iterations to retry a back-pressured offer. ~10 ms with the current idle strategy. */
-    private static final int OFFER_RETRY_LIMIT = 100;
 
     // Cluster connection state
     private volatile MediaDriver mediaDriver;
@@ -173,6 +171,9 @@ public class AssetsClusterClient
     private volatile long leaderTransitionDeadlineMs = 0;
     private volatile long leaderChangeCount = 0;
     private volatile long lastEgressMessageMs = System.currentTimeMillis();
+    /** Wall-clock of the last command we offered to the AE. Used to distinguish a real stall (a
+     * sent command went unanswered) from a normal idle period (oms#109). 0 = nothing sent yet. */
+    private volatile long lastCommandSentMs = 0;
 
     /**
      * Create a client with connection parameters from environment variables.
@@ -479,10 +480,17 @@ public class AssetsClusterClient
 
                 long nowNs = System.nanoTime();
                 if (nowNs - lastKeepAliveNs >= KEEPALIVE_INTERVAL_NS) {
-                    if (!currentCluster.isClosed()) {
-                        boolean sent = currentCluster.sendKeepAlive();
-                        if (!sent && keepAliveCount % 10 == 0) {
-                            log.warn("AE session keep-alive back-pressured; will retry next interval");
+                    // oms#116: a throwing keep-alive must not skip the drain/watchdog below.
+                    try {
+                        if (!currentCluster.isClosed()) {
+                            boolean sent = currentCluster.sendKeepAlive();
+                            if (!sent && keepAliveCount % 10 == 0) {
+                                log.warn("AE session keep-alive back-pressured; will retry next interval");
+                            }
+                        }
+                    } catch (RuntimeException e) {
+                        if (keepAliveCount % 10 == 0) {
+                            log.warn("AE session keep-alive threw ({}); watchdog still runs", e.toString());
                         }
                     }
                     lastKeepAliveNs = nowNs;
@@ -490,7 +498,7 @@ public class AssetsClusterClient
                     work++;
                 }
 
-                work += drainCommandQueue(currentCluster, idleStrategy);
+                work += drainCommandQueue(currentCluster);
 
                 long nowMs = System.currentTimeMillis();
                 if (nowMs - lastStatsLogMs > STATS_LOG_INTERVAL_MS) {
@@ -523,7 +531,7 @@ public class AssetsClusterClient
      *
      * @return number of commands processed (success + dropped, not held)
      */
-    private int drainCommandQueue(AeronCluster currentCluster, IdleStrategy idle) {
+    private int drainCommandQueue(AeronCluster currentCluster) {
         int count = 0;
         while (true) {
             final PooledCommand cmd;
@@ -540,23 +548,17 @@ public class AssetsClusterClient
             if (result >= 0) {
                 releaseCommand(cmd);
                 commandsSent++;
+                lastCommandSentMs = System.currentTimeMillis();
                 count++;
                 continue;
             }
 
-            if (result == Publication.BACK_PRESSURED || result == Publication.ADMIN_ACTION) {
-                long retried = retryOffer(currentCluster, cmd, idle);
-                if (retried >= 0) {
-                    releaseCommand(cmd);
-                    commandsSent++;
-                    offerRetriedCount++;
-                    count++;
-                    continue;
-                }
-                result = retried;
-            }
-
-            if (result == Publication.NOT_CONNECTED || result == Publication.CLOSED) {
+            // Back-pressure or connection error: HOLD the command and return so pollEgress()
+            // runs before we retry (mirrors ClusterClient.drainOrderQueue). The old retryOffer
+            // spin starved egress polling under back-pressure — money-critical here, since a
+            // starved AE egress means a delayed HoldAck / BalanceUpdate.
+            if (result == Publication.BACK_PRESSURED || result == Publication.ADMIN_ACTION
+                    || result == Publication.NOT_CONNECTED || result == Publication.CLOSED) {
                 if (pendingCommand == null) {
                     pendingCommand = cmd;
                     offerHeldCount++;
@@ -564,8 +566,7 @@ public class AssetsClusterClient
                 return count;
             }
 
-            log.warn("AE command offer failed (template stays queued? no -> dropped): {}",
-                    offerResultName(result));
+            log.warn("AE command offer failed (dropped): {}", offerResultName(result));
             offerDroppedCount++;
             releaseCommand(cmd);
             count++;
@@ -581,22 +582,6 @@ public class AssetsClusterClient
         commandPool.offer(cmd); // capacity >= commands in circulation, so this always succeeds
     }
 
-    private long retryOffer(AeronCluster currentCluster, PooledCommand cmd, IdleStrategy idle) {
-        idle.reset();
-        for (int i = 0; i < OFFER_RETRY_LIMIT; i++) {
-            long result = currentCluster.offer(cmd.buffer, 0, cmd.length);
-            if (result >= 0) {
-                return result;
-            }
-            if (result == Publication.NOT_CONNECTED || result == Publication.CLOSED
-                    || result == Publication.MAX_POSITION_EXCEEDED) {
-                return result;
-            }
-            idle.idle();
-        }
-        return Publication.BACK_PRESSURED;
-    }
-
     private void logStats(AeronCluster currentCluster, long nowMs) {
         long egressAgeMs = nowMs - lastEgressMessageMs;
         var sub = currentCluster.egressSubscription();
@@ -608,8 +593,13 @@ public class AssetsClusterClient
                 offerRetriedCount, offerHeldCount, offerDroppedCount, submitRejectedCount,
                 aeronErrorCount.get(), commandQueue.size());
 
-        if (egressAgeMs > STALE_EGRESS_TIMEOUT_MS && egressMessageCount > 0) {
-            log.warn("AE STALE EGRESS: no egress for {}ms while connected. Forcing reconnect.", egressAgeMs);
+        // oms#109: the AE is REQUEST-RESPONSE, so egress silence during an idle period (no
+        // holds/queries in flight) is normal and must NOT force a reconnect — that churned the
+        // session pointlessly. Only a command we SENT since the last egress that has gone
+        // unanswered past the timeout is a real stall.
+        boolean requestOutstanding = lastCommandSentMs > lastEgressMessageMs;
+        if (egressAgeMs > STALE_EGRESS_TIMEOUT_MS && requestOutstanding) {
+            log.warn("AE STALE EGRESS: a sent command went unanswered for {}ms while connected. Forcing reconnect.", egressAgeMs);
             final long staleSessionId = currentCluster.clusterSessionId();
             closeAbandonedCluster(currentCluster, "stale-egress forced reconnect");
             cluster = null;
