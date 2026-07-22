@@ -2,9 +2,61 @@
 
 All notable changes to `oms` (the Open Exchange order management service)
 are documented here. The stack (`match`, `oms`, `admin-gateway`,
-`trading-ui`) is versioned together; one version spans all four repos.
+`trading-ui`, `assets`) is versioned together; one version spans all five repos.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [0.4.0-beta] - 2026-07-22
+
+The money release: order money moves to the Assets Engine, and the fill path
+is hardened end to end.
+
+### Added
+- Money on the Assets Engine: `oms-assets-client` AE cluster transport
+  (money-schema v2) (#99); `AeronAssetsBalanceStore` behind the BalanceStore
+  seam (#100); explicit balance-store selection + AE store wiring/metrics
+  (#101); PG balance read model — CQRS mirror off the AE projection (#104).
+- `AssetsHoldReconciler`: provably-never-submitted orphan sweep (#103).
+- OMS↔AE integration tests — hold/amend/settle/residual/synthetic-flag end to
+  end (#102).
+- Ordered egress, client side: egressSeq threading + reorder metric (#98);
+  engine reject reasons surfaced from SBE v6 egress (#95).
+- Market metadata (tickSize/minPrice/maxPrice) served in
+  `GET /api/v1/markets` (#105).
+- Demo auth mode — self-registered users with scoped principals
+  (`OMS_AUTH_MODE=demo`) (#72).
+
+### Fixed
+- The gap storm: out-of-order trade arrival tolerated — no longer swallowing
+  ~16% of fills (#107); reconciler ignores AE tombstones, handled FK-race log
+  deduped (#108).
+- clusterOrderId recorded on trade-driven fills so instant-cross orders don't
+  persist as 0 (#122).
+- Hold/settle integrity: floor-guarded settle — an under-held order can't
+  drive locked negative (#88); open-order slot released on FILLED, not just
+  cancels (#112); amend/iceberg hold integrity + synthetic thread-safety
+  (#96); age-gated release-bearing membership-repair terminalization (#97).
+- Order lifecycle: PUT amend spans the cancel-and-replace legs — no lost
+  orders (#90); queue-full rejections terminalize immediately — no
+  PENDING_NEW zombies (#92); ICEBERG submits its first display slice at
+  creation (#87) and multi-slice refill works on both sides of a fill; slice
+  FILLED no longer terminalizes the parent (#94); market/stop BUY no longer
+  misrejected on balance — hold ran before the price estimate (#83).
+- Per-market risk config + manual circuit-breaker trips persist across
+  restarts (#113).
+- Cluster client: egress polling interleaved with order-submit back-pressure
+  (#123); old AeronCluster teardown guaranteed on every reconnect path (#115).
+- REST/WS plane: real HTTP/1.1 keep-alive (#93); user WS accepts more than
+  one connection per OMS lifetime (#69); shared order/risk state made
+  thread-safe (#71).
+
+### Changed
+- The dead in-process double-entry ledger path is deleted — the Assets Engine
+  is the money authority; audit-log default path + rotation (#114).
+- Aeron 1.52.2, Agrona 2.5.0, SBE 1.39.0, PostgreSQL 42.7.13, Jackson bom
+  2.22.1; netty 4.2.16.Final (CVE-2026-44891), earlier pinned via bom import
+  (CVE-2026-44249); jackson-core GHSA-r7wm-3cxj-wff9 fixed by the bom bump (#75-#79, #91, #117, #118, #121).
+- Contact email is info@openexch.io (#80).
 
 ## [0.3.0-beta] - 2026-07-05
 
