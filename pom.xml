@@ -48,7 +48,7 @@
         <netty.version>4.2.16.Final</netty.version>
 
         <!-- Jackson -->
-        <jackson.version>2.22.0</jackson.version>
+        <jackson.version>2.22.1</jackson.version>
 
         <!-- Redis -->
         <lettuce.version>7.6.0.RELEASE</lettuce.version>
