@@ -40,12 +40,9 @@ import com.openexchange.oms.core.OrderLifecycleManager;
 import com.openexchange.oms.core.StartupStateRebuilder;
 import com.openexchange.oms.core.SyntheticOrderEngine;
 import com.openexchange.oms.ledger.BalanceStore;
-import com.openexchange.oms.ledger.InMemoryBalanceStore;
 import com.openexchange.oms.ledger.LedgerService;
-import com.openexchange.oms.ledger.RedisBalanceStore;
 import com.openexchange.oms.assets.AeronAssetsBalanceStore;
 import com.openexchange.oms.assets.AssetsClusterClient;
-import io.lettuce.core.RedisClient;
 import com.openexchange.oms.persistence.PostgresOrderRepository;
 import com.openexchange.oms.persistence.PostgresExecutionRepository;
 import com.openexchange.oms.persistence.PostgresUserRepository;
@@ -72,11 +69,11 @@ public class OmsApplication {
     private ClusterClient clusterClient;
     private AuditLog auditLog;
     private PrometheusMeterRegistry meterRegistry;
-    /** Only set when {@code OMS_BALANCE_STORE=aeron}; a second, isolated Aeron client (E3/E4). */
+    /** The OMS-side Assets Engine client (E3/E4) — the money authority. */
     private AssetsClusterClient assetsClusterClient;
-    /** Only set when {@code OMS_BALANCE_STORE=aeron}; the Q3 orphan-hold reconciler (E5). */
+    /** The Q3 orphan-hold reconciler (E5). */
     private AssetsHoldReconciler assetsHoldReconciler;
-    /** Only set when {@code OMS_BALANCE_STORE=aeron} + PG present; the CQRS balance read-model writer (E6). */
+    /** The CQRS balance read-model writer (E6); set when PG is present. */
     private PgBalanceReadModelWriter balanceReadModelWriter;
 
     public static void main(String[] args) {
@@ -125,90 +122,50 @@ public class OmsApplication {
             log.warn("PostgreSQL not available — running without persistence: {}", e.getMessage());
         }
 
-        // 2. Create balance store (E3/E4): explicit selection via OMS_BALANCE_STORE, built and
-        // (for aeron) fully ready BEFORE anything below can serve traffic — a wrong balance is a
-        // wrong dollar, so every failure path here is FATAL rather than a silent fallback.
-        BalanceStore balanceStore;
-        AeronAssetsBalanceStore aeronBalanceStore = null; // non-null only for metrics registration below
-        BalanceStoreKind balanceStoreKind = BalanceStoreKind.fromConfigValue(config.balanceStore());
-        switch (balanceStoreKind) {
-            case REDIS -> {
-                try {
-                    String redisUri = "redis://" + config.redisHost() + ":" + config.redisPort();
-                    RedisClient redisClient = RedisClient.create(redisUri);
-                    redisClient.connect().close(); // test connectivity
-                    balanceStore = new RedisBalanceStore(redisClient);
-                    log.info("Balance store initialized (Redis: {})", redisUri);
-                } catch (Exception e) {
-                    // The old behavior silently fell back to InMemoryBalanceStore here — a standing
-                    // money bug (balances vanish on restart with no operator signal). Redis being
-                    // down at boot is now FATAL; opt into non-durable balances explicitly instead
-                    // (OMS_BALANCE_STORE=memory) if that is really what's wanted.
-                    log.error("FATAL: Redis balance store unavailable at boot ({}:{}) — refusing to "
-                                    + "start with a silent in-memory fallback. Fix Redis, or set "
-                                    + "OMS_BALANCE_STORE=memory to opt into non-durable balances "
-                                    + "explicitly.",
-                            config.redisHost(), config.redisPort(), e);
-                    System.exit(1);
-                    return; // unreachable; satisfies definite-assignment of balanceStore below
-                }
-            }
-            case AERON -> {
-                log.info("Balance store: aeron (Assets Engine cluster)");
-                AssetsClusterClient assetsClient = new AssetsClusterClient();
-                AeronAssetsBalanceStore store = new AeronAssetsBalanceStore(
-                        assetsClient, Asset.values().length, config.aeHoldTimeoutMs(), config.aeAckTimeoutMs());
-                // The store's constructor above already called assetsClient.setEgressListener(store),
-                // so the listener is attached BEFORE polling starts. Ordering this the other way
-                // around (start polling, then construct the store) is a real race, not a theoretical
-                // one: the AE cluster is typically local, and the polling loop's first tryReconnect()
-                // can complete in well under a millisecond — onConnected() would fire with no
-                // listener attached yet, the balance-snapshot bootstrap request would never be sent,
-                // and isProjectionReady() would then wait out the full connect timeout for nothing
-                // (recovering only on a later leader change, if one ever happens).
-                Thread aePollingThread = new Thread(assetsClient::startPolling, "oms-assets-poll");
-                aePollingThread.setDaemon(true);
-                aePollingThread.start();
-                assetsClusterClient = assetsClient; // for graceful shutdown in stop()
+        // 2. Balance store: the Assets Engine cluster is the money authority (v0.4).
+        // There is no alternative and nothing to configure — money lives on the AE.
+        // Its construction is fully ready BEFORE anything below can serve traffic,
+        // and every failure is FATAL, exactly like a missing matching-engine cluster:
+        // a wrong balance is a wrong dollar, so we refuse to serve rather than degrade.
+        log.info("Balance store: Assets Engine cluster (the money authority)");
+        AssetsClusterClient assetsClient = new AssetsClusterClient();
+        AeronAssetsBalanceStore aeronBalanceStore = new AeronAssetsBalanceStore(
+                assetsClient, Asset.values().length, config.aeHoldTimeoutMs(), config.aeAckTimeoutMs());
+        // The store's constructor above already called assetsClient.setEgressListener(store),
+        // so the listener is attached BEFORE polling starts. Ordering this the other way
+        // around (start polling, then construct the store) is a real race, not a theoretical
+        // one: the AE cluster is typically local, and the polling loop's first tryReconnect()
+        // can complete in well under a millisecond — onConnected() would fire with no
+        // listener attached yet, the balance-snapshot bootstrap request would never be sent,
+        // and isProjectionReady() would then wait out the full connect timeout for nothing
+        // (recovering only on a later leader change, if one ever happens).
+        Thread aePollingThread = new Thread(assetsClient::startPolling, "oms-assets-poll");
+        aePollingThread.setDaemon(true);
+        aePollingThread.start();
+        assetsClusterClient = assetsClient; // for graceful shutdown in stop()
 
-                if (!awaitProjectionReady(store, config.aeConnectTimeoutMs())) {
-                    log.error("FATAL: AE balance projection not ready within {}ms — refusing to "
-                                    + "serve traffic against a stale/unknown balance view",
-                            config.aeConnectTimeoutMs());
-                    System.exit(1);
-                    return; // unreachable
-                }
-
-                // Boot-time dedupe floor for the local settle side effects (risk onFill, exec
-                // persist, applyFill) — the AE itself settles money asynchronously off the ME
-                // journal feed, so this floor is what stops the OMS re-applying a trade whose
-                // execution row already made it to Postgres before a restart. PG is therefore
-                // mandatory for this store, unlike the general "PG is optional" posture above.
-                if (executionRepo == null) {
-                    log.error("FATAL: PostgreSQL is unavailable but OMS_BALANCE_STORE=aeron — the "
-                            + "settle dedupe high-water floor (PG max(trade_id)) is money-relevant "
-                            + "and cannot start unseeded.");
-                    System.exit(1);
-                    return; // unreachable
-                }
-                store.initSettleHighWater(executionRepo.maxTradeId());
-
-                balanceStore = store;
-                aeronBalanceStore = store;
-            }
-            case MEMORY -> {
-                log.warn("NON-DURABLE BALANCE STORE (explicit): OMS_BALANCE_STORE=memory — balances "
-                        + "live only in process memory and are LOST on every restart. This is only "
-                        + "for local dev/testing; never run production traffic on it.");
-                balanceStore = new InMemoryBalanceStore();
-            }
-            default -> {
-                log.error("FATAL: unknown OMS_BALANCE_STORE '{}' (expected redis, aeron, or memory)",
-                        config.balanceStore());
-                System.exit(1);
-                return; // unreachable
-            }
+        if (!awaitProjectionReady(aeronBalanceStore, config.aeConnectTimeoutMs())) {
+            log.error("FATAL: Assets Engine balance projection not ready within {}ms — refusing to "
+                            + "serve traffic against a stale/unknown balance view. The AE is the "
+                            + "money authority; a healthy AE cluster is required to start.",
+                    config.aeConnectTimeoutMs());
+            System.exit(1);
+            return; // unreachable
         }
+
+        // Boot-time dedupe floor for the local settle side effects (risk onFill, exec
+        // persist, applyFill) — the AE itself settles money asynchronously off the ME
+        // journal feed, so this floor is what stops the OMS re-applying a trade whose
+        // execution row already made it to Postgres before a restart. PG is therefore
+        // mandatory: money settlement cannot start unseeded.
+        if (executionRepo == null) {
+            log.error("FATAL: PostgreSQL is unavailable — the settle dedupe high-water floor "
+                    + "(PG max(trade_id)) is money-relevant and cannot start unseeded.");
+            System.exit(1);
+            return; // unreachable
+        }
+        aeronBalanceStore.initSettleHighWater(executionRepo.maxTradeId());
+        BalanceStore balanceStore = aeronBalanceStore;
 
         // 3. ID generator
         SnowflakeIdGenerator idGenerator = new SnowflakeIdGenerator(config.nodeId());

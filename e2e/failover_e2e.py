@@ -5,11 +5,13 @@ Full-stack failover E2E (oms#41 / P5.1) — P1's acceptance test in miniature,
 runnable on a clean clone (GitHub Actions) or a dev box.
 
 What it does:
-  1. Resets a dedicated Postgres database (never `oms`) and, if needed,
-     spawns a private Redis.
+  1. Resets a dedicated Postgres database (never `oms`).
   2. Launches a REAL 3-node Aeron cluster (embedded media drivers, isolated
-     aeron dirs + port base so a live dev cluster on the same box is safe)
-     and a REAL OMS wired to it.
+     aeron dirs + port base so a live dev cluster on the same box is safe),
+     a REAL single-node Assets Engine (the sole balance store — the OMS
+     refuses to boot without it), the REAL settlement bridge (ME journal ->
+     AE; without it no fill ever consumes its hold), and a REAL OMS wired
+     to all of it.
   3. Seeds two users and streams crossing limit orders.
   4. kill -9's the CURRENT LEADER mid-load, keeps submitting through the
      election, waits for the new leader + OMS reconnect, then restarts the
@@ -28,12 +30,15 @@ tails are printed.
 
 Env (all optional on CI; defaults are safe next to a live dev stack):
   E2E_MATCH_JAR   path to match-cluster.jar   (default ../match/... layout)
+  E2E_ASSETS_JAR  path to assets-cluster.jar  (default ../assets/... layout)
+  E2E_BRIDGE_JAR  path to assets-bridge.jar   (default ../assets/... layout)
   E2E_OMS_JAR     path to oms-app.jar         (default oms-app/target/oms-app.jar)
   E2E_WORKDIR     scratch dir                 (default mkdtemp)
   E2E_PORT_BASE   cluster port base           (default 19000; live box uses 9000)
+  E2E_AE_PORT_BASE  AE cluster port base      (default 19300; live box uses 9300)
+  E2E_AE_EGRESS_PORT  AE egress port          (default 19393; live box uses 9393)
   E2E_OMS_HTTP / E2E_OMS_GRPC / E2E_EGRESS_PORT   (defaults 18080/19091/19093)
   E2E_PG_HOST/PORT/DB/USER/PASSWORD           (defaults localhost/5432/oms_e2e/oms/-)
-  E2E_REDIS_HOST/PORT                         (default: spawn redis-server on 16379)
 """
 import atexit
 import json
@@ -55,12 +60,19 @@ REPO = os.path.abspath(os.path.join(HERE, ".."))
 # ---------- config ----------
 MATCH_JAR = os.path.abspath(os.environ.get(
     "E2E_MATCH_JAR", os.path.join(REPO, "..", "match", "match-cluster", "target", "match-cluster.jar")))
+ASSETS_JAR = os.path.abspath(os.environ.get(
+    "E2E_ASSETS_JAR", os.path.join(REPO, "..", "assets", "assets-cluster", "target", "assets-cluster.jar")))
+BRIDGE_JAR = os.path.abspath(os.environ.get(
+    "E2E_BRIDGE_JAR", os.path.join(REPO, "..", "assets", "assets-bridge", "target", "assets-bridge.jar")))
 OMS_JAR = os.path.abspath(os.environ.get(
     "E2E_OMS_JAR", os.path.join(REPO, "oms-app", "target", "oms-app.jar")))
 SCHEMA_SQL = os.path.join(
     REPO, "oms-persistence", "src", "main", "resources", "db", "migration", "V001__init_schema.sql")
 
 PORT_BASE = int(os.environ.get("E2E_PORT_BASE", "19000"))
+# Mirrors the live layout (match 9000 / AE 9300 / AE egress 9393) shifted by +10000.
+AE_PORT_BASE = int(os.environ.get("E2E_AE_PORT_BASE", "19300"))
+AE_EGRESS_PORT = int(os.environ.get("E2E_AE_EGRESS_PORT", "19393"))
 OMS_HTTP = int(os.environ.get("E2E_OMS_HTTP", "18080"))
 OMS_GRPC = int(os.environ.get("E2E_OMS_GRPC", "19091"))
 EGRESS_PORT = int(os.environ.get("E2E_EGRESS_PORT", "19093"))
@@ -71,9 +83,6 @@ PG_DB = os.environ.get("E2E_PG_DB", "oms_e2e")
 PG_USER = os.environ.get("E2E_PG_USER", "oms")
 PG_PASSWORD = os.environ.get("E2E_PG_PASSWORD", os.environ.get("PGPASSWORD", ""))
 
-REDIS_HOST = os.environ.get("E2E_REDIS_HOST", "127.0.0.1")
-REDIS_PORT = int(os.environ.get("E2E_REDIS_PORT", "0"))  # 0 = spawn private on 16379
-
 # Pin every spawned process to these CPUs (taskset -c syntax, e.g. "20-23").
 # On a dev box that also runs the live stack this is close to mandatory:
 # an unpinned 3-node cluster can starve the desktop AND the live cluster's
@@ -83,7 +92,7 @@ CPUSET = os.environ.get("E2E_CPUSET", "")
 BASE = f"http://127.0.0.1:{OMS_HTTP}"
 FP = 10 ** 8  # 8-dp fixed point
 
-# Run-scoped users so a shared Redis never bleeds balances between runs.
+# Run-scoped users so a reused workdir/AE never bleeds balances between runs.
 RUN_TAG = int(time.time()) % 100000
 BUYER = 900_000_000 + RUN_TAG * 2
 SELLER = BUYER + 1
@@ -270,6 +279,11 @@ def cluster_env(node_id):
         "TRANSPORT_LOG_TERM_LENGTH": os.environ.get("E2E_LOG_TERM_LENGTH", "4m"),
         # keep clear of a live stack's 9500..9502
         "METRICS_PORT": str(PORT_BASE + 500 + node_id),
+        # The money path: each node journals applied settlements to its archive;
+        # the settlement bridge tails it into the AE. Without this, AE holds of
+        # FILLED orders are never consumed (the OMS's settle() moves no money).
+        "SETTLEMENT_JOURNAL_ENABLED": "true",
+        "SETTLEMENT_JOURNAL_DIR": os.path.join(WORKDIR, "journal"),
     }
 
 
@@ -336,6 +350,64 @@ def find_leader(exclude=None):
     return None
 
 
+# ---------- Assets Engine ----------
+
+def start_ae():
+    """Single-node AE cluster: the OMS's only balance store — no AE, no OMS boot."""
+    os.makedirs(os.path.join(WORKDIR, "ae0"), exist_ok=True)
+    os.makedirs(shm_base(), exist_ok=True)
+    cmd = java_cmd() + [
+        "-Xms128m", "-Xmx768m",
+        # AE derives <aeron.dir>-assets-<id>-driver — same isolation as the
+        # match nodes, distinct suffix so the two never collide.
+        f"-Daeron.dir={os.path.join(shm_base(), 'aeron')}",
+        "-jar", ASSETS_JAR,
+    ]
+    env = {
+        "CLUSTER_NODE": "0",
+        "CLUSTER_ADDRESSES": "127.0.0.1",
+        "CLUSTER_PORT_BASE": str(AE_PORT_BASE),
+        # Cluster/archive state (the money ledger) — under the workdir, not shm.
+        "BASE_DIR": os.path.join(WORKDIR, "ae0"),
+        "TRANSPORT_DRIVER_MODE": "embedded",
+        "TRANSPORT_IDLE_MODE": "backoff",
+        "TRANSPORT_TERM_LENGTH": os.environ.get("E2E_TERM_LENGTH", "1m"),
+        "TRANSPORT_LOG_TERM_LENGTH": os.environ.get("E2E_LOG_TERM_LENGTH", "4m"),
+    }
+    return spawn("ae0", cmd, env=env)
+
+
+def start_bridge():
+    """Settlement bridge: tails the ME settlement journal (each node's archive)
+    and feeds Settle/Release into the AE. Stateless; own pid-suffixed aeron dir."""
+    cmd = java_cmd() + ["-Xms64m", "-Xmx256m", "-jar", BRIDGE_JAR]
+    env = {
+        "BRIDGE_ME_JOURNAL_ARCHIVES": ",".join(
+            f"127.0.0.1:{PORT_BASE + n * 100 + 10}" for n in (0, 1, 2)),
+        "BRIDGE_AE_CLUSTER_ADDRESSES": "127.0.0.1",
+        "BRIDGE_AE_PORT_BASE": str(AE_PORT_BASE),
+        # Must differ from the OMS client's AE egress endpoint.
+        "BRIDGE_AE_EGRESS_ENDPOINT": f"127.0.0.1:{AE_EGRESS_PORT + 1}",
+        "BRIDGE_METRICS_PORT": "0",
+    }
+    return spawn("bridge", cmd, env=env)
+
+
+def ae_ready():
+    """Single-node AE has taken leadership (ClusterTool view — same check the
+    live box uses; never trust recording.log size). With BASE_DIR set, the AE
+    puts cluster state directly under <BASE_DIR>/cluster."""
+    cluster_dir = os.path.join(WORKDIR, "ae0", "cluster")
+    r = subprocess.run(
+        java_cmd() + [
+            "-Daeron.cluster.tool.timeout=5000",
+            "-Daeron.client.liveness.timeout=5000000000",
+            "-cp", ASSETS_JAR, "io.aeron.cluster.ClusterTool", cluster_dir, "list-members"],
+        capture_output=True, text=True, timeout=15)
+    m = re.search(r"leaderMemberId=(\d+)", r.stdout + r.stderr)
+    return bool(m and int(m.group(1)) >= 0)
+
+
 # ---------- OMS ----------
 
 def start_oms():
@@ -346,8 +418,10 @@ def start_oms():
         "OMS_POSTGRES_URL": f"jdbc:postgresql://{PG_HOST}:{PG_PORT}/{PG_DB}",
         "OMS_POSTGRES_USER": PG_USER,
         "OMS_POSTGRES_PASSWORD": PG_PASSWORD,
-        "OMS_REDIS_HOST": REDIS_HOST,
-        "OMS_REDIS_PORT": str(REDIS_PORT),
+        "AE_CLUSTER_ADDRESSES": "127.0.0.1",
+        "AE_CLUSTER_PORT_BASE": str(AE_PORT_BASE),
+        "AE_EGRESS_HOST": "127.0.0.1",
+        "AE_EGRESS_PORT": str(AE_EGRESS_PORT),
         "OMS_AUDIT_LOG": "off",
         "OMS_NODE_ID": "7",
         "CLUSTER_ADDRESSES": "127.0.0.1,127.0.0.1,127.0.0.1",
@@ -511,11 +585,13 @@ def assert_positions():
 # ---------- main ----------
 
 def main():
-    global WORKDIR, LOGDIR, REDIS_PORT
+    global WORKDIR, LOGDIR
 
     if PG_DB in ("oms", "postgres", "template0", "template1"):
         fail(f"refusing to run against database '{PG_DB}'")
     for path, what in ((MATCH_JAR, "match-cluster.jar (E2E_MATCH_JAR)"),
+                       (ASSETS_JAR, "assets-cluster.jar (E2E_ASSETS_JAR)"),
+                       (BRIDGE_JAR, "assets-bridge.jar (E2E_BRIDGE_JAR)"),
                        (OMS_JAR, "oms-app.jar (E2E_OMS_JAR)"),
                        (SCHEMA_SQL, "schema sql")):
         if not os.path.isfile(path):
@@ -542,25 +618,20 @@ def main():
     psql_file(SCHEMA_SQL)
     log(f"postgres ready: {PG_DB} schema reset")
 
-    # -- Redis: reuse if given, else spawn a private one
-    if REDIS_PORT == 0:
-        REDIS_PORT = 16379
-        if port_free(REDIS_PORT):
-            if not shutil.which("redis-server"):
-                fail("redis-server not found and E2E_REDIS_PORT not set")
-            spawn("redis", ["redis-server", "--port", str(REDIS_PORT),
-                            "--save", "", "--appendonly", "no",
-                            "--dir", WORKDIR])
-            wait_for("redis", lambda: not port_free(REDIS_PORT), 15)
-        log(f"redis on {REDIS_PORT} (private)")
-    else:
-        log(f"redis on {REDIS_PORT} (external)")
+    # -- Single-node Assets Engine (started first: it forms in seconds and the
+    #    OMS's boot gate FATALs without it)
+    start_ae()
 
     # -- 3-node cluster
     for nid in (0, 1, 2):
         start_node(nid)
     leader = wait_for("initial leader election", find_leader, 90, interval=2)
     log(f"cluster up, leader = node{leader}")
+    wait_for("assets engine leadership", ae_ready, 90, interval=2)
+    log("assets engine up (single node, leader)")
+
+    # -- Settlement bridge (ME journal -> AE); after both sides it connects to
+    start_bridge()
 
     # -- OMS
     start_oms()

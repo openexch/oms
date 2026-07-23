@@ -9,19 +9,13 @@ package com.openexchange.oms.app;
  * "jwt" (HS256, requires jwtSecret), or "dev" (accepts everything — must be
  * opted into explicitly, never production).
  *
- * Balance store (E3/E4): balanceStore selects the {@code BalanceStore} —
- * "redis" (default; a failed connectivity probe is FATAL, no silent
- * in-memory fallback), "aeron" (the AE-backed money store; also gates on
- * PG availability and boot-time balance-projection readiness), or "memory"
- * (explicit non-durable opt-in, dev/test only). The AE tunables
- * (aeHoldTimeoutMs/aeAckTimeoutMs/aeConnectTimeoutMs) only apply when
- * balanceStore=aeron.
+ * Balance store: the Assets Engine cluster is the money authority — there is
+ * no alternative and nothing to select. The AE tunables
+ * (aeHoldTimeoutMs/aeAckTimeoutMs/aeConnectTimeoutMs) size the OMS's client.
  */
 public record OmsConfig(
     int httpPort,
     int grpcPort,
-    String redisHost,
-    int redisPort,
     String postgresUrl,
     String postgresUser,
     String postgresPassword,
@@ -33,7 +27,6 @@ public record OmsConfig(
     String jwtSecret,
     String corsOrigins,
     String auditLogPath,
-    String balanceStore,
     long aeHoldTimeoutMs,
     long aeAckTimeoutMs,
     long aeConnectTimeoutMs
@@ -42,8 +35,6 @@ public record OmsConfig(
         return new OmsConfig(
             intProp("OMS_HTTP_PORT", 8080),
             intProp("OMS_GRPC_PORT", 9090),
-            prop("OMS_REDIS_HOST", "localhost"),
-            intProp("OMS_REDIS_PORT", 6379),
             prop("OMS_POSTGRES_URL", "jdbc:postgresql://localhost:5432/oms"),
             prop("OMS_POSTGRES_USER", "oms"),
             // No default password (oms#37): unset means Postgres auth fails and
@@ -59,7 +50,6 @@ public record OmsConfig(
             // Default under ~/.local/log/oms (AuditLog.open creates the directories),
             // not the working directory where it used to land in the repo root.
             prop("OMS_AUDIT_LOG", System.getProperty("user.home") + "/.local/log/oms/oms-audit.log"),
-            prop("OMS_BALANCE_STORE", "redis"),
             longProp("OMS_AE_HOLD_TIMEOUT_MS", 250L),
             longProp("OMS_AE_ACK_TIMEOUT_MS", 1000L),
             longProp("OMS_AE_CONNECT_TIMEOUT_MS", 30_000L)

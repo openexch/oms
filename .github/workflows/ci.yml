@@ -46,8 +46,9 @@ jobs:
         run: mvn -B clean verify
 
   # Full-stack failover E2E (oms#41 / P5.1): real 3-node Aeron cluster +
-  # real OMS + Postgres + Redis on the runner; kills the leader mid-load and
-  # asserts convergence + exact ledger invariants. See e2e/README.md.
+  # real single-node Assets Engine + real OMS + Postgres on the runner; kills
+  # the leader mid-load and asserts convergence + exact ledger invariants.
+  # See e2e/README.md.
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -60,14 +61,6 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      redis:
-        image: redis:7
-        ports: ["6379:6379"]
-        options: >-
-          --health-cmd "redis-cli ping"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -106,8 +99,10 @@ jobs:
       - name: Build match-cluster jar
         run: mvn -B -f _match/pom.xml install -DskipTests -pl match-cluster -am
 
+      # install also produces the shaded assets-cluster.jar and assets-bridge.jar
+      # the E2E launches as its single-node Assets Engine + settlement bridge.
       - name: Install assets modules into local Maven repo
-        run: mvn -B -f _assets/pom.xml install -DskipTests -pl assets-common,assets-cluster -am
+        run: mvn -B -f _assets/pom.xml install -DskipTests -pl assets-common,assets-cluster,assets-bridge -am
 
       - name: Build OMS app jar
         run: mvn -B package -DskipTests
@@ -115,10 +110,11 @@ jobs:
       - name: Failover E2E
         env:
           E2E_MATCH_JAR: _match/match-cluster/target/match-cluster.jar
+          E2E_ASSETS_JAR: _assets/assets-cluster/target/assets-cluster.jar
+          E2E_BRIDGE_JAR: _assets/assets-bridge/target/assets-bridge.jar
           E2E_OMS_JAR: oms-app/target/oms-app-1.0-SNAPSHOT.jar
           E2E_PG_USER: postgres
           E2E_PG_PASSWORD: postgres
-          E2E_REDIS_PORT: "6379"
           E2E_WORKDIR: ${{ runner.temp }}/e2e
         run: python3 e2e/failover_e2e.py
 
