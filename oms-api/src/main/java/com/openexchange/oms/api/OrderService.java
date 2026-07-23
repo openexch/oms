@@ -45,9 +45,9 @@ public interface OrderService {
     int getActiveOrderCount();
 
     /**
-     * AE-backed balance store's boot-time projection readiness (E3/E4), or {@code null} when a
-     * different {@code BalanceStore} (redis/memory) is active — the health payload surfaces this
-     * field only when non-null so it never falsely implies an AE store is in play.
+     * The Assets Engine balance store's boot-time projection readiness (E3/E4), or {@code null}
+     * when no AE store is wired (only the in-memory test double) — the health payload surfaces
+     * this field only when non-null so it never falsely implies an AE store is in play.
      */
     Boolean isAssetsProjectionReady();
 

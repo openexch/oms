@@ -1,10 +1,11 @@
 # Full-stack failover E2E (oms#41 / P5.1)
 
 `failover_e2e.py` is P1's acceptance test in miniature, runnable on a clean
-clone: it launches a REAL 3-node Aeron cluster (embedded media drivers) and a
-REAL OMS against Postgres + Redis, streams crossing limit orders, `kill -9`s
-the cluster LEADER mid-load, keeps submitting through the election, restarts
-the killed node, drains to quiescence, and asserts:
+clone: it launches a REAL 3-node Aeron cluster (embedded media drivers), a
+REAL single-node Assets Engine (the sole balance store — the OMS refuses to
+boot without it) and a REAL OMS against Postgres, streams crossing limit
+orders, `kill -9`s the cluster LEADER mid-load, keeps submitting through the
+election, restarts the killed node, drains to quiescence, and asserts:
 
 - every order in history is terminal (nothing stuck open),
 - per-order `filledQty == SUM(executions.quantity)` in Postgres,
@@ -15,19 +16,20 @@ the killed node, drains to quiescence, and asserts:
 - the failover was real: the leader changed and orders were accepted
   after the kill.
 
-CI runs it in the `e2e` job (Postgres/Redis as services). A green run takes
+CI runs it in the `e2e` job (Postgres as a service). A green run takes
 about 2 minutes after the builds.
 
 ## Running on a dev box
 
-Safe next to a live stack: isolated port base (19000), isolated aeron dirs
-under `/dev/shm/oms-e2e-*`, its own database and (by default) its own Redis.
+Safe next to a live stack: isolated port bases (match 19000, AE 19300),
+isolated aeron dirs under `/dev/shm/oms-e2e-*`, and its own database.
 
 ```bash
 # one-time: create the database (any superuser)
 psql -U postgres -c 'CREATE DATABASE oms_e2e OWNER oms'
 
 mvn -f ../match/pom.xml package -DskipTests -pl match-cluster -am
+mvn -f ../assets/pom.xml package -DskipTests -pl assets-cluster -am
 mvn package -DskipTests && cp oms-app/target/oms-app-1.0-SNAPSHOT.jar oms-app/target/oms-app.jar
 
 E2E_CPUSET=20-23 E2E_PG_PASSWORD=... python3 e2e/failover_e2e.py
@@ -38,9 +40,10 @@ and a live cluster's 1s leader heartbeat; term buffers are already shrunk to
 1m (`E2E_TERM_LENGTH`) because 16m terms across a second full stack froze a
 31G box via page-reclaim storms.
 
-All knobs (`E2E_MATCH_JAR`, `E2E_OMS_JAR`, `E2E_PORT_BASE`, `E2E_PG_*`,
-`E2E_REDIS_*`, `E2E_WORKDIR`) are documented at the top of the script.
-The harness refuses to run against a database named `oms`.
+All knobs (`E2E_MATCH_JAR`, `E2E_ASSETS_JAR`, `E2E_OMS_JAR`,
+`E2E_PORT_BASE`, `E2E_AE_PORT_BASE`, `E2E_PG_*`, `E2E_WORKDIR`) are
+documented at the top of the script. The harness refuses to run against a
+database named `oms`.
 
 ## Found by this harness (fixed in the same PR)
 

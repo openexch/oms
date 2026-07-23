@@ -17,7 +17,7 @@ Order management system that sits between trading clients and the [Match Engine]
 - **Dual API** — REST (Netty HTTP) and gRPC with server-side streaming for orders, executions, and balances
 - **Hot-reloadable risk config** — Update risk parameters per market at runtime via admin API
 - **PostgreSQL persistence** — Orders and executions persisted via HikariCP connection pool (graceful degradation if DB unavailable)
-- **Redis balance store** — Optional Redis-backed balance store via Lettuce with Lua-scripted atomic operations (falls back to in-memory)
+- **Assets Engine balance store** — the AE cluster is the sole money authority: every hold/release/settle is a consensus command; there is no alternative store, no config, and no fallback — the OMS refuses to start without a healthy AE
 - **Fixed-point arithmetic** — 8-decimal precision (10^8 scaling) throughout, consistent with the match engine
 - **5 market pairs** — BTC, ETH, SOL, XRP, DOGE against USD (shared via `MarketInfo` from match-common)
 
@@ -104,11 +104,14 @@ mvn test
 java -jar oms-app/target/oms-app-1.0-SNAPSHOT.jar
 ```
 
-The OMS starts with sensible defaults: HTTP on port 8080, gRPC on port 9090, in-memory balance store.
+The OMS starts with sensible defaults: HTTP on port 8080, gRPC on port 9090.
+Two hard dependencies gate boot — a healthy Assets Engine cluster (the money
+authority; connection via `AE_*` env vars below) and a reachable PostgreSQL
+(the settle-dedupe floor). Missing either is FATAL, exactly like a missing
+matching-engine cluster.
 
-For durable persistence, create the database and apply the schema before
-starting (the OMS does not auto-migrate; without a reachable PostgreSQL it
-runs in-memory only):
+Create the database and apply the schema before starting (the OMS does not
+auto-migrate):
 
 ```bash
 createdb -U postgres oms
@@ -258,8 +261,13 @@ All configuration via environment variables with sensible defaults:
 | `OMS_HTTP_PORT` | `8080` | REST API port |
 | `OMS_GRPC_PORT` | `9090` | gRPC server port |
 | `OMS_NODE_ID` | `0` | Snowflake ID generator node (0-1023) |
-| `OMS_REDIS_HOST` | `localhost` | Redis host (for RedisBalanceStore) |
-| `OMS_REDIS_PORT` | `6379` | Redis port |
+| `AE_CLUSTER_ADDRESSES` | `127.0.0.1` | Comma-separated Assets Engine node hostnames |
+| `AE_CLUSTER_PORT_BASE` | `9300` | AE cluster port base |
+| `AE_EGRESS_HOST` | `127.0.0.1` | OMS-side endpoint the AE publishes responses to (egress channel) |
+| `AE_EGRESS_PORT` | `9393` | AE egress port on that endpoint |
+| `OMS_AE_HOLD_TIMEOUT_MS` | `250` | Per-hold AE round-trip budget before the order is rejected |
+| `OMS_AE_ACK_TIMEOUT_MS` | `1000` | AE ack timeout for release/settle commands |
+| `OMS_AE_CONNECT_TIMEOUT_MS` | `30000` | Boot gate: max wait for the AE balance projection before FATAL |
 | `OMS_POSTGRES_URL` | `jdbc:postgresql://localhost:5432/oms` | PostgreSQL URL |
 | `OMS_POSTGRES_USER` | `oms` | PostgreSQL user |
 | `OMS_POSTGRES_PASSWORD` | `oms` | PostgreSQL password |
