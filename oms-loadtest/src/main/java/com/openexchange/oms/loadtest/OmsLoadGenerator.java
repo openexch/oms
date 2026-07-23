@@ -24,9 +24,12 @@ public class OmsLoadGenerator {
         System.out.printf("Users: %d%n", config.getNumUsers());
         System.out.println();
 
-        // Pre-fund test users
-        System.out.println("Funding test users...");
-        fundTestUsers(config);
+        // Register + auto-fund test users. Demo auth (OMS_AUTH_MODE=demo): POST /api/v1/auth/register
+        // creates the user, funds demo balances, and mints a bearer token. Orders must carry that
+        // token AND the minted userId (the API forbids acting as another user).
+        System.out.println("Registering + funding test users...");
+        Users users = registerUsers(config);
+        System.out.printf("Registered %d users%n", users.ids.length);
 
         OmsMetricsCollector metrics = new OmsMetricsCollector();
         long totalTarget = (long) config.getTargetRate() * (config.getDurationSeconds() + config.getWarmupSeconds());
@@ -37,7 +40,7 @@ public class OmsLoadGenerator {
         Thread[] workers = new Thread[config.getThreads()];
         for (int i = 0; i < config.getThreads(); i++) {
             workers[i] = new Thread(
-                    new HttpOrderPublisher(config, metrics, sentCounter, totalTarget, ratePerThread),
+                    new HttpOrderPublisher(config, metrics, sentCounter, totalTarget, ratePerThread, users),
                     "loadtest-worker-" + i);
             workers[i].setDaemon(true);
         }
@@ -67,39 +70,53 @@ public class OmsLoadGenerator {
         metrics.printFinalReport(sentCounter.get());
     }
 
-    private static void fundTestUsers(OmsLoadConfig config) throws Exception {
+    /** Registered load-test users: parallel arrays of minted userId + bearer token. */
+    static final class Users {
+        final long[] ids;
+        final String[] tokens;
+        Users(long[] ids, String[] tokens) { this.ids = ids; this.tokens = tokens; }
+    }
+
+    private static Users registerUsers(OmsLoadConfig config) throws Exception {
         HttpClient client = HttpClient.newHttpClient();
         String baseUrl = "http://" + config.getOmsHost() + ":" + config.getOmsPort();
-
-        for (int userId = 1; userId <= config.getNumUsers(); userId++) {
-            // Deposit USD (asset 0) - $1,000,000
-            String depositJson = "{\"assetId\":0,\"amount\":1000000.0}";
+        int n = config.getNumUsers();
+        long[] ids = new long[n];
+        String[] tokens = new String[n];
+        long stamp = System.nanoTime() % 100000000L; // keep username <=20 chars (validation limit)
+        for (int i = 0; i < n; i++) {
+            String body = String.format("{\"username\":\"ld%d_%d\",\"password\":\"pass1234\"}", stamp, i);
             HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(baseUrl + "/api/v1/accounts/" + userId + "/deposit"))
+                    .uri(URI.create(baseUrl + "/api/v1/auth/register"))
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(depositJson))
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
                     .build();
-            client.send(req, HttpResponse.BodyHandlers.ofString());
-
-            // Deposit BTC (asset 1)
-            depositJson = "{\"assetId\":1,\"amount\":100.0}";
-            req = HttpRequest.newBuilder()
-                    .uri(URI.create(baseUrl + "/api/v1/accounts/" + userId + "/deposit"))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(depositJson))
-                    .build();
-            client.send(req, HttpResponse.BodyHandlers.ofString());
-
-            // Deposit ETH (asset 2)
-            depositJson = "{\"assetId\":2,\"amount\":1000.0}";
-            req = HttpRequest.newBuilder()
-                    .uri(URI.create(baseUrl + "/api/v1/accounts/" + userId + "/deposit"))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(depositJson))
-                    .build();
-            client.send(req, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            String json = resp.body();
+            ids[i] = extractLong(json, "userId");
+            tokens[i] = extractString(json, "token");
+            if (tokens[i] == null) {
+                throw new IllegalStateException("register failed (" + resp.statusCode() + "): " + json);
+            }
         }
+        return new Users(ids, tokens);
+    }
 
-        System.out.printf("Funded %d users%n", config.getNumUsers());
+    /** Minimal field extractor for the fixed register response {"userId":N,...,"token":"..."}. */
+    static long extractLong(String json, String field) {
+        int k = json.indexOf("\"" + field + "\":");
+        if (k < 0) return -1;
+        int s = k + field.length() + 3;
+        int e = s;
+        while (e < json.length() && (Character.isDigit(json.charAt(e)) || json.charAt(e) == '-')) e++;
+        return Long.parseLong(json.substring(s, e));
+    }
+
+    static String extractString(String json, String field) {
+        int k = json.indexOf("\"" + field + "\":\"");
+        if (k < 0) return null;
+        int s = k + field.length() + 4;
+        int e = json.indexOf('"', s);
+        return e < 0 ? null : json.substring(s, e);
     }
 }
