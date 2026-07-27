@@ -12,6 +12,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # cluster-kit resolves from GitHub Packages; the sibling checkouts' settings
+    # files use this token to read it.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
 
@@ -37,10 +42,14 @@ jobs:
           cache: maven
 
       - name: Install match-common into local Maven repo
-        run: mvn -B -f _match/pom.xml install -DskipTests -pl match-common -am
+        run: mvn -B -s _match/.mvn-settings.xml -f _match/pom.xml install -DskipTests -pl match-common -am
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install assets modules into local Maven repo
-        run: mvn -B -f _assets/pom.xml install -DskipTests -pl assets-common,assets-cluster -am
+        run: mvn -B -s _assets/.mvn-settings.xml -f _assets/pom.xml install -DskipTests -pl assets-common,assets-cluster -am
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and test
         run: mvn -B clean verify
@@ -52,6 +61,9 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
     services:
       postgres:
         image: postgres:16
@@ -97,12 +109,16 @@ jobs:
         run: sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
 
       - name: Build match-cluster jar
-        run: mvn -B -f _match/pom.xml install -DskipTests -pl match-cluster -am
+        run: mvn -B -s _match/.mvn-settings.xml -f _match/pom.xml install -DskipTests -pl match-cluster -am
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # install also produces the shaded assets-cluster.jar and assets-bridge.jar
       # the E2E launches as its single-node Assets Engine + settlement bridge.
       - name: Install assets modules into local Maven repo
-        run: mvn -B -f _assets/pom.xml install -DskipTests -pl assets-common,assets-cluster,assets-bridge -am
+        run: mvn -B -s _assets/.mvn-settings.xml -f _assets/pom.xml install -DskipTests -pl assets-common,assets-cluster,assets-bridge -am
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build OMS app jar
         run: mvn -B package -DskipTests
