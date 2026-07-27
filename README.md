@@ -72,7 +72,6 @@ Order management system that sits between trading clients and the [Match Engine]
 | gRPC | gRPC Java 1.82, Protobuf 4.35 |
 | Data Structures | Agrona 2.4 (zero-allocation maps) |
 | Persistence | PostgreSQL JDBC 42.7, HikariCP 7.1 |
-| Caching | Lettuce (Redis) 7.6 |
 | Serialization | Jackson 2.22 |
 | Build | Maven 3+ |
 
@@ -338,7 +337,9 @@ trigger monitoring) is rebuilt from PostgreSQL on every startup:
   monitoring.
 - **Positions**: replayed as a SQL aggregate over the `executions` ledger
   (BUY minus SELL per user/market).
-- **Balances**: live in Redis and survive restarts on their own.
+- **Balances**: live in the Assets Engine, a separate Raft cluster. Every hold, release and
+  settle is a consensus command, so a balance survives the OMS process entirely; the OMS
+  holds a read model, not the money.
 
 After the rebuild, the cluster open-orders snapshot reconciliation (P1.2)
 trues the restored set up against cluster reality — orders the cluster no
