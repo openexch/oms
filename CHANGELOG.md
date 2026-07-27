@@ -6,6 +6,21 @@ are documented here. The stack (`match`, `oms`, `admin-gateway`,
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0-beta] - 2026-07-27
+
+The durability release. For the OMS the change is a subtraction: money lives in
+the Assets Engine and nowhere else.
+
+### Changed
+- **The Assets Engine is the only balance store.** The pluggable seam is gone,
+  along with `OMS_BALANCE_STORE`, the Redis store and its configuration; the
+  OMS always constructs `AeronAssetsBalanceStore` and refuses to boot without a
+  healthy AE, the way it already refuses to boot without the matching engine.
+  The seam's default still said `redis`, so a deployment that did not set the
+  variable ran the old store while the release notes said the money was on the
+  AE. A store that has to be selected can be selected wrongly (#125).
+- The load test works against an auth-enabled OMS (#126).
+
 ## [0.4.0-beta] - 2026-07-22
 
 The money release: order money moves to the Assets Engine, and the fill path
