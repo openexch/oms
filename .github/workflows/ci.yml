@@ -52,7 +52,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and test
-        run: mvn -B clean verify
+        run: mvn -B -s .mvn-settings.xml clean verify
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Full-stack failover E2E (oms#41 / P5.1): real 3-node Aeron cluster +
   # real single-node Assets Engine + real OMS + Postgres on the runner; kills
@@ -121,7 +123,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build OMS app jar
-        run: mvn -B package -DskipTests
+        run: mvn -B -s .mvn-settings.xml package -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Failover E2E
         env:

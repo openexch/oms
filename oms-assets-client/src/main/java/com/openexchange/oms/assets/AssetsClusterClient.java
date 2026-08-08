@@ -82,12 +82,13 @@ public class AssetsClusterClient
 
     private static final Logger log = LoggerFactory.getLogger(AssetsClusterClient.class);
 
-    // ---- AE cluster port math (kept in lock-step with the AE's ClusterConfig; see class doc) ----
-    // clientFacingPort(nodeId) = portBase + nodeId*PORTS_PER_NODE + CLIENT_FACING_PORT_OFFSET.
-    // Duplicated here (not imported from assets-cluster) so the money client depends only on
-    // assets-common, never on the heavyweight server module.
-    private static final int PORTS_PER_NODE = 100;
-    private static final int CLIENT_FACING_PORT_OFFSET = 2;
+    // ---- AE cluster port math ----
+    // No longer duplicated. It used to be copied here to keep the money client off the
+    // heavyweight server module, and that reason still holds; cluster-kit is the small
+    // Apache-2.0 jar the engines already share, so the client gets the arithmetic without
+    // the server. Copies of a wire contract do not drift loudly: they drift into dialling
+    // a port nobody is listening on. By default every AE member listens on the SAME
+    // client-facing port and only the host differs.
 
     // ---- Transport tuning (mirrors the proven ME ClusterClient values) ----
     private static final long KEEPALIVE_INTERVAL_NS = TimeUnit.MILLISECONDS.toNanos(1_000);
@@ -229,7 +230,8 @@ public class AssetsClusterClient
     private static String buildIngressEndpoints(List<String> hostnames, int portBase) {
         final StringBuilder sb = new StringBuilder();
         for (int i = 0; i < hostnames.size(); i++) {
-            final int clientFacingPort = portBase + (i * PORTS_PER_NODE) + CLIENT_FACING_PORT_OFFSET;
+            final int clientFacingPort = com.openexchange.cluster.ClusterPorts.port(
+                    i, portBase, com.openexchange.cluster.ClusterPorts.CLIENT_FACING_OFFSET);
             sb.append(i).append('=').append(hostnames.get(i).trim()).append(':').append(clientFacingPort);
             if (i < hostnames.size() - 1) {
                 sb.append(',');

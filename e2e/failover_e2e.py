@@ -261,6 +261,11 @@ def cluster_env(node_id):
         "CLUSTER_NODE": str(node_id),
         "CLUSTER_ADDRESSES": "127.0.0.1,127.0.0.1,127.0.0.1",
         "CLUSTER_PORT_BASE": str(PORT_BASE),
+        # Every member of this cluster is on this one runner, which is the
+        # special case: the engines default to one member per address and give
+        # all of them the same ports. Clients need the same value or they dial
+        # ports nobody bound.
+        "CLUSTER_PORT_STRIDE": "100",
         "BASE_DIR": os.path.join(WORKDIR, f"node{node_id}"),
         # Never inherit a dev box's external-driver setup
         "TRANSPORT_DRIVER_MODE": "embedded",
@@ -367,6 +372,7 @@ def start_ae():
         "CLUSTER_NODE": "0",
         "CLUSTER_ADDRESSES": "127.0.0.1",
         "CLUSTER_PORT_BASE": str(AE_PORT_BASE),
+        "CLUSTER_PORT_STRIDE": "100",
         # Cluster/archive state (the money ledger) — under the workdir, not shm.
         "BASE_DIR": os.path.join(WORKDIR, "ae0"),
         "TRANSPORT_DRIVER_MODE": "embedded",
@@ -385,6 +391,7 @@ def start_bridge():
         "BRIDGE_ME_JOURNAL_ARCHIVES": ",".join(
             f"127.0.0.1:{PORT_BASE + n * 100 + 10}" for n in (0, 1, 2)),
         "BRIDGE_AE_CLUSTER_ADDRESSES": "127.0.0.1",
+        "CLUSTER_PORT_STRIDE": "100",
         "BRIDGE_AE_PORT_BASE": str(AE_PORT_BASE),
         # Must differ from the OMS client's AE egress endpoint.
         "BRIDGE_AE_EGRESS_ENDPOINT": f"127.0.0.1:{AE_EGRESS_PORT + 1}",
@@ -420,12 +427,18 @@ def start_oms():
         "OMS_POSTGRES_PASSWORD": PG_PASSWORD,
         "AE_CLUSTER_ADDRESSES": "127.0.0.1",
         "AE_CLUSTER_PORT_BASE": str(AE_PORT_BASE),
+        "CLUSTER_PORT_STRIDE": "100",
         "AE_EGRESS_HOST": "127.0.0.1",
         "AE_EGRESS_PORT": str(AE_EGRESS_PORT),
         "OMS_AUDIT_LOG": "off",
         "OMS_NODE_ID": "7",
         "CLUSTER_ADDRESSES": "127.0.0.1,127.0.0.1,127.0.0.1",
         "CLUSTER_PORT_BASE": str(PORT_BASE),
+        # Every member of this cluster is on this one runner, which is the
+        # special case: the engines default to one member per address and give
+        # all of them the same ports. Clients need the same value or they dial
+        # ports nobody bound.
+        "CLUSTER_PORT_STRIDE": "100",
         "EGRESS_HOST": "127.0.0.1",
         "EGRESS_PORT": str(EGRESS_PORT),
     }

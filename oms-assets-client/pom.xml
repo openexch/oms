@@ -26,6 +26,14 @@
             <groupId>com.openexchange.assets</groupId>
             <artifactId>assets-common</artifactId>
         </dependency>
+
+        <!-- The AE port arithmetic, one copy. Small and Apache-2.0: this keeps the
+             money client off the heavyweight server module, which is why the maths
+             was duplicated here in the first place. -->
+        <dependency>
+            <groupId>com.openexchange</groupId>
+            <artifactId>cluster-kit</artifactId>
+        </dependency>
         <dependency>
             <groupId>io.aeron</groupId>
             <artifactId>aeron-all</artifactId>

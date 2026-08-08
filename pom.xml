@@ -36,6 +36,11 @@
         <!-- Assets Engine dependency (money-schema v2 SBE codecs, FixedPoint) -->
         <assets.version>0.1.0-SNAPSHOT</assets.version>
 
+        <!-- Shared cluster machinery. Only the port arithmetic is used here: the
+             engines, the settlement bridge and this client all have to derive the
+             same numbers, and copies of a wire contract drift silently. -->
+        <cluster-kit.version>0.1.5</cluster-kit.version>
+
         <!-- Aeron (must match match-engine version) -->
         <aeron.version>1.52.2</aeron.version>
         <agrona.version>2.5.0</agrona.version>
@@ -124,6 +129,11 @@
                 <groupId>com.openexchange.assets</groupId>
                 <artifactId>assets-common</artifactId>
                 <version>${assets.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.openexchange</groupId>
+                <artifactId>cluster-kit</artifactId>
+                <version>${cluster-kit.version}</version>
             </dependency>
 
             <!-- Aeron -->
