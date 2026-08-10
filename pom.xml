@@ -48,7 +48,7 @@
              (added in 0.1.6), which a 0.1.5 runtime classpath cannot load. OMS's only
              use, ClusterPorts.port(nodeId, portBase, CLIENT_FACING_OFFSET), is unchanged
              across 0.1.5 -> 0.1.6. -->
-        <cluster-kit.version>0.1.6</cluster-kit.version>
+        <cluster-kit.version>0.1.7</cluster-kit.version>
 
         <!-- Aeron (must match match-engine version) -->
         <aeron.version>1.52.2</aeron.version>
