@@ -33,7 +33,7 @@
         <!-- Match engine wire dependency: an IMMUTABLE 1.0.<utcstamp>.g<sha> from GitHub
              Packages, deployed by match CI on every main push; g<sha> names the exact match
              commit. Bumped by match CI's consumer-bump PR together with producers.lock. -->
-        <match.version>1.0.20260810221131.gfc502d0</match.version>
+        <match.version>1.0.20260810224606.gf873fed</match.version>
 
         <!-- Assets Engine wire dependency (money-schema SBE codecs, FixedPoint; assets-cluster
              is test-scoped for the embedded-AE integration test). Same discipline as
