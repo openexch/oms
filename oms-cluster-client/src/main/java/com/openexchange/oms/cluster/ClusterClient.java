@@ -610,11 +610,24 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
         switch (submission.getType()) {
             case CREATE:
                 createOrderEncoder.wrapAndApplyHeader(encodeBuffer, 0, headerEncoder);
+                // SBE v8: CreateOrder.totalPrice was removed. The MARKET-BUY spend budget now rides
+                // in price; LIMIT/LIMIT_MAKER keep their limit price; MARKET-SELL sends 0. This
+                // mirrors the engine's v8 decode (SbeDemuxer: orderType==MARKET -> command.totalPrice
+                // = wire price, command.price = 0; else -> command.price = wire price). The submission's
+                // getTotalPrice() (the estimated notional that also sizes the ledger hold) stays the
+                // budget source; only its wire mapping moved off the deleted totalPrice field.
+                final long wirePrice;
+                if (submission.getOrderType() != OrderType.MARKET) {
+                    wirePrice = submission.getPrice();          // LIMIT / LIMIT_MAKER limit price
+                } else if (submission.getOrderSide() == OrderSide.BID) {
+                    wirePrice = submission.getTotalPrice();     // MARKET BUY budget
+                } else {
+                    wirePrice = 0L;                             // MARKET SELL (no budget)
+                }
                 createOrderEncoder
                         .userId(submission.getUserId())
-                        .price(submission.getPrice())
+                        .price(wirePrice)
                         .quantity(submission.getQuantity())
-                        .totalPrice(submission.getTotalPrice())
                         .marketId(submission.getMarketId())
                         .orderType(submission.getOrderType())
                         .orderSide(submission.getOrderSide())

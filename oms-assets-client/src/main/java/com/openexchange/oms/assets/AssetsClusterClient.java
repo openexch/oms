@@ -3,13 +3,16 @@ package com.openexchange.oms.assets;
 
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndDecoder;
+import com.openexchange.assets.infrastructure.generated.BalanceUpdateBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateDecoder;
 import com.openexchange.assets.infrastructure.generated.DepositAckDecoder;
 import com.openexchange.assets.infrastructure.generated.DepositEncoder;
 import com.openexchange.assets.infrastructure.generated.FeedPositionReportDecoder;
+import com.openexchange.assets.infrastructure.generated.HoldAckBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldAckDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldRejectDecoder;
+import com.openexchange.assets.infrastructure.generated.HoldSnapshotBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEndDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEntryDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
@@ -18,6 +21,7 @@ import com.openexchange.assets.infrastructure.generated.QueryFeedPositionEncoder
 import com.openexchange.assets.infrastructure.generated.ReleaseEncoder;
 import com.openexchange.assets.infrastructure.generated.RequestBalanceSnapshotEncoder;
 import com.openexchange.assets.infrastructure.generated.RequestHoldSnapshotEncoder;
+import com.openexchange.assets.infrastructure.generated.SettlementAppliedBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedDecoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawAckDecoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawEncoder;
@@ -151,6 +155,14 @@ public class AssetsClusterClient
     private final BalanceSnapshotEndDecoder balanceSnapshotEndDecoder = new BalanceSnapshotEndDecoder();
     private final HoldSnapshotEntryDecoder holdSnapshotEntryDecoder = new HoldSnapshotEntryDecoder();
     private final HoldSnapshotEndDecoder holdSnapshotEndDecoder = new HoldSnapshotEndDecoder();
+
+    // money-schema v5 batch egress decoders. A live AE v5 coalesces a drain cycle's same-type events
+    // into one frame; these decode the group and replay the SAME per-entry listener callbacks the
+    // single-form cases invoke. The single decoders above are kept for back-compat (tools/tests).
+    private final HoldAckBatchDecoder holdAckBatchDecoder = new HoldAckBatchDecoder();
+    private final BalanceUpdateBatchDecoder balanceUpdateBatchDecoder = new BalanceUpdateBatchDecoder();
+    private final SettlementAppliedBatchDecoder settlementAppliedBatchDecoder = new SettlementAppliedBatchDecoder();
+    private final HoldSnapshotBatchDecoder holdSnapshotBatchDecoder = new HoldSnapshotBatchDecoder();
 
     // External listener for decoded egress messages
     private volatile AssetsEgressListener egressListener;
@@ -821,6 +833,14 @@ public class AssetsClusterClient
                             holdAckDecoder.userId(), holdAckDecoder.assetId(), holdAckDecoder.amount());
                     break;
 
+                case HoldAckBatchDecoder.TEMPLATE_ID:
+                    holdAckBatchDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                    for (HoldAckBatchDecoder.AcksDecoder e : holdAckBatchDecoder.acks()) {
+                        l.onHoldAck(e.correlationId(), e.orderId(),
+                                e.userId(), e.assetId(), e.amount());
+                    }
+                    break;
+
                 case HoldRejectDecoder.TEMPLATE_ID:
                     holdRejectDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
                     l.onHoldReject(holdRejectDecoder.correlationId(), holdRejectDecoder.orderId(),
@@ -834,10 +854,25 @@ public class AssetsClusterClient
                             balanceUpdateDecoder.available(), balanceUpdateDecoder.locked());
                     break;
 
+                case BalanceUpdateBatchDecoder.TEMPLATE_ID:
+                    balanceUpdateBatchDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                    for (BalanceUpdateBatchDecoder.UpdatesDecoder e : balanceUpdateBatchDecoder.updates()) {
+                        l.onBalanceUpdate(e.userId(), e.assetId(), e.available(), e.locked());
+                    }
+                    break;
+
                 case SettlementAppliedDecoder.TEMPLATE_ID:
                     settlementAppliedDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
                     l.onSettlementApplied(settlementAppliedDecoder.tradeId(),
                             settlementAppliedDecoder.buyerUserId(), settlementAppliedDecoder.sellerUserId());
+                    break;
+
+                case SettlementAppliedBatchDecoder.TEMPLATE_ID:
+                    settlementAppliedBatchDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                    for (SettlementAppliedBatchDecoder.SettlementsDecoder e
+                            : settlementAppliedBatchDecoder.settlements()) {
+                        l.onSettlementApplied(e.tradeId(), e.buyerUserId(), e.sellerUserId());
+                    }
                     break;
 
                 case WithdrawRejectDecoder.TEMPLATE_ID:
@@ -879,6 +914,13 @@ public class AssetsClusterClient
                     l.onHoldSnapshotEntry(holdSnapshotEntryDecoder.orderId(),
                             holdSnapshotEntryDecoder.userId(), holdSnapshotEntryDecoder.assetId(),
                             holdSnapshotEntryDecoder.remaining());
+                    break;
+
+                case HoldSnapshotBatchDecoder.TEMPLATE_ID:
+                    holdSnapshotBatchDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                    for (HoldSnapshotBatchDecoder.HoldsDecoder e : holdSnapshotBatchDecoder.holds()) {
+                        l.onHoldSnapshotEntry(e.orderId(), e.userId(), e.assetId(), e.remaining());
+                    }
                     break;
 
                 case HoldSnapshotEndDecoder.TEMPLATE_ID:

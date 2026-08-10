@@ -2,15 +2,19 @@
 package com.openexchange.oms.assets;
 
 import com.openexchange.assets.infrastructure.generated.BalanceSnapshotEndEncoder;
+import com.openexchange.assets.infrastructure.generated.BalanceUpdateBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.BalanceUpdateEncoder;
 import com.openexchange.assets.infrastructure.generated.DepositAckEncoder;
 import com.openexchange.assets.infrastructure.generated.FeedPositionReportEncoder;
+import com.openexchange.assets.infrastructure.generated.HoldAckBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldAckEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldRejectEncoder;
+import com.openexchange.assets.infrastructure.generated.HoldSnapshotBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEndEncoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEntryEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
 import com.openexchange.assets.infrastructure.generated.RejectReason;
+import com.openexchange.assets.infrastructure.generated.SettlementAppliedBatchEncoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedEncoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawAckEncoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawRejectEncoder;
@@ -144,6 +148,64 @@ class AssetsEgressDispatchTest {
         assertArrayEquals(new long[]{66, 7}, rec.values);
     }
 
+    // ---- money-schema v5 batch egress: each frame replays the single-form per-entry callback ----
+
+    @Test
+    void holdAckBatchReplaysEachEntry() {
+        HoldAckBatchEncoder enc = new HoldAckBatchEncoder();
+        enc.wrapAndApplyHeader(buf, 0, header);
+        HoldAckBatchEncoder.AcksEncoder acks = enc.acksCount(2);
+        acks.next().correlationId(11).orderId(22).userId(33).assetId(4).amount(555);
+        acks.next().correlationId(12).orderId(23).userId(34).assetId(5).amount(556);
+        dispatch(enc.encodedLength());
+        assertEquals("holdAck", rec.last);
+        assertEquals(2, rec.all.size());
+        assertArrayEquals(new long[]{11, 22, 33, 4, 555}, rec.all.get(0));
+        assertArrayEquals(new long[]{12, 23, 34, 5, 556}, rec.all.get(1));
+    }
+
+    @Test
+    void balanceUpdateBatchReplaysEachEntry() {
+        BalanceUpdateBatchEncoder enc = new BalanceUpdateBatchEncoder();
+        enc.wrapAndApplyHeader(buf, 0, header);
+        BalanceUpdateBatchEncoder.UpdatesEncoder updates = enc.updatesCount(2);
+        updates.next().userId(77).assetId(9).available(1000).locked(250);
+        updates.next().userId(78).assetId(10).available(2000).locked(500);
+        dispatch(enc.encodedLength());
+        assertEquals("balanceUpdate", rec.last);
+        assertEquals(2, rec.all.size());
+        assertArrayEquals(new long[]{77, 9, 1000, 250}, rec.all.get(0));
+        assertArrayEquals(new long[]{78, 10, 2000, 500}, rec.all.get(1));
+    }
+
+    @Test
+    void settlementAppliedBatchReplaysEachEntry() {
+        SettlementAppliedBatchEncoder enc = new SettlementAppliedBatchEncoder();
+        enc.wrapAndApplyHeader(buf, 0, header);
+        SettlementAppliedBatchEncoder.SettlementsEncoder settlements = enc.settlementsCount(2);
+        settlements.next().tradeId(9001).buyerUserId(5).sellerUserId(6);
+        settlements.next().tradeId(9002).buyerUserId(7).sellerUserId(8);
+        dispatch(enc.encodedLength());
+        assertEquals("settlementApplied", rec.last);
+        assertEquals(2, rec.all.size());
+        assertArrayEquals(new long[]{9001, 5, 6}, rec.all.get(0));
+        assertArrayEquals(new long[]{9002, 7, 8}, rec.all.get(1));
+    }
+
+    @Test
+    void holdSnapshotBatchReplaysEachEntry() {
+        HoldSnapshotBatchEncoder enc = new HoldSnapshotBatchEncoder();
+        enc.wrapAndApplyHeader(buf, 0, header);
+        HoldSnapshotBatchEncoder.HoldsEncoder holds = enc.holdsCount(2);
+        holds.next().orderId(10).userId(20).assetId(2).remaining(333);
+        holds.next().orderId(11).userId(21).assetId(3).remaining(444);
+        dispatch(enc.encodedLength());
+        assertEquals("holdSnapshotEntry", rec.last);
+        assertEquals(2, rec.all.size());
+        assertArrayEquals(new long[]{10, 20, 2, 333}, rec.all.get(0));
+        assertArrayEquals(new long[]{11, 21, 3, 444}, rec.all.get(1));
+    }
+
     @Test
     void unknownTemplateIsIgnored() {
         // Frame a header with a templateId the client does not handle (schema ingress id 1 = Deposit,
@@ -163,11 +225,14 @@ class AssetsEgressDispatchTest {
     private static final class Recording implements AssetsEgressListener {
         String last;
         long[] values;
+        /** Every callback's values in order — lets a batch test assert each entry was replayed. */
+        final java.util.List<long[]> all = new java.util.ArrayList<>();
 
         @Override
         public void onHoldAck(long correlationId, long orderId, long userId, int assetId, long amount) {
             last = "holdAck";
             values = new long[]{correlationId, orderId, userId, assetId, amount};
+            all.add(values);
         }
 
         @Override
@@ -180,6 +245,7 @@ class AssetsEgressDispatchTest {
         public void onBalanceUpdate(long userId, int assetId, long available, long locked) {
             last = "balanceUpdate";
             values = new long[]{userId, assetId, available, locked};
+            all.add(values);
         }
 
         @Override
@@ -204,6 +270,7 @@ class AssetsEgressDispatchTest {
         public void onSettlementApplied(long tradeId, long buyerUserId, long sellerUserId) {
             last = "settlementApplied";
             values = new long[]{tradeId, buyerUserId, sellerUserId};
+            all.add(values);
         }
 
         @Override
@@ -222,6 +289,7 @@ class AssetsEgressDispatchTest {
         public void onHoldSnapshotEntry(long orderId, long userId, int assetId, long remaining) {
             last = "holdSnapshotEntry";
             values = new long[]{orderId, userId, assetId, remaining};
+            all.add(values);
         }
 
         @Override
