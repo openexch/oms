@@ -30,11 +30,15 @@
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
 
-        <!-- Match engine dependency -->
-        <match.version>1.0</match.version>
+        <!-- Match engine wire dependency: an IMMUTABLE 1.0.<utcstamp>.g<sha> from GitHub
+             Packages, deployed by match CI on every main push; g<sha> names the exact match
+             commit. Bumped by match CI's consumer-bump PR together with producers.lock. -->
+        <match.version>1.0.20260810181723.g90108b0</match.version>
 
-        <!-- Assets Engine dependency (money-schema v2 SBE codecs, FixedPoint) -->
-        <assets.version>0.1.0-SNAPSHOT</assets.version>
+        <!-- Assets Engine wire dependency (money-schema SBE codecs, FixedPoint; assets-cluster
+             is test-scoped for the embedded-AE integration test). Same discipline as
+             match.version: immutable, from Packages, bumped by assets CI. -->
+        <assets.version>0.1.0.20260810182657.gf321086</assets.version>
 
         <!-- Shared cluster machinery. Only the port arithmetic is used here: the
              engines, the settlement bridge and this client all have to derive the

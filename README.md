@@ -85,14 +85,27 @@ Order management system that sits between trading clients and the [Match Engine]
 
 ### Build & Run
 
-OMS depends on `com.match:match-common`, which is not published to Maven
-Central; install it into your local repository from a sibling checkout of
-[match](https://github.com/openexch/match) first.
+OMS depends on `com.match:match-common` and the `com.openexchange.assets` wire
+modules at the exact versions pinned in `pom.xml`. They resolve from GitHub
+Packages, which needs a token with `read:packages` even for public packages:
 
 ```bash
-# One-time: install match-common from the match repo
-mvn -f ../match/pom.xml install -DskipTests -pl match-common -am
+# One-time: give your gh token the packages scope, then build with it
+gh auth refresh -s read:packages
+GITHUB_ACTOR=$(gh api user --jq .login) GITHUB_TOKEN=$(gh auth token) \
+  mvn -s .mvn-settings.xml clean verify
+```
 
+Working on a wire change across repos? Install the producer from your sibling
+checkout and point the build at that version explicitly — the override is
+deliberate and visible, never a silent default:
+
+```bash
+mvn -f ../match/pom.xml install -DskipTests -pl match-common -am   # installs 1.0
+mvn -s .mvn-settings.xml -Dmatch.version=1.0 clean verify
+```
+
+```bash
 # Build all modules
 mvn clean package -DskipTests
 

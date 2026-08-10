@@ -1,0 +1,5 @@
+# Producer shas the E2E checks out and builds. Moved by the producers' bump
+# automation together with the pom.xml version pins; the g<sha> suffix in each
+# pinned version names the same commit recorded here.
+match=90108b04f40514dbac6efe64de79b98d2f1d4bd1
+assets=f321086980d0f7ee61d6398a0c2cc83b2326a122
