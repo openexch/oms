@@ -20,20 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check out match (for match-common dependency)
-        uses: actions/checkout@v7
-        with:
-          repository: openexch/match
-          ref: main
-          path: _match
-
-      - name: Check out assets (for assets-common/assets-cluster dependency)
-        uses: actions/checkout@v7
-        with:
-          repository: openexch/assets
-          ref: main
-          path: _assets
-
       - name: Set up Java 21
         uses: actions/setup-java@v5
         with:
@@ -41,16 +27,8 @@ jobs:
           java-version: 21
           cache: maven
 
-      - name: Install match-common into local Maven repo
-        run: mvn -B -s _match/.mvn-settings.xml -f _match/pom.xml install -DskipTests -pl match-common -am
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install assets modules into local Maven repo
-        run: mvn -B -s _assets/.mvn-settings.xml -f _assets/pom.xml install -DskipTests -pl assets-common,assets-cluster -am
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+      # match-common and the assets wire modules resolve from GitHub Packages at the
+      # versions pinned in pom.xml — no more producer checkouts at floating main.
       - name: Build and test
         run: mvn -B -s .mvn-settings.xml clean verify
         env:
@@ -81,18 +59,29 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The E2E runs REAL producer binaries (match-cluster, assets-cluster, bridge),
+      # so it still checks the producers out — but at the shas in producers.lock,
+      # which the bump automation moves together with the pom pins. A floating main
+      # here meant the tested jar and the pinned wire could silently diverge.
+      - name: Read producer pins
+        id: lock
+        run: |
+          set -euo pipefail
+          echo "match=$(grep '^match=' producers.lock | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "assets=$(grep '^assets=' producers.lock | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+
       - name: Check out match (cluster + match-common)
         uses: actions/checkout@v7
         with:
           repository: openexch/match
-          ref: main
+          ref: ${{ steps.lock.outputs.match }}
           path: _match
 
       - name: Check out assets (for assets-common/assets-cluster dependency)
         uses: actions/checkout@v7
         with:
           repository: openexch/assets
-          ref: main
+          ref: ${{ steps.lock.outputs.assets }}
           path: _assets
 
       - name: Set up Java 21
