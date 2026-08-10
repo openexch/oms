@@ -12,6 +12,13 @@ package com.openexchange.oms.app;
  * Balance store: the Assets Engine cluster is the money authority — there is
  * no alternative and nothing to select. The AE tunables
  * (aeHoldTimeoutMs/aeAckTimeoutMs/aeConnectTimeoutMs) size the OMS's client.
+ *
+ * Balance feed: BALANCE_FEED_CHANNEL (empty/unset = OFF) names the AE's
+ * conflated balance side-channel; when set, the OMS consumes live balances
+ * from it and narrows its cluster session to acks+settlements instead of
+ * receiving every user's BalanceUpdate. Same env var the AE nodes use, so a
+ * stack profile sets one value for both sides. BALANCE_FEED_STREAM_ID
+ * overrides the feed stream id (default 4201).
  */
 public record OmsConfig(
     int httpPort,
@@ -29,7 +36,9 @@ public record OmsConfig(
     String auditLogPath,
     long aeHoldTimeoutMs,
     long aeAckTimeoutMs,
-    long aeConnectTimeoutMs
+    long aeConnectTimeoutMs,
+    String balanceFeedChannel,
+    int balanceFeedStreamId
 ) {
     public static OmsConfig loadDefaults() {
         return new OmsConfig(
@@ -52,7 +61,12 @@ public record OmsConfig(
             prop("OMS_AUDIT_LOG", System.getProperty("user.home") + "/.local/log/oms/oms-audit.log"),
             longProp("OMS_AE_HOLD_TIMEOUT_MS", 250L),
             longProp("OMS_AE_ACK_TIMEOUT_MS", 1000L),
-            longProp("OMS_AE_CONNECT_TIMEOUT_MS", 30_000L)
+            longProp("OMS_AE_CONNECT_TIMEOUT_MS", 30_000L),
+            // Deliberately NOT OMS_-prefixed: it is the same knob the AE nodes read
+            // (see assets' BalanceFeedRuntime), one stack-profile value for both sides.
+            prop("BALANCE_FEED_CHANNEL", ""),
+            intProp("BALANCE_FEED_STREAM_ID",
+                com.openexchange.oms.assets.AssetsClusterClient.DEFAULT_BALANCE_FEED_STREAM_ID)
         );
     }
 

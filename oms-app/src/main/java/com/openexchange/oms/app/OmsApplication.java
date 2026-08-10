@@ -128,7 +128,8 @@ public class OmsApplication {
         // and every failure is FATAL, exactly like a missing matching-engine cluster:
         // a wrong balance is a wrong dollar, so we refuse to serve rather than degrade.
         log.info("Balance store: Assets Engine cluster (the money authority)");
-        AssetsClusterClient assetsClient = new AssetsClusterClient();
+        AssetsClusterClient assetsClient = new AssetsClusterClient(
+                config.balanceFeedChannel(), config.balanceFeedStreamId());
         AeronAssetsBalanceStore aeronBalanceStore = new AeronAssetsBalanceStore(
                 assetsClient, Asset.values().length, config.aeHoldTimeoutMs(), config.aeAckTimeoutMs());
         // The store's constructor above already called assetsClient.setEgressListener(store),

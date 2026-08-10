@@ -38,7 +38,7 @@
         <!-- Assets Engine wire dependency (money-schema SBE codecs, FixedPoint; assets-cluster
              is test-scoped for the embedded-AE integration test). Same discipline as
              match.version: immutable, from Packages, bumped by assets CI. -->
-        <assets.version>0.1.0.20260810182657.gf321086</assets.version>
+        <assets.version>0.1.0.20260810201130.g025f0b2</assets.version>
 
         <!-- Shared cluster machinery. Only the port arithmetic is used here: the
              engines, the settlement bridge and this client all have to derive the
