@@ -23,11 +23,14 @@ import com.openexchange.assets.infrastructure.generated.RequestBalanceSnapshotEn
 import com.openexchange.assets.infrastructure.generated.RequestHoldSnapshotEncoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.SettlementAppliedDecoder;
+import com.openexchange.assets.infrastructure.generated.SubscribeEncoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawAckDecoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawEncoder;
 import com.openexchange.assets.infrastructure.generated.WithdrawRejectDecoder;
 
+import io.aeron.FragmentAssembler;
 import io.aeron.Publication;
+import io.aeron.Subscription;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.codecs.EventCode;
 import io.aeron.driver.MediaDriver;
@@ -80,6 +83,32 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Exponential backoff with {@link MediaDriver} reset after consecutive failures, plus stale-egress
  * detection. A leader change ({@link #onNewLeader}) fires {@link AssetsEgressListener#onReconnected()}
  * so the store above can re-sync balances/holds across the switchover seam.</p>
+ *
+ * <h3>Balance-feed side-channel (optional)</h3>
+ * <p>When {@code balanceFeedChannel} names an Aeron channel, live balances arrive on the AE's
+ * conflated side-channel (a plain publication, latest-value per {@code (user, asset)}) instead of
+ * riding the cluster session, and this client narrows its session with a {@code Subscribe} to
+ * {@code {acks, settlements}} — the firehose of every user's BalanceUpdate stops multiplying per
+ * session on the AE egress. Three invariants keep this correct:</p>
+ * <ul>
+ *   <li><b>Re-declared transport state.</b> The Subscribe narrowing lives on the AE leader and is
+ *       deliberately never snapshotted, so it is re-armed on every session establishment AND every
+ *       leader change (same principle the assets bridge applies), offered non-blockingly from the
+ *       poll loop until accepted — the intent is never dropped and no caller thread ever blocks.
+ *       Until it lands the session receives the full firehose, which is the safe direction.</li>
+ *   <li><b>Bootstrap order.</b> The feed subscription is opened BEFORE
+ *       {@link AssetsEgressListener#onConnected()} fires (which is what enqueues the
+ *       balance-snapshot bootstrap), so no live change published after the snapshot's cut can fall
+ *       into an unsubscribed gap. The residual last-write-wins window — a feed frame carrying an
+ *       older value than the snapshot landing after it — stands only until that key next changes,
+ *       and is acceptable because the projection serves reads/pre-checks; the authoritative gate is
+ *       the HOLD (see {@link AeronAssetsBalanceStore}'s class doc).</li>
+ *   <li><b>The feed is NOT authoritative</b> — the cluster is. Intermediate values may be skipped
+ *       (conflation is the feature); the final value always arrives. Snapshot replies and acks stay
+ *       on the cluster session (origin-routed, mask-exempt since assets#56).</li>
+ * </ul>
+ * <p>Feed unset (empty channel) leaves behavior byte-identical to the legacy firehose client:
+ * no Subscribe is sent, no subscription opened, nothing polled.</p>
  */
 public class AssetsClusterClient
         implements AssetsTransport, io.aeron.cluster.client.EgressListener, AutoCloseable {
@@ -114,6 +143,20 @@ public class AssetsClusterClient
     /** Buffer bytes per pooled command. Largest money-schema ingress message (Hold) is 44 bytes. */
     private static final int MAX_COMMAND_LENGTH = 128;
 
+    // ---- Balance-feed side-channel ----
+    /**
+     * Default Aeron stream id of the AE balance-feed side-channel. Mirrors the AE's
+     * {@code InfrastructureConstants.BALANCE_FEED_STREAM_ID} (assets#55) as a LOCAL constant: a
+     * stream id is a wire contract like the port math, and the alternative — importing it — would
+     * put the heavyweight assets server module on the money client's production classpath.
+     */
+    public static final int DEFAULT_BALANCE_FEED_STREAM_ID = 4201;
+    /**
+     * Fragments per feed poll on the shared poll thread. Bounded so a feed burst (leadership-gain
+     * full sweep) cannot starve {@code pollEgress} — acks are what callers block on.
+     */
+    private static final int FEED_POLL_FRAGMENT_LIMIT = 64;
+
     // Cluster connection state
     private volatile MediaDriver mediaDriver;
     private volatile AeronCluster cluster;
@@ -126,6 +169,19 @@ public class AssetsClusterClient
     private final String ingressEndpoints;
     private final String egressChannel;
     private final String aeronDirName;
+
+    // ---- Balance-feed side-channel state (empty channel = feature OFF, legacy behavior) ----
+    private final String balanceFeedChannel;
+    private final int balanceFeedStreamId;
+    /** Pre-encoded {@code Subscribe{acks, settlements}} frame; immutable after construction. */
+    private final UnsafeBuffer subscribeBuffer;
+    private final int subscribeLength;
+    /** Reassembles fragmented feed frames (a full BalanceUpdateBatch exceeds the default MTU). */
+    private final FragmentAssembler feedAssembler;
+    /** Lives and dies with the current {@link #cluster}'s owned Aeron client. */
+    private volatile Subscription feedSubscription;
+    /** Set on session establishment and leader change; cleared when the offer is accepted. */
+    private volatile boolean subscribePending;
 
     // ---- Ingress: pooled pre-encoded commands ----
     // A command is either in the free-list pool, in the queue, or held as pendingCommand — never two
@@ -181,6 +237,14 @@ public class AssetsClusterClient
     private volatile long submitRejectedCount = 0;
     private final AtomicLong aeronErrorCount = new AtomicLong();
 
+    // Feed stats (single-writer: the polling thread). egressBalanceUpdateEntries counts balance
+    // entries that arrived on the CLUSTER session — with the feed on and the Subscribe accepted,
+    // only origin-routed snapshot-reply entries should move it (the firehose negative is testable).
+    private volatile long subscribesSent = 0;
+    private volatile long feedFramesReceived = 0;
+    private volatile long feedEntriesReceived = 0;
+    private volatile long egressBalanceUpdateEntries = 0;
+
     private volatile long leaderTransitionDeadlineMs = 0;
     private volatile long leaderChangeCount = 0;
     private volatile long lastEgressMessageMs = System.currentTimeMillis();
@@ -189,7 +253,8 @@ public class AssetsClusterClient
     private volatile long lastCommandSentMs = 0;
 
     /**
-     * Create a client with connection parameters from environment variables.
+     * Create a client with connection parameters from environment variables and no balance feed
+     * (the legacy full-firehose session).
      *
      * <ul>
      *   <li>{@code AE_CLUSTER_ADDRESSES} - comma-separated AE node hostnames (default: {@code 127.0.0.1})</li>
@@ -199,32 +264,79 @@ public class AssetsClusterClient
      * </ul>
      */
     public AssetsClusterClient() {
-        final String clusterAddresses = System.getenv().getOrDefault("AE_CLUSTER_ADDRESSES", "127.0.0.1");
-        final int portBase = Integer.parseInt(System.getenv().getOrDefault("AE_CLUSTER_PORT_BASE", "9300"));
-        final String egressHost = System.getenv().getOrDefault("AE_EGRESS_HOST", "127.0.0.1");
-        final int egressPort = Integer.parseInt(System.getenv().getOrDefault("AE_EGRESS_PORT", "9393"));
-
-        final List<String> hostnames = Arrays.asList(clusterAddresses.split(","));
-        this.ingressEndpoints = buildIngressEndpoints(hostnames, portBase);
-        this.egressChannel = "aeron:udp?endpoint=" + egressHost + ":" + egressPort;
-        this.aeronDirName = "/dev/shm/aeron-oms-assets-" + ProcessHandle.current().pid();
-
-        prefillCommandPool();
-        log.info("AssetsClusterClient configured: ingress={}, egress={}", ingressEndpoints, egressChannel);
+        this("", DEFAULT_BALANCE_FEED_STREAM_ID);
     }
 
     /**
-     * Create a client with explicit connection parameters (for tests / non-env deployments).
+     * Create a client with transport parameters from environment variables (see {@link #AssetsClusterClient()})
+     * and an explicit balance-feed configuration — the production constructor ({@code OmsConfig}
+     * owns the {@code BALANCE_FEED_CHANNEL}/{@code BALANCE_FEED_STREAM_ID} env reads).
+     *
+     * @param balanceFeedChannel Aeron channel of the AE's conflated balance feed; empty/null = OFF.
+     *                           Must be reachable from this client's own embedded driver (UDP
+     *                           unicast/multicast or MDC — {@code aeron:ipc} cannot span drivers).
+     * @param balanceFeedStreamId stream id of the feed ({@link #DEFAULT_BALANCE_FEED_STREAM_ID})
+     */
+    public AssetsClusterClient(String balanceFeedChannel, int balanceFeedStreamId) {
+        this(envIngressEndpoints(), envEgressChannel(), balanceFeedChannel, balanceFeedStreamId);
+    }
+
+    /**
+     * Create a client with explicit connection parameters (for tests / non-env deployments), no
+     * balance feed.
      *
      * @param ingressEndpoints Aeron cluster ingress endpoints string ({@code 0=host:port,1=host:port,...})
      * @param egressChannel    Aeron egress channel URI
      */
     public AssetsClusterClient(String ingressEndpoints, String egressChannel) {
+        this(ingressEndpoints, egressChannel, "", DEFAULT_BALANCE_FEED_STREAM_ID);
+    }
+
+    /** Fully explicit constructor; every other constructor funnels here. */
+    public AssetsClusterClient(String ingressEndpoints, String egressChannel,
+                               String balanceFeedChannel, int balanceFeedStreamId) {
         this.ingressEndpoints = ingressEndpoints;
         this.egressChannel = egressChannel;
         this.aeronDirName = "/dev/shm/aeron-oms-assets-" + ProcessHandle.current().pid();
+        this.balanceFeedChannel = balanceFeedChannel == null ? "" : balanceFeedChannel;
+        this.balanceFeedStreamId = balanceFeedStreamId;
+        if (feedConfigured()) {
+            // The Subscribe frame is constant for the life of the client — encode it once here so
+            // the poll loop's re-offers never touch an encoder (and the buffer is safely immutable
+            // across the connect()-thread / poll-thread handoff).
+            this.subscribeBuffer = new UnsafeBuffer(new byte[64]);
+            final SubscribeEncoder subscribeEncoder = new SubscribeEncoder();
+            subscribeEncoder.wrapAndApplyHeader(subscribeBuffer, 0, new MessageHeaderEncoder())
+                    .correlationId(0L)
+                    .channels().clear().acks(true).settlements(true);
+            this.subscribeLength = MessageHeaderEncoder.ENCODED_LENGTH + subscribeEncoder.encodedLength();
+            this.feedAssembler = new FragmentAssembler(this::onFeedFragment);
+        } else {
+            this.subscribeBuffer = null;
+            this.subscribeLength = 0;
+            this.feedAssembler = null;
+        }
         prefillCommandPool();
-        log.info("AssetsClusterClient configured: ingress={}, egress={}", ingressEndpoints, egressChannel);
+        log.info("AssetsClusterClient configured: ingress={}, egress={}, balanceFeed={}",
+                ingressEndpoints, egressChannel,
+                feedConfigured() ? this.balanceFeedChannel + " stream " + balanceFeedStreamId : "off");
+    }
+
+    private static String envIngressEndpoints() {
+        final String clusterAddresses = System.getenv().getOrDefault("AE_CLUSTER_ADDRESSES", "127.0.0.1");
+        final int portBase = Integer.parseInt(System.getenv().getOrDefault("AE_CLUSTER_PORT_BASE", "9300"));
+        return buildIngressEndpoints(Arrays.asList(clusterAddresses.split(",")), portBase);
+    }
+
+    private static String envEgressChannel() {
+        final String egressHost = System.getenv().getOrDefault("AE_EGRESS_HOST", "127.0.0.1");
+        final int egressPort = Integer.parseInt(System.getenv().getOrDefault("AE_EGRESS_PORT", "9393"));
+        return "aeron:udp?endpoint=" + egressHost + ":" + egressPort;
+    }
+
+    /** True when a balance-feed channel is configured (the Subscribe/side-channel machinery is live). */
+    private boolean feedConfigured() {
+        return !balanceFeedChannel.isEmpty();
     }
 
     private void prefillCommandPool() {
@@ -398,6 +510,23 @@ public class AssetsClusterClient
         lastEgressMessageMs = System.currentTimeMillis();
         wasConnected = true;
 
+        if (feedConfigured()) {
+            // BOOTSTRAP ORDER — this must precede listener.onConnected() below. onConnected() is
+            // what enqueues the balance-snapshot bootstrap request, and the feed must already be
+            // OPEN and polled when that snapshot streams: any live change published after the
+            // snapshot's cut then lands on the feed instead of vanishing into an unsubscribed gap.
+            // The remaining honest window is last-write-wins: a conflated feed frame carrying an
+            // OLDER value than the snapshot can arrive after it and stand until that (user, asset)
+            // next changes. Acceptable by design — the projection is a read/pre-check cache and
+            // self-correcting; the authoritative money gate is the HOLD on the cluster session
+            // (AeronAssetsBalanceStore's class doc), which a stale read can only false-reject.
+            openFeedSubscription();
+            // Narrow this brand-new session (it starts CH_ALL on the AE): armed here, offered
+            // non-blockingly by the poll loop until accepted. Until then the firehose flows — the
+            // safe direction.
+            subscribePending = true;
+        }
+
         AssetsEgressListener listener = egressListener;
         if (listener != null) {
             try {
@@ -406,6 +535,21 @@ public class AssetsClusterClient
                 log.error("AssetsEgressListener.onConnected() threw exception", e);
             }
         }
+    }
+
+    /**
+     * (Re)open the balance-feed subscription on the SAME Aeron instance the cluster session uses —
+     * the one owned by the current {@link AeronCluster} on this client's embedded driver. Tying its
+     * lifecycle to the cluster instance means every teardown path that closes the session (reconnect,
+     * stale egress, driver reset, shutdown) reclaims the subscription with it, and every
+     * {@code connectToCluster()} re-creates it fresh.
+     */
+    private void openFeedSubscription() {
+        CloseHelper.quietClose(feedSubscription);
+        feedSubscription = cluster.context().aeron()
+                .addSubscription(balanceFeedChannel, balanceFeedStreamId);
+        log.info("AE balance-feed subscription opened: channel={}, stream={}",
+                balanceFeedChannel, balanceFeedStreamId);
     }
 
     /** Attempt to reconnect with exponential backoff; recreate the MediaDriver after repeated failures. */
@@ -418,6 +562,7 @@ public class AssetsClusterClient
 
         // Close old cluster connection (guaranteed teardown so the abandoned egress
         // subscription's image mappings are released; see closeAbandonedCluster).
+        closeFeedSubscription();
         closeAbandonedCluster(cluster, "reconnect");
         cluster = null;
         notifyDisconnected();
@@ -492,6 +637,21 @@ public class AssetsClusterClient
             try {
                 int work = currentCluster.pollEgress();
 
+                // Balance-feed side-channel: same single thread, bounded fragment budget so the
+                // feed (a leadership-gain sweep can burst) never starves pollEgress above nor the
+                // command drain below — and vice versa. No-op (null) when the feed is off.
+                final Subscription feedSub = feedSubscription;
+                if (feedSub != null) {
+                    work += feedSub.poll(feedAssembler, FEED_POLL_FRAGMENT_LIMIT);
+                }
+
+                // Re-declare the Subscribe narrowing when armed (fresh session or new leader).
+                // Non-blocking single offer per cycle; back-pressure keeps the flag up, so the
+                // intent survives until the leader accepts it. Never touches a caller thread.
+                if (subscribePending) {
+                    work += tryOfferSubscribe(currentCluster);
+                }
+
                 long nowNs = System.nanoTime();
                 if (nowNs - lastKeepAliveNs >= KEEPALIVE_INTERVAL_NS) {
                     // oms#116: a throwing keep-alive must not skip the drain/watchdog below.
@@ -535,6 +695,84 @@ public class AssetsClusterClient
     /** Signal the polling loop to stop. */
     public void stopPolling() {
         running.set(false);
+    }
+
+    /**
+     * One non-blocking attempt to land the pre-encoded {@code Subscribe{acks, settlements}} on the
+     * current session. Success clears {@link #subscribePending}; ANY failure keeps it set — a dead
+     * session is handled by the reconnect machinery, which re-arms the flag on the replacement
+     * session anyway, and re-sending a Subscribe twice is idempotent on the AE.
+     *
+     * @return 1 if the frame was accepted (work done), 0 otherwise
+     */
+    private int tryOfferSubscribe(AeronCluster currentCluster) {
+        final long result = currentCluster.offer(subscribeBuffer, 0, subscribeLength);
+        if (result > 0) {
+            subscribePending = false;
+            subscribesSent++;
+            log.info("AE session narrowed to acks+settlements (balances ride the feed side-channel)");
+            return 1;
+        }
+        return 0;
+    }
+
+    /** Close the current feed subscription (idempotent, null-safe); reopened by connectToCluster. */
+    private void closeFeedSubscription() {
+        final Subscription sub = feedSubscription;
+        feedSubscription = null;
+        CloseHelper.quietClose(sub);
+    }
+
+    /**
+     * Decode one balance-feed frame and fan out through the SAME listener path as the cluster
+     * egress — {@link AssetsEgressListener#onBalanceUpdate} — so the projection and everything
+     * downstream cannot tell the transports apart. Runs on the single polling thread (the same
+     * thread as {@link #dispatchEgress}), which is why sharing its decoders is safe.
+     *
+     * <p>Deliberately does NOT touch {@code egressMessageCount}/{@code lastEgressMessageMs}: the
+     * stale-egress watchdog reasons about the request-response CLUSTER session, and side-channel
+     * traffic must never mask a stalled session. Package-private as a test seam (mirrors
+     * {@code dispatchEgress}).</p>
+     */
+    void onFeedFragment(DirectBuffer buffer, int offset, int length, Header header) {
+        if (length < MessageHeaderDecoder.ENCODED_LENGTH) {
+            return;
+        }
+        headerDecoder.wrap(buffer, offset);
+        final int templateId = headerDecoder.templateId();
+
+        final AssetsEgressListener l = egressListener;
+        if (l == null) {
+            return;
+        }
+        try {
+            switch (templateId) {
+                case BalanceUpdateDecoder.TEMPLATE_ID:
+                    feedFramesReceived++;
+                    balanceUpdateDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                    l.onBalanceUpdate(balanceUpdateDecoder.userId(), balanceUpdateDecoder.assetId(),
+                            balanceUpdateDecoder.available(), balanceUpdateDecoder.locked());
+                    feedEntriesReceived++;
+                    break;
+
+                case BalanceUpdateBatchDecoder.TEMPLATE_ID:
+                    feedFramesReceived++;
+                    balanceUpdateBatchDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+                    for (BalanceUpdateBatchDecoder.UpdatesDecoder e : balanceUpdateBatchDecoder.updates()) {
+                        l.onBalanceUpdate(e.userId(), e.assetId(), e.available(), e.locked());
+                        feedEntriesReceived++;
+                    }
+                    break;
+
+                default:
+                    // The feed's vocabulary is balance frames only; anything else is a foreign
+                    // publication on our stream id — ignore rather than mis-decode.
+                    log.warn("AE balance feed: unexpected templateId={} ignored", templateId);
+                    break;
+            }
+        } catch (Exception ex) {
+            log.error("AssetsEgressListener feed dispatch threw for templateId={}", templateId, ex);
+        }
     }
 
     /**
@@ -601,11 +839,13 @@ public class AssetsClusterClient
         var sub = currentCluster.egressSubscription();
         log.info("AE STATS: egress={}, keepAlives={}, sent={}, connected={}, subConnected={}, "
                         + "images={}, sessionId={}, egressAge={}ms, retried={}, held={}, dropped={}, "
-                        + "rejected={}, aeronErrors={}, queueDepth={}",
+                        + "rejected={}, aeronErrors={}, queueDepth={}, feedFrames={}, feedEntries={}, "
+                        + "egressBalanceEntries={}, subscribes={}",
                 egressMessageCount, keepAliveCount, commandsSent, isConnected(),
                 sub.isConnected(), sub.imageCount(), currentCluster.clusterSessionId(), egressAgeMs,
                 offerRetriedCount, offerHeldCount, offerDroppedCount, submitRejectedCount,
-                aeronErrorCount.get(), commandQueue.size());
+                aeronErrorCount.get(), commandQueue.size(), feedFramesReceived, feedEntriesReceived,
+                egressBalanceUpdateEntries, subscribesSent);
 
         // oms#109: the AE is REQUEST-RESPONSE, so egress silence during an idle period (no
         // holds/queries in flight) is normal and must NOT force a reconnect — that churned the
@@ -615,6 +855,7 @@ public class AssetsClusterClient
         if (egressAgeMs > STALE_EGRESS_TIMEOUT_MS && requestOutstanding) {
             log.warn("AE STALE EGRESS: a sent command went unanswered for {}ms while connected. Forcing reconnect.", egressAgeMs);
             final long staleSessionId = currentCluster.clusterSessionId();
+            closeFeedSubscription();
             closeAbandonedCluster(currentCluster, "stale-egress forced reconnect");
             cluster = null;
             // Live verification signal: images= in the AE STATS line above must stop climbing
@@ -849,6 +1090,7 @@ public class AssetsClusterClient
                     break;
 
                 case BalanceUpdateDecoder.TEMPLATE_ID:
+                    egressBalanceUpdateEntries++;
                     balanceUpdateDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
                     l.onBalanceUpdate(balanceUpdateDecoder.userId(), balanceUpdateDecoder.assetId(),
                             balanceUpdateDecoder.available(), balanceUpdateDecoder.locked());
@@ -857,6 +1099,7 @@ public class AssetsClusterClient
                 case BalanceUpdateBatchDecoder.TEMPLATE_ID:
                     balanceUpdateBatchDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
                     for (BalanceUpdateBatchDecoder.UpdatesDecoder e : balanceUpdateBatchDecoder.updates()) {
+                        egressBalanceUpdateEntries++;
                         l.onBalanceUpdate(e.userId(), e.assetId(), e.available(), e.locked());
                     }
                     break;
@@ -965,6 +1208,15 @@ public class AssetsClusterClient
         log.info("AE new leader: member={}, term={}, ingress={} (transition window {}ms)",
                 leaderMemberId, leadershipTermId, ingressEndpoints, LEADER_TRANSITION_TIMEOUT_MS);
 
+        if (feedConfigured()) {
+            // Leader-local transport state must be re-declared on EVERY leader change (the same
+            // principle the assets bridge applies): the Subscribe narrowing lives on the leader and
+            // is deliberately never snapshotted, so a session that survives the change falls back
+            // to the full firehose (safe direction) until this lands on the new leader. Armed here
+            // (this callback runs on the poll thread, inside pollEgress); the poll loop offers it.
+            subscribePending = true;
+        }
+
         // Tell the store above to re-sync money state lost at the switchover seam.
         AssetsEgressListener listener = egressListener;
         if (listener != null) {
@@ -1024,9 +1276,40 @@ public class AssetsClusterClient
         return aeronErrorCount.get();
     }
 
+    /** Subscribe frames accepted by the AE (>=1 per session/leader generation when the feed is on). */
+    public long getSubscribesSent() {
+        return subscribesSent;
+    }
+
+    /** True while a Subscribe narrowing is armed but not yet accepted by the leader. */
+    public boolean isSubscribePending() {
+        return subscribePending;
+    }
+
+    /** Balance-feed frames decoded (side-channel only; 0 when the feed is off). */
+    public long getFeedFramesReceived() {
+        return feedFramesReceived;
+    }
+
+    /** Balance entries decoded off the feed (singles + batch entries). */
+    public long getFeedEntriesReceived() {
+        return feedEntriesReceived;
+    }
+
+    /**
+     * Balance entries (singles + batch entries) that arrived on the CLUSTER session. With the feed
+     * on and the Subscribe accepted, only origin-routed snapshot-reply entries move this — a live
+     * broadcast landing here would be the firehose leaking past the mask (the integration test's
+     * negative assertion).
+     */
+    public long getEgressBalanceUpdateEntries() {
+        return egressBalanceUpdateEntries;
+    }
+
     @Override
     public void close() {
         running.set(false);
+        closeFeedSubscription();
         closeAbandonedCluster(cluster, "shutdown");
         CloseHelper.quietClose(mediaDriver);
         cluster = null;
@@ -1050,6 +1333,19 @@ public class AssetsClusterClient
         dst.putBytes(0, cmd.buffer, 0, len);
         commandPool.offer(cmd);
         return len;
+    }
+
+    /**
+     * Test seam: copy the pre-encoded Subscribe frame into {@code dst} and return its length, or
+     * {@code -1} when no feed is configured (no frame exists). Lets the unit test decode the exact
+     * bytes the poll loop offers, without a cluster.
+     */
+    int copySubscribeForTest(MutableDirectBuffer dst) {
+        if (!feedConfigured()) {
+            return -1;
+        }
+        dst.putBytes(0, subscribeBuffer, 0, subscribeLength);
+        return subscribeLength;
     }
 
     // ==================== Utility ====================
