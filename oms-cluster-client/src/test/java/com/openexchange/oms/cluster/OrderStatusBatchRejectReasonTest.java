@@ -33,11 +33,11 @@ class OrderStatusBatchRejectReasonTest {
         OrderStatusBatchEncoder.OrdersEncoder orders = enc.ordersCount(2);
         orders.next()
                 .orderId(1000L).userId(1L).status(OrderStatus.FILLED).price(100L)
-                .remainingQty(0L).filledQty(50L).side(OrderSide.BID).timestamp(1L)
+                .remainingQty(0L).filledQty(50L).side(OrderSide.BID)
                 .omsOrderId(11L).statusSeq(1L).rejectReason((short) 0); // NONE
         orders.next()
                 .orderId(1001L).userId(1L).status(OrderStatus.REJECTED).price(0L)
-                .remainingQty(0L).filledQty(0L).side(OrderSide.ASK).timestamp(2L)
+                .remainingQty(0L).filledQty(0L).side(OrderSide.ASK)
                 .omsOrderId(12L).statusSeq(2L).rejectReason((short) 9); // NO_LIQUIDITY
         return buffer;
     }

@@ -3,6 +3,7 @@ package com.openexchange.oms.assets;
 
 import com.match.domain.FixedPoint;
 import com.openexchange.assets.infrastructure.generated.BoolFlag;
+import com.openexchange.assets.infrastructure.generated.HoldSnapshotBatchDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEndDecoder;
 import com.openexchange.assets.infrastructure.generated.HoldSnapshotEntryDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
@@ -418,6 +419,7 @@ class OmsAeIntegrationTest {
 
         private final MessageHeaderDecoder header = new MessageHeaderDecoder();
         private final HoldSnapshotEntryDecoder holdEntry = new HoldSnapshotEntryDecoder();
+        private final HoldSnapshotBatchDecoder holdBatch = new HoldSnapshotBatchDecoder();
         private final HoldSnapshotEndDecoder holdEnd = new HoldSnapshotEndDecoder();
         private final SettlementAppliedDecoder settlementApplied = new SettlementAppliedDecoder();
 
@@ -464,6 +466,13 @@ class OmsAeIntegrationTest {
                 holdEntry.wrapAndApplyHeader(buffer, offset, header);
                 holds.put(holdEntry.orderId(),
                         new long[] {holdEntry.userId(), holdEntry.assetId(), holdEntry.remaining()});
+            } else if (templateId == HoldSnapshotBatchDecoder.TEMPLATE_ID) {
+                // money-schema v5: a live AE answers RequestHoldSnapshot with HoldSnapshotBatch
+                // chunks (HoldSnapshotEnd still terminates). Record each entry exactly as the single form.
+                holdBatch.wrapAndApplyHeader(buffer, offset, header);
+                for (HoldSnapshotBatchDecoder.HoldsDecoder e : holdBatch.holds()) {
+                    holds.put(e.orderId(), new long[] {e.userId(), e.assetId(), e.remaining()});
+                }
             } else if (templateId == HoldSnapshotEndDecoder.TEMPLATE_ID) {
                 holdEnd.wrapAndApplyHeader(buffer, offset, header);
                 holdSnapEndCorr = holdEnd.correlationId();
