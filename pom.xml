@@ -38,8 +38,13 @@
 
         <!-- Shared cluster machinery. Only the port arithmetic is used here: the
              engines, the settlement bridge and this client all have to derive the
-             same numbers, and copies of a wire contract drift silently. -->
-        <cluster-kit.version>0.1.5</cluster-kit.version>
+             same numbers, and copies of a wire contract drift silently. Pinned to
+             match match@main and assets@main (both on 0.1.6): the v5 assets engine
+             that OmsAeIntegrationTest boots references cluster-kit's ClusterMemberPositions
+             (added in 0.1.6), which a 0.1.5 runtime classpath cannot load. OMS's only
+             use, ClusterPorts.port(nodeId, portBase, CLIENT_FACING_OFFSET), is unchanged
+             across 0.1.5 -> 0.1.6. -->
+        <cluster-kit.version>0.1.6</cluster-kit.version>
 
         <!-- Aeron (must match match-engine version) -->
         <aeron.version>1.52.2</aeron.version>
