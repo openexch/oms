@@ -48,6 +48,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -85,11 +86,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * so the store above can re-sync balances/holds across the switchover seam.</p>
  *
  * <h3>Balance-feed side-channel (optional)</h3>
- * <p>When {@code balanceFeedChannel} names an Aeron channel, live balances arrive on the AE's
- * conflated side-channel (a plain publication, latest-value per {@code (user, asset)}) instead of
- * riding the cluster session, and this client narrows its session with a {@code Subscribe} to
- * {@code {acks, settlements}} — the firehose of every user's BalanceUpdate stops multiplying per
- * session on the AE egress. Three invariants keep this correct:</p>
+ * <p>When {@code balanceFeedChannel} names one or more Aeron channels (comma-separated — one per
+ * AE node's control endpoint, or a single multicast URI; see {@link #balanceFeedChannels} for why
+ * a list), live balances arrive on the AE's conflated side-channel (a plain publication,
+ * latest-value per {@code (user, asset)}) instead of riding the cluster session, and this client
+ * narrows its session with a {@code Subscribe} to {@code {acks, settlements}} — the firehose of
+ * every user's BalanceUpdate stops multiplying per session on the AE egress. Three invariants keep
+ * this correct:</p>
  * <ul>
  *   <li><b>Re-declared transport state.</b> The Subscribe narrowing lives on the AE leader and is
  *       deliberately never snapshotted, so it is re-armed on every session establishment AND every
@@ -170,16 +173,33 @@ public class AssetsClusterClient
     private final String egressChannel;
     private final String aeronDirName;
 
-    // ---- Balance-feed side-channel state (empty channel = feature OFF, legacy behavior) ----
-    private final String balanceFeedChannel;
+    // ---- Balance-feed side-channel state (empty channel list = feature OFF, legacy behavior) ----
+    /**
+     * The feed channel URIs, parsed from the comma-separated {@code BALANCE_FEED_CHANNEL} value
+     * (split on ',', trimmed, empties ignored; an all-empty value = feature OFF).
+     *
+     * <p>A LIST, not one URI, because only the AE <b>leader</b> publishes the feed while each
+     * co-resident AE node owns its OWN MDC control endpoint (per-node
+     * {@code aeron:udp?control=host:port|control-mode=dynamic}). Subscribing every node's endpoint
+     * up front costs nothing — a follower's publication carries zero traffic until that node gains
+     * leadership — and makes failover seamless: the new leader's leadership-gain full sweep repaints
+     * every (user, asset) through the already-open subscription, no churn, no re-dial. A colo
+     * deployment collapses the list to a single multicast URI
+     * ({@code aeron:udp?endpoint=<group>:9420}) with identical semantics on both sides.</p>
+     */
+    private final List<String> balanceFeedChannels;
     private final int balanceFeedStreamId;
     /** Pre-encoded {@code Subscribe{acks, settlements}} frame; immutable after construction. */
     private final UnsafeBuffer subscribeBuffer;
     private final int subscribeLength;
     /** Reassembles fragmented feed frames (a full BalanceUpdateBatch exceeds the default MTU). */
     private final FragmentAssembler feedAssembler;
-    /** Lives and dies with the current {@link #cluster}'s owned Aeron client. */
-    private volatile Subscription feedSubscription;
+    /**
+     * One subscription per {@link #balanceFeedChannels} entry (see that field for why a list).
+     * Lives and dies with the current {@link #cluster}'s owned Aeron client. Published as a whole,
+     * fully-built array; the poll loop reads it once per cycle.
+     */
+    private volatile Subscription[] feedSubscriptions;
     /** Set on session establishment and leader change; cleared when the offer is accepted. */
     private volatile boolean subscribePending;
 
@@ -272,8 +292,11 @@ public class AssetsClusterClient
      * and an explicit balance-feed configuration — the production constructor ({@code OmsConfig}
      * owns the {@code BALANCE_FEED_CHANNEL}/{@code BALANCE_FEED_STREAM_ID} env reads).
      *
-     * @param balanceFeedChannel Aeron channel of the AE's conflated balance feed; empty/null = OFF.
-     *                           Must be reachable from this client's own embedded driver (UDP
+     * @param balanceFeedChannel comma-separated Aeron channel URIs of the AE's conflated balance
+     *                           feed, one subscription opened per URI (typically one per AE node's
+     *                           control endpoint, or a single multicast URI — see
+     *                           {@link #balanceFeedChannels}); empty/null = OFF. Each must be
+     *                           reachable from this client's own embedded driver (UDP
      *                           unicast/multicast or MDC — {@code aeron:ipc} cannot span drivers).
      * @param balanceFeedStreamId stream id of the feed ({@link #DEFAULT_BALANCE_FEED_STREAM_ID})
      */
@@ -298,7 +321,7 @@ public class AssetsClusterClient
         this.ingressEndpoints = ingressEndpoints;
         this.egressChannel = egressChannel;
         this.aeronDirName = "/dev/shm/aeron-oms-assets-" + ProcessHandle.current().pid();
-        this.balanceFeedChannel = balanceFeedChannel == null ? "" : balanceFeedChannel;
+        this.balanceFeedChannels = parseFeedChannels(balanceFeedChannel);
         this.balanceFeedStreamId = balanceFeedStreamId;
         if (feedConfigured()) {
             // The Subscribe frame is constant for the life of the client — encode it once here so
@@ -319,7 +342,25 @@ public class AssetsClusterClient
         prefillCommandPool();
         log.info("AssetsClusterClient configured: ingress={}, egress={}, balanceFeed={}",
                 ingressEndpoints, egressChannel,
-                feedConfigured() ? this.balanceFeedChannel + " stream " + balanceFeedStreamId : "off");
+                feedConfigured() ? String.join(",", balanceFeedChannels) + " stream " + balanceFeedStreamId : "off");
+    }
+
+    /**
+     * Split the comma-separated feed channel value into its URIs: split on ',', trim each part,
+     * drop empties. Null/empty (or all-empty, e.g. {@code " , "}) yields an empty list = feed OFF.
+     */
+    private static List<String> parseFeedChannels(String channels) {
+        if (channels == null || channels.isEmpty()) {
+            return List.of();
+        }
+        final List<String> uris = new ArrayList<>();
+        for (String part : channels.split(",")) {
+            final String uri = part.trim();
+            if (!uri.isEmpty()) {
+                uris.add(uri);
+            }
+        }
+        return List.copyOf(uris);
     }
 
     private static String envIngressEndpoints() {
@@ -334,9 +375,9 @@ public class AssetsClusterClient
         return "aeron:udp?endpoint=" + egressHost + ":" + egressPort;
     }
 
-    /** True when a balance-feed channel is configured (the Subscribe/side-channel machinery is live). */
+    /** True when at least one balance-feed channel is configured (the Subscribe/side-channel machinery is live). */
     private boolean feedConfigured() {
-        return !balanceFeedChannel.isEmpty();
+        return !balanceFeedChannels.isEmpty();
     }
 
     private void prefillCommandPool() {
@@ -520,7 +561,7 @@ public class AssetsClusterClient
             // next changes. Acceptable by design — the projection is a read/pre-check cache and
             // self-correcting; the authoritative money gate is the HOLD on the cluster session
             // (AeronAssetsBalanceStore's class doc), which a stale read can only false-reject.
-            openFeedSubscription();
+            openFeedSubscriptions(cluster.context().aeron());
             // Narrow this brand-new session (it starts CH_ALL on the AE): armed here, offered
             // non-blockingly by the poll loop until accepted. Until then the firehose flows — the
             // safe direction.
@@ -538,18 +579,30 @@ public class AssetsClusterClient
     }
 
     /**
-     * (Re)open the balance-feed subscription on the SAME Aeron instance the cluster session uses —
-     * the one owned by the current {@link AeronCluster} on this client's embedded driver. Tying its
-     * lifecycle to the cluster instance means every teardown path that closes the session (reconnect,
-     * stale egress, driver reset, shutdown) reclaims the subscription with it, and every
-     * {@code connectToCluster()} re-creates it fresh.
+     * (Re)open one balance-feed subscription per configured channel URI on the SAME Aeron instance
+     * the cluster session uses — the one owned by the current {@link AeronCluster} on this client's
+     * embedded driver. Tying their lifecycle to the cluster instance means every teardown path that
+     * closes the session (reconnect, stale egress, driver reset, shutdown) reclaims the
+     * subscriptions with it, and every {@code connectToCluster()} re-creates them fresh.
+     *
+     * <p>Package-private taking the {@code Aeron} instance as a test seam: the unit test opens the
+     * subscriptions against its own driver's client without booting an AE cluster (production's only
+     * caller passes {@code cluster.context().aeron()}).</p>
      */
-    private void openFeedSubscription() {
-        CloseHelper.quietClose(feedSubscription);
-        feedSubscription = cluster.context().aeron()
-                .addSubscription(balanceFeedChannel, balanceFeedStreamId);
-        log.info("AE balance-feed subscription opened: channel={}, stream={}",
-                balanceFeedChannel, balanceFeedStreamId);
+    void openFeedSubscriptions(io.aeron.Aeron aeron) {
+        closeFeedSubscriptions();
+        final Subscription[] subs = new Subscription[balanceFeedChannels.size()];
+        try {
+            for (int i = 0; i < subs.length; i++) {
+                subs[i] = aeron.addSubscription(balanceFeedChannels.get(i), balanceFeedStreamId);
+            }
+        } catch (Exception e) {
+            CloseHelper.quietCloseAll(subs); // no half-open set: all subscriptions or none
+            throw e;
+        }
+        feedSubscriptions = subs;
+        log.info("AE balance-feed subscriptions opened: channels={}, stream={}",
+                balanceFeedChannels, balanceFeedStreamId);
     }
 
     /** Attempt to reconnect with exponential backoff; recreate the MediaDriver after repeated failures. */
@@ -562,7 +615,7 @@ public class AssetsClusterClient
 
         // Close old cluster connection (guaranteed teardown so the abandoned egress
         // subscription's image mappings are released; see closeAbandonedCluster).
-        closeFeedSubscription();
+        closeFeedSubscriptions();
         closeAbandonedCluster(cluster, "reconnect");
         cluster = null;
         notifyDisconnected();
@@ -639,11 +692,8 @@ public class AssetsClusterClient
 
                 // Balance-feed side-channel: same single thread, bounded fragment budget so the
                 // feed (a leadership-gain sweep can burst) never starves pollEgress above nor the
-                // command drain below — and vice versa. No-op (null) when the feed is off.
-                final Subscription feedSub = feedSubscription;
-                if (feedSub != null) {
-                    work += feedSub.poll(feedAssembler, FEED_POLL_FRAGMENT_LIMIT);
-                }
+                // command drain below — and vice versa. No-op when the feed is off.
+                work += pollFeedSubscriptions();
 
                 // Re-declare the Subscribe narrowing when armed (fresh session or new leader).
                 // Non-blocking single offer per cycle; back-pressure keeps the flag up, so the
@@ -716,11 +766,35 @@ public class AssetsClusterClient
         return 0;
     }
 
-    /** Close the current feed subscription (idempotent, null-safe); reopened by connectToCluster. */
-    private void closeFeedSubscription() {
-        final Subscription sub = feedSubscription;
-        feedSubscription = null;
-        CloseHelper.quietClose(sub);
+    /**
+     * Poll every feed subscription under ONE shared fragment budget ({@link #FEED_POLL_FRAGMENT_LIMIT}
+     * is the per-cycle TOTAL, not per subscription): each subscription gets the full remaining
+     * budget until it is exhausted. Index order is fair enough — only the AE leader publishes, so
+     * at most one subscription has traffic in any cycle. Package-private as a test seam (the unit
+     * test drives it on its own thread, mirroring {@code dispatchEgress}); in production only the
+     * single polling thread calls it. No-op (0) when the feed is off or torn down.
+     *
+     * @return fragments consumed across all subscriptions
+     */
+    int pollFeedSubscriptions() {
+        final Subscription[] subs = feedSubscriptions;
+        if (subs == null) {
+            return 0;
+        }
+        int consumed = 0;
+        for (int i = 0; i < subs.length && consumed < FEED_POLL_FRAGMENT_LIMIT; i++) {
+            consumed += subs[i].poll(feedAssembler, FEED_POLL_FRAGMENT_LIMIT - consumed);
+        }
+        return consumed;
+    }
+
+    /** Close all current feed subscriptions (idempotent, null-safe); reopened by connectToCluster. */
+    private void closeFeedSubscriptions() {
+        final Subscription[] subs = feedSubscriptions;
+        feedSubscriptions = null;
+        if (subs != null) {
+            CloseHelper.quietCloseAll(subs);
+        }
     }
 
     /**
@@ -855,7 +929,7 @@ public class AssetsClusterClient
         if (egressAgeMs > STALE_EGRESS_TIMEOUT_MS && requestOutstanding) {
             log.warn("AE STALE EGRESS: a sent command went unanswered for {}ms while connected. Forcing reconnect.", egressAgeMs);
             final long staleSessionId = currentCluster.clusterSessionId();
-            closeFeedSubscription();
+            closeFeedSubscriptions();
             closeAbandonedCluster(currentCluster, "stale-egress forced reconnect");
             cluster = null;
             // Live verification signal: images= in the AE STATS line above must stop climbing
@@ -1309,7 +1383,7 @@ public class AssetsClusterClient
     @Override
     public void close() {
         running.set(false);
-        closeFeedSubscription();
+        closeFeedSubscriptions();
         closeAbandonedCluster(cluster, "shutdown");
         CloseHelper.quietClose(mediaDriver);
         cluster = null;
@@ -1346,6 +1420,14 @@ public class AssetsClusterClient
         }
         dst.putBytes(0, subscribeBuffer, 0, subscribeLength);
         return subscribeLength;
+    }
+
+    /**
+     * Test seam: the live feed subscriptions array (null when the feed is off or torn down). Lets
+     * the unit test assert one subscription per configured URI and that teardown closed every one.
+     */
+    Subscription[] feedSubscriptionsForTest() {
+        return feedSubscriptions;
     }
 
     // ==================== Utility ====================
