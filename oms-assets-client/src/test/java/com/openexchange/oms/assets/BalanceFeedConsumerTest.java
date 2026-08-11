@@ -7,26 +7,43 @@ import com.openexchange.assets.infrastructure.generated.DepositAckEncoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderDecoder;
 import com.openexchange.assets.infrastructure.generated.MessageHeaderEncoder;
 import com.openexchange.assets.infrastructure.generated.SubscribeDecoder;
+import io.aeron.Aeron;
+import io.aeron.Publication;
+import io.aeron.Subscription;
+import io.aeron.driver.MediaDriver;
+import io.aeron.driver.ThreadingMode;
 import org.agrona.ExpandableArrayBuffer;
+import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.jupiter.api.Test;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Unit coverage for the balance-feed consumer seams of {@link AssetsClusterClient}, no cluster:
  * the exact bytes of the {@code Subscribe} narrowing, the re-declare trigger on a leader change,
- * and the feed-fragment dispatch path (same listener callbacks, cluster egress counters untouched).
+ * the feed-fragment dispatch path (same listener callbacks, cluster egress counters untouched),
+ * and the comma-separated multi-URI subscription set (one subscription per AE node endpoint —
+ * see {@code AssetsClusterClient#balanceFeedChannels} for why a list) against a real driver.
  */
 class BalanceFeedConsumerTest {
 
     private static final String INGRESS = "0=localhost:9302";
     private static final String EGRESS = "aeron:udp?endpoint=localhost:9393";
     private static final String FEED = "aeron:udp?endpoint=localhost:9494";
+
+    /** Two feed endpoints standing in for two AE nodes' control endpoints (ports unused elsewhere). */
+    private static final String FEED_A = "aeron:udp?endpoint=localhost:19710";
+    private static final String FEED_B = "aeron:udp?endpoint=localhost:19711";
+
+    private static final long AWAIT_TIMEOUT_MS = 10_000;
 
     private static AssetsClusterClient feedClient() {
         return new AssetsClusterClient(INGRESS, EGRESS, FEED,
@@ -163,6 +180,128 @@ class BalanceFeedConsumerTest {
         assertEquals(2L, rec.balanceUpdates.get(1)[0]);
         assertEquals(20L, rec.balanceUpdates.get(1)[2]);
         assertEquals(0, client.getEgressBalanceUpdateEntries());
+    }
+
+    // ==================== Comma-separated URI list ====================
+
+    @Test
+    void allEmptyChannelListMeansFeedOff() {
+        // Parser contract: split on ',', trim, drop empties — a value of only separators and
+        // whitespace configures NO feed, byte-identical to the legacy empty-channel client.
+        final AssetsClusterClient client = new AssetsClusterClient(INGRESS, EGRESS, " , ,",
+                AssetsClusterClient.DEFAULT_BALANCE_FEED_STREAM_ID);
+        assertEquals(-1, client.copySubscribeForTest(new ExpandableArrayBuffer()),
+                "an all-empty channel list must mean feed off (no Subscribe frame)");
+        client.onNewLeader(1L, 2L, 1, INGRESS);
+        assertFalse(client.isSubscribePending(), "feed off: a leader change must arm nothing");
+    }
+
+    /**
+     * The multi-URI path against a REAL driver: a messy comma list opens one subscription per URI
+     * (whitespace trimmed, empties dropped), frames published on EITHER endpoint reach the same
+     * listener path, one {@code pollFeedSubscriptions()} cycle never exceeds the shared TOTAL
+     * fragment budget across all subscriptions, and teardown closes every subscription.
+     */
+    @Test
+    void commaListOpensOneSubscriptionPerUriAndEitherDelivers() {
+        final String aeronDir = new File(System.getProperty("java.io.tmpdir"),
+                "oms-feed-multi-" + ProcessHandle.current().pid()).getAbsolutePath();
+
+        try (MediaDriver driver = MediaDriver.launch(new MediaDriver.Context()
+                     .aeronDirectoryName(aeronDir)
+                     .threadingMode(ThreadingMode.SHARED)
+                     .publicationTermBufferLength(64 * 1024)
+                     .ipcTermBufferLength(64 * 1024)
+                     .dirDeleteOnStart(true)
+                     .dirDeleteOnShutdown(true));
+             Aeron aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(aeronDir));
+             AssetsClusterClient client = new AssetsClusterClient(INGRESS, EGRESS,
+                     " " + FEED_A + " ,, " + FEED_B + " ,", // messy on purpose: trim + drop empties
+                     AssetsClusterClient.DEFAULT_BALANCE_FEED_STREAM_ID)) {
+
+            final Recording rec = new Recording();
+            client.setEgressListener(rec);
+
+            client.openFeedSubscriptions(aeron);
+            final Subscription[] subs = client.feedSubscriptionsForTest();
+            assertEquals(2, subs.length, "one subscription per URI, empties dropped");
+
+            try (Publication pubA = aeron.addPublication(FEED_A,
+                         AssetsClusterClient.DEFAULT_BALANCE_FEED_STREAM_ID);
+                 Publication pubB = aeron.addPublication(FEED_B,
+                         AssetsClusterClient.DEFAULT_BALANCE_FEED_STREAM_ID)) {
+                awaitTrue("pubA connected", pubA::isConnected);
+                awaitTrue("pubB connected", pubB::isConnected);
+
+                // Frames on EITHER endpoint arrive through the same dispatch path.
+                offerBalanceUpdate(pubA, 1L, 0, 100L, 10L);
+                awaitTrue("frame from endpoint A", () -> pollOnce(client) >= 0 && rec.balanceUpdates.size() == 1);
+                assertEquals(1L, rec.balanceUpdates.get(0)[0]);
+                assertEquals(100L, rec.balanceUpdates.get(0)[2]);
+
+                offerBalanceUpdate(pubB, 2L, 1, 200L, 20L);
+                awaitTrue("frame from endpoint B", () -> pollOnce(client) >= 0 && rec.balanceUpdates.size() == 2);
+                assertEquals(2L, rec.balanceUpdates.get(1)[0]);
+                assertEquals(200L, rec.balanceUpdates.get(1)[2]);
+
+                // Budget: FEED_POLL_FRAGMENT_LIMIT (64) is the per-cycle TOTAL across all
+                // subscriptions, not per subscription. 40 frames on each endpoint = 80 available;
+                // no single poll cycle may consume more than 64, and all 80 must drain.
+                for (int i = 0; i < 40; i++) {
+                    offerBalanceUpdate(pubA, 100L + i, 0, i, 0L);
+                    offerBalanceUpdate(pubB, 200L + i, 1, i, 0L);
+                }
+                int drained = 0;
+                final long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
+                while (drained < 80) {
+                    assertTrue(System.currentTimeMillis() < deadline, "timed out draining the burst");
+                    final int consumed = client.pollFeedSubscriptions();
+                    assertTrue(consumed <= 64,
+                            "one poll cycle consumed " + consumed + " fragments; 64 is the shared total budget");
+                    drained += consumed;
+                }
+                assertEquals(80, drained);
+                assertEquals(82, rec.balanceUpdates.size());
+            }
+
+            // Teardown mirrors the single-close: close() must close EVERY subscription.
+            client.close();
+            for (Subscription sub : subs) {
+                assertTrue(sub.isClosed(), "close() must close every feed subscription");
+            }
+            assertNull(client.feedSubscriptionsForTest(), "the subscription set must be torn down");
+        }
+    }
+
+    /** One poll on the client's own seam; returns fragments consumed (side effect: dispatch). */
+    private static int pollOnce(AssetsClusterClient client) {
+        return client.pollFeedSubscriptions();
+    }
+
+    private static void offerBalanceUpdate(Publication pub, long userId, int assetId,
+                                           long available, long locked) {
+        final UnsafeBuffer buf = new UnsafeBuffer(new byte[64]);
+        final BalanceUpdateEncoder enc = new BalanceUpdateEncoder();
+        enc.wrapAndApplyHeader(buf, 0, new MessageHeaderEncoder())
+                .userId(userId).assetId(assetId).available(available).locked(locked);
+        final int length = MessageHeaderEncoder.ENCODED_LENGTH + enc.encodedLength();
+        final long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
+        while (pub.offer(buf, 0, length) < 0) {
+            assertTrue(System.currentTimeMillis() < deadline, "offer back-pressured too long");
+            Thread.onSpinWait();
+        }
+    }
+
+    private static void awaitTrue(String what, BooleanSupplier cond) {
+        final long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
+        while (!cond.getAsBoolean()) {
+            assertTrue(System.currentTimeMillis() < deadline, "timed out waiting for: " + what);
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     @Test

@@ -14,11 +14,15 @@ package com.openexchange.oms.app;
  * (aeHoldTimeoutMs/aeAckTimeoutMs/aeConnectTimeoutMs) size the OMS's client.
  *
  * Balance feed: BALANCE_FEED_CHANNEL (empty/unset = OFF) names the AE's
- * conflated balance side-channel; when set, the OMS consumes live balances
- * from it and narrows its cluster session to acks+settlements instead of
- * receiving every user's BalanceUpdate. Same env var the AE nodes use, so a
- * stack profile sets one value for both sides. BALANCE_FEED_STREAM_ID
- * overrides the feed stream id (default 4201).
+ * conflated balance side-channel — a comma-separated list of Aeron URIs, one
+ * per AE node's control endpoint (only the leader publishes, so the extra
+ * subscriptions are free; a single multicast URI also works — see
+ * AssetsClusterClient's balanceFeedChannels doc). When set, the OMS consumes
+ * live balances from it and narrows its cluster session to acks+settlements
+ * instead of receiving every user's BalanceUpdate. Each AE node reads the
+ * same env name for its own publisher URI, so a stack profile drives both
+ * sides with one field. BALANCE_FEED_STREAM_ID overrides the feed stream id
+ * (default 4201).
  */
 public record OmsConfig(
     int httpPort,
