@@ -60,15 +60,36 @@ jobs:
       - uses: actions/checkout@v7
 
       # The E2E runs REAL producer binaries (match-cluster, assets-cluster, bridge),
-      # so it still checks the producers out — but at the shas in producers.lock,
-      # which the bump automation moves together with the pom pins. A floating main
-      # here meant the tested jar and the pinned wire could silently diverge.
+      # so it still checks the producers out — but at the shas in producers/, which
+      # the bump automation moves together with the pom pins. A floating main here
+      # meant the tested jar and the pinned wire could silently diverge.
+      #
+      # One lock file per producer: on a single file the two producers' bump PRs
+      # edited adjacent lines, and git needs an unchanged line between hunks, so
+      # merging either bump turned the other DIRTY (2026-08-12, a 16-deep queue).
+      # Separate files make the two bumps independently mergeable.
       - name: Read producer pins
         id: lock
         run: |
           set -euo pipefail
-          echo "match=$(grep '^match=' producers.lock | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-          echo "assets=$(grep '^assets=' producers.lock | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          read_lock() { grep -vE '^\s*(#|$)' "producers/$1.lock" | tr -d '[:space:]'; }
+          pom_sha() { sed -nE "s|.*<$1\.version>[^<]*\.g([0-9a-f]+)</$1\.version>.*|\1|p" pom.xml; }
+
+          for P in match assets; do
+            LOCK=$(read_lock "$P")
+            PIN=$(pom_sha "$P")
+            [ -n "$LOCK" ] || { echo "producers/$P.lock is empty"; exit 1; }
+            [ -n "$PIN" ]  || { echo "pom.xml has no .g<sha> suffix on <$P.version>"; exit 1; }
+            # The pin names a commit and so does the lock. If they disagree the
+            # E2E would build one commit and resolve the wire artifact of
+            # another: green, and testing a combination nobody ships. That is
+            # exactly what a half-applied bump looks like, so fail loudly.
+            case "$LOCK" in
+              "$PIN"*) ;;
+              *) echo "producer pin skew for $P: pom.xml says g$PIN, producers/$P.lock says $LOCK"; exit 1 ;;
+            esac
+            echo "$P=$LOCK" >> "$GITHUB_OUTPUT"
+          done
 
       - name: Check out match (cluster + match-common)
         uses: actions/checkout@v7
