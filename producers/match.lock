@@ -6,4 +6,4 @@
 # single producers.lock, the two producers' bump PRs could not be merged
 # independently. Git needs an unchanged line between two hunks to merge them, so
 # landing one bump turned the other DIRTY every single time (2026-08-12).
-d82505f526c793caa09bae5d138f887952733f61
+335ab240c25f077dcb135d743d39432e6f1ecf8d
