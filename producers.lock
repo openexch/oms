@@ -2,4 +2,4 @@
 # automation together with the pom.xml version pins; the g<sha> suffix in each
 # pinned version names the same commit recorded here.
 match=b04e41616f90b4a5019fce3f07060d975b2171c0
-assets=8b92eb01383e15c126c929d4546a3e2474b437cd
+assets=4432d07fde002311c2a43e9e53bf4dd0f59aacc2
