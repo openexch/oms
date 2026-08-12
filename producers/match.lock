@@ -1,0 +1,9 @@
+# The match commit the E2E checks out and builds. Moved by match CI's bump
+# automation together with <match.version> in pom.xml, whose .g<sha> suffix
+# names this same commit — the e2e asserts the two agree.
+#
+# One file per producer ON PURPOSE: while both pins lived on adjacent lines of a
+# single producers.lock, the two producers' bump PRs could not be merged
+# independently. Git needs an unchanged line between two hunks to merge them, so
+# landing one bump turned the other DIRTY every single time (2026-08-12).
+d82505f526c793caa09bae5d138f887952733f61

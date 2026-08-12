@@ -1,0 +1,6 @@
+# The assets commit the E2E checks out and builds. Moved by assets CI's bump
+# automation together with <assets.version> in pom.xml, whose .g<sha> suffix
+# names this same commit — the e2e asserts the two agree.
+#
+# One file per producer ON PURPOSE: see producers/match.lock.
+4432d07fde002311c2a43e9e53bf4dd0f59aacc2
