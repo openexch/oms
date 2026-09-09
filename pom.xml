@@ -73,7 +73,7 @@
 
         <!-- gRPC -->
         <grpc.version>1.83.1</grpc.version>
-        <protobuf.version>4.35.1</protobuf.version>
+        <protobuf.version>4.36.0</protobuf.version>
 
         <!-- Logging -->
         <slf4j.version>2.0.18</slf4j.version>
