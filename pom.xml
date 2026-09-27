@@ -6,7 +6,7 @@
 
     <groupId>com.openexchange.oms</groupId>
     <artifactId>order-management</artifactId>
-    <version>1.0-SNAPSHOT</version>
+    <version>1.0-runtime.20260927.r00.g56e719e</version>
     <packaging>pom</packaging>
 
     <name>Order Management System</name>
@@ -48,7 +48,7 @@
              (added in 0.1.6), which a 0.1.5 runtime classpath cannot load. OMS's only
              use, ClusterPorts.port(nodeId, portBase, CLIENT_FACING_OFFSET), is unchanged
              across 0.1.5 -> 0.1.6. -->
-        <cluster-kit.version>0.1.7</cluster-kit.version>
+        <cluster-kit.version>0.1.8-runtime.20260927.r00.f692a83</cluster-kit.version>
 
         <!-- Aeron (must match match-engine version) -->
         <aeron.version>1.52.2</aeron.version>
