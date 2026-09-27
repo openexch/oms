@@ -6,7 +6,7 @@
 
     <groupId>com.openexchange.oms</groupId>
     <artifactId>order-management</artifactId>
-    <version>1.0-runtime.20260927.r00.g56e719e</version>
+    <version>1.0-runtime.20260927.r00b.g56e719e</version>
     <packaging>pom</packaging>
 
     <name>Order Management System</name>
@@ -33,12 +33,12 @@
         <!-- Match engine wire dependency: an IMMUTABLE 1.0.<utcstamp>.g<sha> from GitHub
              Packages, deployed by match CI on every main push; g<sha> names the exact match
              commit. Bumped by match CI's consumer-bump PR together with producers/match.lock. -->
-        <match.version>1.0.20260919011008.g7ea66bf</match.version>
+        <match.version>1.0-runtime.20260927.r00.g7ea66bf</match.version>
 
         <!-- Assets Engine wire dependency (money-schema SBE codecs, FixedPoint; assets-cluster
              is test-scoped for the embedded-AE integration test). Same discipline as
              match.version: immutable, from Packages, bumped by assets CI. -->
-        <assets.version>0.1.0.20260910113224.g4dfc301</assets.version>
+        <assets.version>0.1.0-runtime.20260927.r00b.g4dfc301</assets.version>
 
         <!-- Shared cluster machinery. Only the port arithmetic is used here: the
              engines, the settlement bridge and this client all have to derive the
