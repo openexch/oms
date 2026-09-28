@@ -115,3 +115,24 @@ Production writer cutover still requires durable OMS outcome/risk recovery,
 history freshness exposure, recording rotation/retention integration, and the
 full continuous-load/failover acceptance. A successful history backfill does
 not repair live order state or authorize a financial release.
+
+## Durable command outcomes (candidate protocol)
+
+The reader also accepts order schema 1/v11 template 28. Its schema is pinned in
+`dependencies.lock` and generated with the same SBE tool as settlement messages.
+A command outcome is stored separately in `me_command_outcomes`, atomically with
+the raw event and replay cursor. A repeated delivery must match the original
+payload exactly after excluding its delivery sequence. Conflict/capacity replies
+remain raw observations and cannot replace a canonical result. None of these
+messages creates executions, financial terminals, or settlement commands.
+
+OMS includes the V008 durable command outbox and a template-9 submission encoder.
+PREPARED commands cannot be read by the sender; READY commands retain their exact
+identity and payload across retries. A matching canonical Archive result resolves
+the pending send. This repository/transport support is not wired into production
+order admission yet: hold/workflow recovery, journal-driven lifecycle and risk
+application, and the writer-cutover freshness barrier remain prerequisites.
+
+The binary fixtures in `tests/fixtures` were emitted by the real Java ME publisher
+for an initial command and its lost-ack retry. The store test verifies decoding,
+atomic failure, dedupe, payload conflict, and absence of financial side effects.

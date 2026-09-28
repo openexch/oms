@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
                 int work = subscription->controlledPoll([&](aeron::AtomicBuffer& buffer,
                         aeron::util::index_t offset, aeron::util::index_t length, aeron::Header& header) {
                     try {
-                        if (header.flags() != 0xC0 || length < 8 || length > 101)
+                        if (header.flags() != 0xC0 || length < 8 || length > static_cast<aeron::util::index_t>(oe::MAX_JOURNAL_FRAME_LENGTH))
                             throw std::runtime_error("Unexpected journal fragmentation/size");
                         std::lock_guard lock(queue.mutex);
                         if (queue.events.size() >= 1024) return aeron::ControlledPollAction::ABORT;

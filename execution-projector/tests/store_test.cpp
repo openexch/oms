@@ -62,6 +62,7 @@ int main() {
             rejects([&] { oe::decode(bad.bytes); }, "Invalid wire header/enum accepted");
         }
         auto cmd=command("first",352), retry=command("retry",512);
+        check(cmd.bytes.size()==oe::MAX_JOURNAL_FRAME_LENGTH,"Transport bound differs from Java command schema");
         auto outcome=oe::decode(cmd.bytes);
         check(outcome.type==28 && outcome.commandHigh==17 && outcome.commandLow==1 && outcome.takerOms==9001 &&
             outcome.appliedPosition==128 && outcome.seq==128 && outcome.result==0,"Java command outcome mismatch");
