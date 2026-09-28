@@ -1,0 +1,13 @@
+{
+  "aeron_version": "1.53.1",
+  "aeron_source_url": "https://codeload.github.com/aeron-io/aeron/tar.gz/refs/tags/1.53.1",
+  "aeron_source_sha256": "f3acdcc07d90f1ca48c737f51fb6a32ff16f9c8bdbd1b13b786b8b82d0da3d66",
+  "sbe_version": "1.40.1",
+  "sbe_sha256": "a444bbe4098235ddebe3fa9a3b1fd387d8c6f15c1b53e6d78af30614b4685d6a",
+  "agrona_version": "2.5.0",
+  "agrona_sha256": "f6cb921f21e4fbcfa7a1e0654ac622ca168b8bf10ca89989cb6c0925bc8024c4",
+  "postgresql_client_api": "16",
+  "cpp_standard": 20,
+  "journal_schema_sha256": "7b2361ac727db3bd53f6db2a3343dbfee8adb44ba57a84e2198d1e47bd3bc848",
+  "cmake_minimum_version": "3.30"
+}
