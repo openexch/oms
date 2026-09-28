@@ -9,5 +9,6 @@
   "postgresql_client_api": "16",
   "cpp_standard": 20,
   "journal_schema_sha256": "7b2361ac727db3bd53f6db2a3343dbfee8adb44ba57a84e2198d1e47bd3bc848",
-  "cmake_minimum_version": "3.30"
+  "cmake_minimum_version": "3.30",
+  "order_schema_sha256": "a28e43ed2cabac23b8a6954fba045e7b11ac0b3f866835c9d0c3cac5c49c6a50"
 }

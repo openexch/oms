@@ -19,6 +19,11 @@ file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/schema/settlement-journal-schema.xml" s
 if(NOT schema_hash STREQUAL expected_schema_hash)
     message(FATAL_ERROR "Journal schema differs from dependencies.lock")
 endif()
+string(JSON expected_order_schema_hash GET "${dependency_lock}" order_schema_sha256)
+file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/schema/order-schema.xml" order_schema_hash)
+if(NOT order_schema_hash STREQUAL expected_order_schema_hash)
+    message(FATAL_ERROR "Order schema differs from dependencies.lock")
+endif()
 file(STRINGS "${OE_AERON_SOURCE_DIR}/version.txt" aeron_version LIMIT_COUNT 1)
 if(NOT aeron_version STREQUAL "1.53.1")
     message(FATAL_ERROR "Unsupported Aeron version: ${aeron_version}")
@@ -71,9 +76,19 @@ add_custom_command(OUTPUT "${generated}/journal-codecs.stamp"
     COMMAND ${CMAKE_COMMAND} -E touch "${generated}/journal-codecs.stamp"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema/settlement-journal-schema.xml" VERBATIM)
 add_custom_target(oe_journal_codecs DEPENDS "${generated}/journal-codecs.stamp")
+add_custom_command(OUTPUT "${generated}/command-codecs.stamp"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${generated}/command"
+    COMMAND ${Java_JAVA_EXECUTABLE} --add-opens java.base/jdk.internal.misc=ALL-UNNAMED
+        -Dsbe.target.language=Cpp -Dsbe.target.namespace=oe.command
+        "-Dsbe.output.dir=${generated}/command" -Dsbe.validation.stop.on.error=true
+        -cp "${OE_SBE_CLASSPATH}" uk.co.real_logic.sbe.SbeTool
+        "${CMAKE_CURRENT_SOURCE_DIR}/schema/order-schema.xml"
+    COMMAND ${CMAKE_COMMAND} -E touch "${generated}/command-codecs.stamp"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema/order-schema.xml" VERBATIM)
+add_custom_target(oe_command_codecs DEPENDS "${generated}/command-codecs.stamp")
 add_library(oe_projection STATIC src/journal.cpp src/store.cpp)
-add_dependencies(oe_projection oe_journal_codecs)
-target_include_directories(oe_projection PUBLIC src PRIVATE "${generated}/journal")
+add_dependencies(oe_projection oe_journal_codecs oe_command_codecs)
+target_include_directories(oe_projection PUBLIC src PRIVATE "${generated}/journal" "${generated}/command")
 target_link_libraries(oe_projection PUBLIC PostgreSQL::PostgreSQL)
 target_compile_options(oe_projection PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(execution-projector src/main.cpp src/monitor.cpp)
@@ -84,7 +99,7 @@ enable_testing()
 
 add_executable(projector-store-test tests/store_test.cpp)
 target_link_libraries(projector-store-test PRIVATE oe_projection)
-target_compile_definitions(projector-store-test PRIVATE OE_WRITER_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/../oms-persistence/src/main/resources/db/migration/V007__execution_writer_ownership.sql" OE_PROJECTOR_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/schema/projector.sql")
+target_compile_definitions(projector-store-test PRIVATE OE_COMMAND_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" OE_WRITER_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/../oms-persistence/src/main/resources/db/migration/V007__execution_writer_ownership.sql" OE_PROJECTOR_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/schema/projector.sql")
 add_test(NAME projector-store COMMAND projector-store-test)
 set_tests_properties(projector-store PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 

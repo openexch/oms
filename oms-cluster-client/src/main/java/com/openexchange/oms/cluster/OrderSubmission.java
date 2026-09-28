@@ -19,6 +19,18 @@ public final class OrderSubmission {
     }
 
     private final Type type;
+    private final com.match.domain.commands.DurableOrderIntent durableIntent;
+    public static OrderSubmission durable(com.match.domain.commands.DurableOrderIntent intent) {
+        return new OrderSubmission(intent);
+    }
+    public com.match.domain.commands.DurableOrderIntent getDurableIntent() { return durableIntent; }
+    private OrderSubmission(com.match.domain.commands.DurableOrderIntent c) {
+        java.util.Objects.requireNonNull(c);
+        durableIntent=c; type=Type.values()[c.kind()]; userId=c.userId(); marketId=c.marketId();
+        price=c.price(); quantity=c.quantity(); totalPrice=c.budget();
+        orderType=OrderType.get((short)c.type()); orderSide=OrderSide.get((short)c.side());
+        omsOrderId=c.omsOrderId(); orderId=c.oldOrderId();
+    }
 
     // Create order fields
     private final long userId;
@@ -44,6 +56,7 @@ public final class OrderSubmission {
             OrderSide orderSide,
             long omsOrderId,
             long orderId) {
+        this.durableIntent = null;
         this.type = type;
         this.userId = userId;
         this.marketId = marketId;

@@ -541,7 +541,18 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
      *
      * @return the number of orders processed (success + dropped, but not held)
      */
+    @FunctionalInterface
+    interface OrderOffer { long offer(org.agrona.DirectBuffer buffer, int offset, int length); }
+
     private int drainOrderQueue(AeronCluster currentCluster) {
+        return drainOrderQueue(currentCluster::offer, () -> {
+            closeAbandonedCluster(currentCluster, "durable offer recovery");
+            cluster = null;
+            notifyDisconnected();
+        });
+    }
+
+    int drainOrderQueue(OrderOffer offer, Runnable recoverConnection) {
         int count = 0;
         while (true) {
             final OrderSubmission submission;
@@ -564,7 +575,7 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                 }
             }
 
-            long result = currentCluster.offer(encodeBuffer, 0, length);
+            long result = offer.offer(encodeBuffer, 0, length);
             if (result >= 0) {
                 pendingSubmission = null;
                 ordersSent++;
@@ -590,6 +601,12 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
                 return count;
             }
 
+            if (submission.getDurableIntent()!=null) {
+                pendingSubmission=submission; pendingLength=length;
+                log.warn("Durable offer failed with {}; command retained across reconnect", offerResultName(result));
+                recoverConnection.run();
+                return count;
+            }
             // MAX_POSITION_EXCEEDED or any other hard failure — give up on this submission so it
             // doesn't head-of-line block subsequent orders behind it.
             log.warn("Order offer failed for {}: {} (dropped)",
@@ -607,6 +624,8 @@ public class ClusterClient implements io.aeron.cluster.client.EgressListener, Au
      * @return the total encoded message length (header + body)
      */
     private int encodeSubmission(OrderSubmission submission) {
+        if (submission.getDurableIntent()!=null)
+            return com.openexchange.oms.common.DurableCommandWire.encode(submission.getDurableIntent(),encodeBuffer);
         switch (submission.getType()) {
             case CREATE:
                 createOrderEncoder.wrapAndApplyHeader(encodeBuffer, 0, headerEncoder);

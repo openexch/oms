@@ -99,6 +99,22 @@ void Store::apply(std::span<const Event> batch) {
                     query("INSERT INTO execution_journal_trades(trade_id,payload) VALUES($1,decode($2,'hex'))", {n(j.trade), payload});
                     leg(j, false); leg(j, true); nextTrade = j.trade;
                 }
+            } else if (j.type == 28) {
+                // CONFLICT/CAPACITY are observations, not a new canonical outcome for the id.
+                // Preserve their complete raw event without overwriting the original result.
+                if (j.result != 2 && j.result != 3) {
+                    auto canonical = hex(std::span(event.bytes).subspan(16)); // omit header + delivery seq
+                    auto saved = query("INSERT INTO me_command_outcomes(command_id_high,command_id_low,user_id,oms_order_id,"
+                        "market_id,command_kind,old_order_id,order_id,old_cancelled,status,reason,result,applied_position,"
+                        "event_time_ms,source_identity,first_position,canonical_payload) "
+                        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,decode($17,'hex')) "
+                        "ON CONFLICT(command_id_high,command_id_low) DO UPDATE SET command_id_high=EXCLUDED.command_id_high "
+                        "WHERE me_command_outcomes.canonical_payload=EXCLUDED.canonical_payload RETURNING command_id_high",
+                        {n(j.commandHigh),n(j.commandLow),n(j.takerUser),n(j.takerOms),n(j.market),n(j.kind),n(j.oldOrder),
+                         n(j.taker),j.oldCancelled?"true":"false",n(j.status),n(j.reason),n(j.result),n(j.appliedPosition),
+                         n(j.timestamp),source_,n(event.position),canonical});
+                    if (PQntuples(saved.get())!=1) throw std::runtime_error("Conflicting durable command outcome");
+                }
             } else {
                 // Preserve authoritative per-ME-leg terminals. An iceberg slice terminal
                 // cannot terminalize its OMS parent or authorize a financial release here.

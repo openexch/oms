@@ -17,6 +17,9 @@ struct Journal {
     std::int64_t price{}, quantity{}, timestamp{}, takerOms{}, makerOms{};
     std::int32_t market{};
     std::uint8_t sideOrStatus{};
+    std::int64_t commandHigh{}, commandLow{}, oldOrder{}, budget{}, appliedPosition{};
+    std::int32_t kind{}, orderType{}, orderSide{}, status{}, reason{}, result{};
+    bool oldCancelled{};
 };
 // Fixed-length schema 3/version 1. Fail closed on a new schema rather than
 // checkpointing an event that this binary cannot project.

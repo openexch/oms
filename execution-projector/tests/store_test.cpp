@@ -33,6 +33,11 @@ oe::Event terminal() {
     put(b, 36, 2, 1); put(b, 37, 1700000000123, 8); put(b, 45, 101, 8);
     return e;
 }
+oe::Event command(const char* name, std::int64_t position) {
+    std::ifstream in(std::string(OE_COMMAND_FIXTURE_DIR)+"/java-command."+name+".bin",std::ios::binary);
+    check(in.good(),"Missing Java command fixture");
+    return {position,std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in),{})};
+}
 struct Db {
     PGconn* c;
     explicit Db(const std::string& url) : c(PQconnectdb(url.c_str())) { check(PQstatus(c) == CONNECTION_OK, "Test DB unavailable"); }
@@ -56,6 +61,13 @@ int main() {
             auto bad = first; bad.bytes[offset] = 99;
             rejects([&] { oe::decode(bad.bytes); }, "Invalid wire header/enum accepted");
         }
+        auto cmd=command("first",352), retry=command("retry",512);
+        auto outcome=oe::decode(cmd.bytes);
+        check(outcome.type==28 && outcome.commandHigh==17 && outcome.commandLow==1 && outcome.takerOms==9001 &&
+            outcome.appliedPosition==128 && outcome.seq==128 && outcome.result==0,"Java command outcome mismatch");
+        check(oe::decode(retry.bytes).seq==256,"Java retry outcome mismatch");
+        for(std::size_t size=0;size<cmd.bytes.size();++size)
+            rejects([&] { oe::decode(std::span(cmd.bytes).first(size)); },"Truncated command outcome accepted");
         const char* env = std::getenv("OE_PROJECTOR_TEST_PG");
         if (!env || !*env) { std::cerr << "OE_PROJECTOR_TEST_PG required\n"; return 77; }
         const std::string url(env), schema = "projector_test_" + std::to_string(getpid());
@@ -110,11 +122,25 @@ int main() {
             auto end = terminal(); restarted.apply(std::span(&end, 1));
             check(db.scalar("SELECT count(*) FROM execution_journal_terminals") == 1, "Terminal lost");
             check(db.scalar("SELECT count(*) FROM executions") == 2, "Terminal changed execution count");
+            db.sql("CREATE FUNCTION fail_outcome() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                   "RAISE EXCEPTION 'injected outcome failure'; END $$; "
+                   "CREATE TRIGGER injected_outcome BEFORE INSERT ON me_command_outcomes FOR EACH ROW EXECUTE FUNCTION fail_outcome()");
+            rejects([&] { restarted.apply(std::span(&cmd,1)); },"Command outcome failure not surfaced");
+            check(db.scalar("SELECT position FROM execution_projector_checkpoint")==256,"Failed outcome advanced cursor");
+            check(db.scalar("SELECT count(*) FROM me_command_outcomes")==0,"Partial command outcome committed");
+            db.sql("DROP TRIGGER injected_outcome ON me_command_outcomes");
+            restarted.apply(std::span(&cmd,1)); restarted.apply(std::span(&retry,1));
+            check(db.scalar("SELECT count(*) FROM me_command_outcomes")==1,"Duplicate canonical command outcome");
+            check(db.scalar("SELECT count(*) FROM executions")==2,"Command outcome replayed settlement");
+            check(db.scalar("SELECT count(*) FROM execution_journal_terminals")==1,"Command outcome became financial terminal");
+            auto badOutcome=retry; badOutcome.position=672; put(badOutcome.bytes,56,123,8);
+            rejects([&] { restarted.apply(std::span(&badOutcome,1)); },"Different canonical command accepted");
+            check(db.scalar("SELECT position FROM execution_projector_checkpoint")==512,"Conflict advanced cursor");
             db.sql("SELECT transition_execution_writer('archive',3,'paused','test pause')");
             rejects([&] { restarted.probe(); }, "Idle worker ignored revoked ownership");
-            auto lateTerminal = terminal(); lateTerminal.position = 352;
+            auto lateTerminal = terminal(); lateTerminal.position = 704;
             rejects([&] { restarted.apply(std::span(&lateTerminal, 1)); }, "Terminal batch ignored revoked ownership");
-            check(db.scalar("SELECT position FROM execution_projector_checkpoint") == 256, "Revoked writer advanced checkpoint");
+            check(db.scalar("SELECT position FROM execution_projector_checkpoint") == 512, "Revoked writer advanced checkpoint");
             db.sql("SELECT transition_execution_writer('paused',4,'archive','test reactivate')");
             rejects([&] { restarted.probe(); }, "Stale epoch resumed after reactivation");
         }
