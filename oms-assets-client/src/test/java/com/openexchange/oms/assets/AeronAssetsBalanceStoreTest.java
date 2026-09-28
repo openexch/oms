@@ -13,14 +13,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Pins the money-critical store semantics against a scripted fake transport: the timeout
- * compensator (exactly one, ordered AFTER the hold, suppressed for amend deltas), fail-closed
- * behavior, read-your-hold projection consistency, the settle high-water dedupe, and the
- * disconnect/reconnect compensation path. These rules are what make a wedged or restarting AE
- * unable to orphan a lock or double-apply a side effect.
+ * Pins correlated hold acceptance and the unknown-outcome boundary across
+ * timeout, disconnect and OMS restart. No uncertain hold is auto-released.
  */
 class AeronAssetsBalanceStoreTest {
 
@@ -129,32 +127,25 @@ class AeronAssetsBalanceStoreTest {
     }
 
     @Test
-    void holdTimeoutSendsExactlyOneCompensatorOrderedAfterTheHold() {
-        // No auto-ack: the future times out (50ms).
-        assertFalse(store.hold(7L, 0, 400L, 42L));
-        assertEquals(2, transport.submissions.size());
-        assertEquals("HOLD", transport.submissions.get(0).type());
-        FakeTransport.Submitted comp = transport.submissions.get(1);
-        assertEquals("RELEASE", comp.type());
-        assertEquals(42L, comp.orderId());
-        assertEquals(7L, comp.userId());
-        assertEquals(-1L, comp.amount());
+    void holdTimeoutPreservesUnknownOutcomeWithoutRelease() {
+        var failure = assertThrows(IllegalStateException.class, () -> store.hold(7, 0, 400, 42));
+        assertTrue(failure.getMessage().contains("OUTCOME UNKNOWN"));
+        assertEquals(1, transport.submissions.size());
+        assertEquals("HOLD", transport.submissions.getFirst().type());
         assertEquals(1L, store.getHoldTimeouts());
-        assertEquals(1L, store.getCompensatorsSent());
+        assertEquals(0L, store.getCompensatorsSent());
     }
 
     @Test
-    void amendDeltaTimeoutSuppressesTheCompensator() {
-        // First: a successful create-hold so the orderId is known-acked.
+    void amendTimeoutAfterStoreRestartCannotReleaseTheExistingBaseHold() {
         transport.autoAckHolds = true;
-        assertTrue(store.hold(7L, 0, 400L, 42L));
-        // Then an amend delta (same orderId) that times out.
+        assertTrue(store.hold(7, 0, 400, 42));
+        // The AE still holds 400. A new OMS has no in-memory acked-order set.
+        store = new AeronAssetsBalanceStore(transport, 6, 50, 100);
         transport.autoAckHolds = false;
-        assertFalse(store.hold(7L, 0, 100L, 42L));
-        // Two HOLD submissions, ZERO releases: the -1 compensator would nuke the base hold.
+        assertThrows(IllegalStateException.class, () -> store.hold(7, 0, 100, 42));
         assertEquals(2, transport.submissions.stream().filter(s -> s.type().equals("HOLD")).count());
         assertEquals(0, transport.submissions.stream().filter(s -> s.type().equals("RELEASE")).count());
-        assertEquals(1L, store.getAmendOrphans());
     }
 
     @Test
@@ -248,28 +239,24 @@ class AeronAssetsBalanceStoreTest {
     }
 
     @Test
-    void disconnectFailsPendingHoldAndCompensatesOnReconnect() throws Exception {
+    void disconnectPreservesUnknownHoldWithoutReconnectCompensation() throws Exception {
         final CountDownLatch done = new CountDownLatch(1);
-        final AtomicBoolean result = new AtomicBoolean(true);
+        final java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
         Thread holder = new Thread(() -> {
-            result.set(store.hold(7L, 0, 400L, 42L));
-            done.countDown();
+            try { store.hold(7, 0, 400, 42); }
+            catch (Throwable e) { failure.set(e); }
+            finally { done.countDown(); }
         });
         holder.start();
         awaitSubmission("HOLD");
-        transport.listener.onDisconnected();       // session dies with the hold outcome unknown
+        transport.listener.onDisconnected();
         assertTrue(done.await(2, TimeUnit.SECONDS));
-        assertFalse(result.get());                  // fail-closed
-
-        transport.listener.onReconnected();         // compensator lands after reconnect
-        assertTrue(transport.submissions.stream().anyMatch(
-                s -> s.type().equals("RELEASE") && s.orderId() == 42L && s.amount() == -1L));
-        // And the projection is marked not-ready until the snapshot completes.
+        assertInstanceOf(IllegalStateException.class, failure.get());
+        assertTrue(failure.get().getMessage().contains("OUTCOME UNKNOWN"));
+        transport.listener.onReconnected();
+        assertFalse(transport.submissions.stream().anyMatch(s -> s.type().equals("RELEASE")));
         assertFalse(store.isProjectionReady());
-        transport.listener.onBalanceSnapshotEnd(transport.last().type().equals("BALSNAP")
-                ? transport.last().correlationId()
-                : transport.submissions.stream().filter(s -> s.type().equals("BALSNAP"))
-                        .reduce((a, b) -> b).orElseThrow().correlationId(), 0);
+        transport.listener.onBalanceSnapshotEnd(transport.last().correlationId(), 0);
         assertTrue(store.isProjectionReady());
     }
 

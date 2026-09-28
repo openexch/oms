@@ -7,7 +7,7 @@
     <parent>
         <groupId>com.openexchange.oms</groupId>
         <artifactId>order-management</artifactId>
-        <version>1.0-runtime.20260928.r02pc1</version>
+        <version>1.0-runtime.20260928.r02pc2</version>
     </parent>
 
     <artifactId>oms-risk</artifactId>

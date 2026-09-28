@@ -45,6 +45,7 @@ class StartupStateRebuilderTest {
                            long price, long qty) {
         OmsOrder o = new OmsOrder();
         o.setOmsOrderId(omsId);
+        o.setStateRevision(1);
         o.setUserId(userId);
         o.setMarketId(MARKET);
         o.setOrderType(type);
@@ -60,6 +61,7 @@ class StartupStateRebuilderTest {
     private OmsOrder persistedCopy(OmsOrder o) {
         OmsOrder c = new OmsOrder();
         c.setOmsOrderId(o.getOmsOrderId());
+        c.setStateRevision(o.getStateRevision());
         c.setClusterOrderId(o.getClusterOrderId());
         c.setClientOrderId(o.getClientOrderId());
         c.setUserId(o.getUserId());
@@ -181,4 +183,58 @@ class StartupStateRebuilderTest {
         // ---- synthetic trigger monitoring re-armed ----
         assertEquals(syntheticA.getActiveStopCount(), syntheticB.getActiveStopCount());
     }
+    @Test
+    void restartPreservesTrailingExtremeBeforeFirstMarketTick() {
+        var trailing = order(901, 1, OmsOrderType.TRAILING_STOP, OrderSide.SELL, 0, 10);
+        trailing.setStatus(OmsOrderStatus.PENDING_TRIGGER);
+        trailing.setTrailingArmPrice(1000);
+        trailing.setTrailingDelta(50);
+        var synthetic = new SyntheticOrderEngine();
+        var triggers = new java.util.concurrent.atomic.AtomicInteger();
+        synthetic.setTriggerCallback((o, t, p) -> triggers.incrementAndGet());
+        StartupStateRebuilder.rebuild(List.of(trailing), List.of(), new OrderLifecycleManager(),
+                synthetic, newRiskEngine());
+        assertEquals(1000, trailing.getTrailingArmPrice());
+        synthetic.onMarketDataUpdate(MARKET, 940, 941);
+        assertEquals(1, triggers.get(), "restart must not forget the pre-crash high");
+    }
+
+    @Test
+    void restartDoesNotRearmAlreadyTriggeredOrCancelledSynthetics() {
+        var stop = order(902, 1, OmsOrderType.STOP_LIMIT, OrderSide.SELL, 900, 10);
+        stop.setStatus(OmsOrderStatus.NEW); stop.setStopPrice(950); stop.setClusterOrderId(55);
+        var trailing = order(903, 2, OmsOrderType.TRAILING_STOP, OrderSide.SELL, 0, 10);
+        trailing.setStatus(OmsOrderStatus.PENDING_NEW);
+        var cancelled = order(904, 3, OmsOrderType.STOP_LOSS, OrderSide.SELL, 0, 10);
+        cancelled.setStatus(OmsOrderStatus.PENDING_TRIGGER); cancelled.setCancelRequested(true);
+        var synthetic = new SyntheticOrderEngine();
+        var result = StartupStateRebuilder.rebuild(List.of(stop, trailing, cancelled), List.of(),
+                new OrderLifecycleManager(), synthetic, newRiskEngine());
+        assertEquals(0, result.syntheticsRegistered());
+        assertEquals(0, synthetic.getActiveStopCount());
+        assertEquals(0, synthetic.getActiveTrailingCount());
+    }
+
+    @Test
+    void legacyRowsWithUnknownWorkflowFieldsRequireExplicitRecovery() {
+        var legacy = order(905, 1, OmsOrderType.ICEBERG, OrderSide.SELL, 900, 100);
+        legacy.setStatus(OmsOrderStatus.NEW);
+        legacy.setStateRevision(0);
+        var lifecycle = new OrderLifecycleManager();
+        assertThrows(IllegalStateException.class, () -> StartupStateRebuilder.rebuild(
+                List.of(legacy), List.of(), lifecycle, new SyntheticOrderEngine(), newRiskEngine()));
+        assertEquals(0, lifecycle.getActiveOrderCount());
+    }
+
+    @Test void unknownAmendHoldCannotBeRestoredAsConfirmed() {
+        var amend = order(906, 1, OmsOrderType.LIMIT, OrderSide.BUY, 900, 100);
+        amend.setStatus(OmsOrderStatus.NEW); amend.setClusterOrderId(44);
+        amend.setReplacePendingOldClusterOrderId(44); amend.setPendingHoldRequested(100);
+        amend.setPendingHoldDelta(0);
+        var lifecycle = new OrderLifecycleManager();
+        assertThrows(IllegalStateException.class, () -> StartupStateRebuilder.rebuild(List.of(amend),
+                List.of(), lifecycle, new SyntheticOrderEngine(), newRiskEngine()));
+        assertEquals(0, lifecycle.getActiveOrderCount());
+    }
+
 }

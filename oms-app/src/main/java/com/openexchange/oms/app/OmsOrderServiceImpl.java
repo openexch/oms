@@ -74,13 +74,14 @@ public class OmsOrderServiceImpl implements OrderService {
             orderRepository.saveOrder(order);
         } catch (RuntimeException e) {
             persistenceHealthy = false;
+            coreEngine.markDurableStateFailed();
             throw new IllegalStateException("Durable order storage unavailable; recovery required", e);
         }
     }
 
     public boolean isAdmissionReady() {
         return persistenceHealthy && persistenceAvailable.getAsBoolean() && orderRepository != null
-                && coreEngine.getUnresolvedOrderCount() == 0;
+                && coreEngine.isDurableStateHealthy() && coreEngine.getUnresolvedOrderCount() == 0;
     }
 
     public void setRepositories(com.openexchange.oms.persistence.PostgresOrderRepository orderRepository,
@@ -141,6 +142,7 @@ public class OmsOrderServiceImpl implements OrderService {
                 return response;
             } catch (com.openexchange.oms.persistence.PersistenceException e) {
                 persistenceHealthy = false;
+                coreEngine.markDurableStateFailed();
                 throw new IllegalStateException("Durable request storage unavailable; retry with the same requestId", e);
             }
         }
@@ -285,7 +287,14 @@ public class OmsOrderServiceImpl implements OrderService {
             // 4. Place ledger hold
             persistAdmission(order); // PENDING_HOLD: a crash after this point may have placed a hold.
             long holdStart = System.nanoTime();
-            boolean holdPlaced = ledgerService.holdForOrder(order);
+            boolean holdPlaced;
+            try {
+                holdPlaced = ledgerService.holdForOrder(order);
+            } catch (RuntimeException unknownOutcome) {
+                persistenceHealthy = false;
+                coreEngine.markDurableStateFailed();
+                throw new IllegalStateException("Hold outcome requires durable recovery", unknownOutcome);
+            }
             if (ledgerHoldTimer != null) {
                 ledgerHoldTimer.record(System.nanoTime() - holdStart, java.util.concurrent.TimeUnit.NANOSECONDS);
             }
@@ -400,36 +409,44 @@ public class OmsOrderServiceImpl implements OrderService {
     @Override
     public CancelOrderResponse cancelOrder(long omsOrderId) {
         OrderLifecycleManager lcm = coreEngine.getLifecycleManager();
-        OmsOrder order = lcm.onCancelRequested(omsOrderId);
+        OmsOrder order = lcm.getOrder(omsOrderId);
         if (order == null) {
             return CancelOrderResponse.rejected("Order not found or already terminal");
         }
 
-        // If order is PENDING_TRIGGER (synthetic), remove from synthetic engine.
-        // Hold + slot release happens in the state listener on the CANCELLED
-        // transition below — releasing here too double-credited the hold once
-        // the listener learned to release PENDING_TRIGGER terminals (oms#49).
-        if (order.getStatus() == OmsOrderStatus.PENDING_TRIGGER) {
-            coreEngine.getSyntheticEngine().removeOrder(order);
-            lcm.onClusterOrderStatus(omsOrderId, 0, 3, 0, 0); // status 3 = CANCELLED
+        synchronized (order) {
+            if (lcm.onCancelRequested(omsOrderId) == null) {
+                return CancelOrderResponse.rejected("Order not found or already terminal");
+            }
+            persistAdmission(order); // Durable cancel intent before any external side effect.
+
+            // If order is PENDING_TRIGGER (synthetic), remove from synthetic engine.
+            // Hold + slot release happens in the state listener on the CANCELLED
+            // transition below — releasing here too double-credited the hold once
+            // the listener learned to release PENDING_TRIGGER terminals (oms#49).
+            if (order.getStatus() == OmsOrderStatus.PENDING_TRIGGER) {
+                coreEngine.getSyntheticEngine().removeOrder(order);
+                lcm.onClusterOrderStatus(omsOrderId, 0, 3, 0, 0); // status 3 = CANCELLED
+                persistAdmission(order);
+                return CancelOrderResponse.accepted(omsOrderId);
+            }
+
+            // If order has been sent to cluster, send cancel
+            if (order.getClusterOrderId() != 0) {
+                OrderSubmission cancelSubmission = OrderSubmission.cancelOrder(
+                        order.getUserId(), order.getClusterOrderId(), order.getMarketId());
+                clusterClient.submitOrder(cancelSubmission);
+            } else if (order.getStatus() == OmsOrderStatus.PENDING_NEW
+                    || order.getStatus() == OmsOrderStatus.NEW
+                    || order.getStatus() == OmsOrderStatus.PARTIALLY_FILLED) {
+                // clusterOrderId not yet received from egress — order is in-flight
+                log.warn("Cancel requested but clusterOrderId not yet assigned for omsOrderId={}, status={}",
+                        omsOrderId, order.getStatus());
+                return CancelOrderResponse.rejected("Order is in-flight, please retry shortly");
+            }
+
             return CancelOrderResponse.accepted(omsOrderId);
         }
-
-        // If order has been sent to cluster, send cancel
-        if (order.getClusterOrderId() != 0) {
-            OrderSubmission cancelSubmission = OrderSubmission.cancelOrder(
-                    order.getUserId(), order.getClusterOrderId(), order.getMarketId());
-            clusterClient.submitOrder(cancelSubmission);
-        } else if (order.getStatus() == OmsOrderStatus.PENDING_NEW
-                || order.getStatus() == OmsOrderStatus.NEW
-                || order.getStatus() == OmsOrderStatus.PARTIALLY_FILLED) {
-            // clusterOrderId not yet received from egress — order is in-flight
-            log.warn("Cancel requested but clusterOrderId not yet assigned for omsOrderId={}, status={}",
-                    omsOrderId, order.getStatus());
-            return CancelOrderResponse.rejected("Order is in-flight, please retry shortly");
-        }
-
-        return CancelOrderResponse.accepted(omsOrderId);
     }
 
     @Override
@@ -440,80 +457,95 @@ public class OmsOrderServiceImpl implements OrderService {
         if (order == null) {
             return Map.of("accepted", false, "message", "Order not found");
         }
-        if (order.getStatus().isTerminal()) {
-            return Map.of("accepted", false, "message", "Order is already terminal");
-        }
-        if (order.getClusterOrderId() == 0) {
-            return Map.of("accepted", false, "message", "Order is in-flight, please retry shortly");
-        }
-        // Amend is defined for plain resting limit orders only. Synthetic parents
-        // (stop/trailing) live as PENDING_TRIGGER with clusterOrderId==0 and are caught
-        // above; icebergs span multiple cluster slices, so amending "the" leg is
-        // incoherent — reject explicitly (oms#67).
-        if (order.getOrderType() != OmsOrderType.LIMIT && order.getOrderType() != OmsOrderType.LIMIT_MAKER) {
-            return Map.of("accepted", false, "message",
-                    "Amend is only supported for LIMIT/LIMIT_MAKER orders");
-        }
-        if (order.isCancelRequested()) {
-            return Map.of("accepted", false, "message", "Cancel already in progress");
-        }
-
-        long price = newPrice > 0 ? newPrice : order.getPrice();
-        long quantity = newQuantity > 0 ? newQuantity : order.getQuantity();
-
-        // quantity is the amended TOTAL (prior fills included): the engine's
-        // cancel-and-replace rests the FULL submitted leg quantity, so the leg carries
-        // the remaining part only. An amend at or below what already filled is void.
-        long legQuantity = quantity - order.getFilledQty();
-        if (legQuantity <= 0) {
-            return Map.of("accepted", false, "message",
-                    "Amended quantity is not above the already-filled quantity");
-        }
-
-        // Risk-safe hold adjustment (oms#67): a GROWN notional is held now — this is the
-        // amend's funds check. A SHRUNK notional releases only at resolution (the amend
-        // may still fail, and the original order must stay fully held until it does).
-        long holdTarget = ledgerService.computeAmendHoldTarget(order, price, quantity);
-        if (holdTarget < 0) {
-            return Map.of("accepted", false, "message", "Amended notional overflows");
-        }
-        // OMS-3: the hold moved on the ACTUAL balance must net already-filled quantity (settled
-        // units are no longer held), so it is sized off the remaining qty, not the full qty. The
-        // holdTarget above stays the full notional — it becomes holdAmount at resolution so
-        // releaseForCancel's − price·filledQty nets correctly.
-        long holdDelta = ledgerService.amendLockedDelta(order, price, quantity);
-
-        // Claim the replace marker BEFORE moving funds: it is the one-amend-at-a-time
-        // gate, and no egress for this replace can exist until submitOrder below.
-        // pendingHoldDelta starts at 0 and is set only AFTER the incremental hold
-        // actually lands — an abort must never release funds that were never held.
-        if (!lcm.onReplaceSubmitted(omsOrderId, price, quantity, 0, holdTarget)) {
-            return Map.of("accepted", false, "message", "Amend already in progress");
-        }
-
-        if (holdDelta > 0) {
-            if (!ledgerService.holdAmendDelta(order, holdDelta)) {
-                lcm.abortReplace(order, "insufficient balance for the amend delta");
-                return Map.of("accepted", false, "message", "Insufficient balance for amend");
+        synchronized (order) {
+            if (order.getStatus().isTerminal()) {
+                return Map.of("accepted", false, "message", "Order is already terminal");
             }
-            order.setPendingHoldDelta(holdDelta);
+            if (order.getClusterOrderId() == 0) {
+                return Map.of("accepted", false, "message", "Order is in-flight, please retry shortly");
+            }
+            // Amend is defined for plain resting limit orders only. Synthetic parents
+            // (stop/trailing) live as PENDING_TRIGGER with clusterOrderId==0 and are caught
+            // above; icebergs span multiple cluster slices, so amending "the" leg is
+            // incoherent — reject explicitly (oms#67).
+            if (order.getOrderType() != OmsOrderType.LIMIT && order.getOrderType() != OmsOrderType.LIMIT_MAKER) {
+                return Map.of("accepted", false, "message",
+                        "Amend is only supported for LIMIT/LIMIT_MAKER orders");
+            }
+            if (order.isCancelRequested()) {
+                return Map.of("accepted", false, "message", "Cancel already in progress");
+            }
+
+            long price = newPrice > 0 ? newPrice : order.getPrice();
+            long quantity = newQuantity > 0 ? newQuantity : order.getQuantity();
+
+            // quantity is the amended TOTAL (prior fills included): the engine's
+            // cancel-and-replace rests the FULL submitted leg quantity, so the leg carries
+            // the remaining part only. An amend at or below what already filled is void.
+            long legQuantity = quantity - order.getFilledQty();
+            if (legQuantity <= 0) {
+                return Map.of("accepted", false, "message",
+                        "Amended quantity is not above the already-filled quantity");
+            }
+
+            // Risk-safe hold adjustment (oms#67): a GROWN notional is held now — this is the
+            // amend's funds check. A SHRUNK notional releases only at resolution (the amend
+            // may still fail, and the original order must stay fully held until it does).
+            long holdTarget = ledgerService.computeAmendHoldTarget(order, price, quantity);
+            if (holdTarget < 0) {
+                return Map.of("accepted", false, "message", "Amended notional overflows");
+            }
+            // OMS-3: the hold moved on the ACTUAL balance must net already-filled quantity (settled
+            // units are no longer held), so it is sized off the remaining qty, not the full qty. The
+            // holdTarget above stays the full notional — it becomes holdAmount at resolution so
+            // releaseForCancel's − price·filledQty nets correctly.
+            long holdDelta = ledgerService.amendLockedDelta(order, price, quantity);
+
+            // Claim the replace marker BEFORE moving funds: it is the one-amend-at-a-time
+            // gate, and no egress for this replace can exist until submitOrder below.
+            // pendingHoldDelta starts at 0 and is set only AFTER the incremental hold
+            // actually lands — an abort must never release funds that were never held.
+            if (!lcm.onReplaceSubmitted(omsOrderId, price, quantity, 0, holdTarget)) {
+                return Map.of("accepted", false, "message", "Amend already in progress");
+            }
+
+            order.setPendingHoldRequested(Math.max(0, holdDelta));
+            persistAdmission(order); // Persist replace identity BEFORE attempting an AE hold.
+            if (holdDelta > 0) {
+                boolean held;
+                try {
+                    held = ledgerService.holdAmendDelta(order, holdDelta);
+                } catch (RuntimeException unknownOutcome) {
+                    persistenceHealthy = false;
+                    coreEngine.markDurableStateFailed();
+                    throw new IllegalStateException("Amend hold outcome requires durable recovery", unknownOutcome);
+                }
+                if (!held) {
+                    lcm.abortReplace(order, "insufficient balance for the amend delta");
+                    persistAdmission(order);
+                    return Map.of("accepted", false, "message", "Insufficient balance for amend");
+                }
+                order.setPendingHoldDelta(holdDelta);
+            }
+            persistAdmission(order); // Confirmed delta/target must survive a send or process failure.
+
+            com.match.infrastructure.generated.OrderSide sbeOrderSide = mapOrderSide(order.getSide());
+            com.match.infrastructure.generated.OrderType sbeOrderType = mapOrderType(order.getOrderType());
+
+            OrderSubmission submission = OrderSubmission.updateOrder(
+                    order.getUserId(), order.getClusterOrderId(), order.getMarketId(),
+                    price, legQuantity, sbeOrderType, sbeOrderSide);
+
+            boolean enqueued = clusterClient.submitOrder(submission);
+            if (!enqueued) {
+                lcm.abortReplace(order, "submission queue full");
+                persistAdmission(order);
+                return Map.of("accepted", false, "message", "Order queue full");
+            }
+
+            // id as a string, like every DTO (oms#39)
+            return Map.of("accepted", true, "omsOrderId", String.valueOf(omsOrderId), "message", "Update submitted");
         }
-
-        com.match.infrastructure.generated.OrderSide sbeOrderSide = mapOrderSide(order.getSide());
-        com.match.infrastructure.generated.OrderType sbeOrderType = mapOrderType(order.getOrderType());
-
-        OrderSubmission submission = OrderSubmission.updateOrder(
-                order.getUserId(), order.getClusterOrderId(), order.getMarketId(),
-                price, legQuantity, sbeOrderType, sbeOrderSide);
-
-        boolean enqueued = clusterClient.submitOrder(submission);
-        if (!enqueued) {
-            lcm.abortReplace(order, "submission queue full");
-            return Map.of("accepted", false, "message", "Order queue full");
-        }
-
-        // id as a string, like every DTO (oms#39)
-        return Map.of("accepted", true, "omsOrderId", String.valueOf(omsOrderId), "message", "Update submitted");
     }
 
     @Override

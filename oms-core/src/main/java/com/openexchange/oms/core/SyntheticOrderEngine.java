@@ -38,6 +38,7 @@ public class SyntheticOrderEngine {
         void onSliceFilled(OmsOrder icebergOrder, long nextSliceQuantity);
     }
 
+    private java.util.function.Consumer<OmsOrder> checkpointCallback = order -> { };
     private TriggerCallback triggerCallback;
     private IcebergSliceCallback icebergCallback;
 
@@ -66,6 +67,10 @@ public class SyntheticOrderEngine {
     // evaluate/refill paths collect the affected orders under the lock, release it, then call out.
     private final Object lock = new Object();
 
+    public void setCheckpointCallback(java.util.function.Consumer<OmsOrder> callback) {
+        this.checkpointCallback = java.util.Objects.requireNonNull(callback);
+    }
+
     public void setTriggerCallback(TriggerCallback callback) {
         this.triggerCallback = callback;
     }
@@ -78,22 +83,18 @@ public class SyntheticOrderEngine {
      * Register a synthetic order for monitoring.
      */
     public void registerOrder(OmsOrder order) {
-        int marketId = order.getMarketId();
-        synchronized (lock) {
-            switch (order.getOrderType()) {
-                case STOP_LOSS:
-                case STOP_LIMIT:
-                    registerStopOrder(order, marketId);
-                    break;
-                case TRAILING_STOP:
-                    registerTrailingOrder(order);
-                    break;
-                case ICEBERG:
-                    icebergOrders.put(order.getOmsOrderId(), order);
-                    break;
-                default:
-                    break;
+        synchronized (order) {
+            int marketId = order.getMarketId();
+            long previousArm = order.getTrailingArmPrice();
+            synchronized (lock) {
+                switch (order.getOrderType()) {
+                    case STOP_LOSS, STOP_LIMIT -> registerStopOrder(order, marketId);
+                    case TRAILING_STOP -> registerTrailingOrder(order);
+                    case ICEBERG -> icebergOrders.put(order.getOmsOrderId(), order);
+                    default -> { }
+                }
             }
+            if (previousArm != order.getTrailingArmPrice()) checkpointCallback.accept(order);
         }
     }
 
@@ -112,11 +113,11 @@ public class SyntheticOrderEngine {
     }
 
     private void registerTrailingOrder(OmsOrder order) {
-        // Initialize arm price to current market price
-        if (order.getSide() == OrderSide.SELL) {
-            order.setTrailingArmPrice(bestBid[order.getMarketId()]);
-        } else {
-            order.setTrailingArmPrice(bestAsk[order.getMarketId()]);
+        // Preserve the durable extreme when restoring an armed order. A new
+        // trailing order starts at zero and observes its first valid quote.
+        if (order.getTrailingArmPrice() == 0) {
+            order.setTrailingArmPrice(order.getSide() == OrderSide.SELL
+                    ? bestBid[order.getMarketId()] : bestAsk[order.getMarketId()]);
         }
         trailingOrders.put(order.getOmsOrderId(), order);
     }
@@ -165,36 +166,21 @@ public class SyntheticOrderEngine {
      */
     public void onIcebergSliceFilled(long omsOrderId) {
         OmsOrder iceberg;
-        long nextSlice;
-        synchronized (lock) {
-            iceberg = icebergOrders.get(omsOrderId);
-            if (iceberg == null) return;
-
-            // OMS-11 / OMS-6: never resubmit a slice for an iceberg the user has cancelled (or that
-            // has otherwise terminalized). A slice-fill event can race a user cancel; refilling here
-            // would resurrect an order the user asked to cancel AND re-link a fresh cluster order id,
-            // which then makes the pending CANCELLED egress look stale and get swallowed. Dropping the
-            // tracking here (cancelRequested is volatile) closes both windows: no new slice, and the
-            // CANCELLED for the still-current slice terminalizes normally.
-            if (iceberg.isCancelRequested() || iceberg.getStatus().isTerminal()) {
-                icebergOrders.remove(omsOrderId);
+        synchronized (lock) { iceberg = icebergOrders.get(omsOrderId); }
+        if (iceberg == null) return;
+        synchronized (iceberg) {
+            if (iceberg.isCancelRequested() || iceberg.isTerminal()) {
+                synchronized (lock) { icebergOrders.remove(omsOrderId); }
                 return;
             }
-
             long hiddenRemaining = iceberg.getHiddenQuantity() - iceberg.getDisplayQuantity();
             if (hiddenRemaining <= 0) {
-                // All slices filled
-                icebergOrders.remove(omsOrderId);
+                synchronized (lock) { icebergOrders.remove(omsOrderId); }
                 return;
             }
-
             iceberg.setHiddenQuantity(hiddenRemaining);
-            nextSlice = Math.min(iceberg.getDisplayQuantity(), hiddenRemaining);
-        }
-
-        // Submit the next slice OUTSIDE the lock (it enqueues to the cluster).
-        if (icebergCallback != null) {
-            icebergCallback.onSliceFilled(iceberg, nextSlice);
+            long nextSlice = Math.min(iceberg.getDisplayQuantity(), hiddenRemaining);
+            if (icebergCallback != null) icebergCallback.onSliceFilled(iceberg, nextSlice);
         }
     }
 
@@ -252,55 +238,32 @@ public class SyntheticOrderEngine {
 
     private void evaluateTrailingStops(int marketId, long bid, long ask) {
         if (triggerCallback == null) return;
-
-        // Update arm prices + detach the triggered orders under the lock; fire the trigger
-        // callbacks AFTER releasing it (the callback submits a child order to the cluster).
-        List<OmsOrder> toTrigger = null;
+        List<OmsOrder> candidates = new ArrayList<>();
         synchronized (lock) {
-            List<Long> triggeredIds = null;
-            Long2ObjectHashMap<OmsOrder>.ValueIterator iter = trailingOrders.values().iterator();
-            while (iter.hasNext()) {
-                OmsOrder order = iter.next();
-                if (order.getMarketId() != marketId) continue;
-                if (order.getStatus() != OmsOrderStatus.PENDING_TRIGGER) continue;
-
-                long delta = order.getTrailingDelta();
-
-                if (order.getSide() == OrderSide.SELL) {
-                    // Track highest bid, trigger when bid falls by delta from high
-                    if (bid > order.getTrailingArmPrice()) {
-                        order.setTrailingArmPrice(bid);
-                    } else if (order.getTrailingArmPrice() - bid >= delta) {
-                        if (triggeredIds == null) triggeredIds = new ArrayList<>();
-                        triggeredIds.add(order.getOmsOrderId());
-                    }
-                } else {
-                    // Track lowest ask, trigger when ask rises by delta from low
-                    if (ask < order.getTrailingArmPrice() || order.getTrailingArmPrice() == 0) {
-                        order.setTrailingArmPrice(ask);
-                    } else if (ask - order.getTrailingArmPrice() >= delta) {
-                        if (triggeredIds == null) triggeredIds = new ArrayList<>();
-                        triggeredIds.add(order.getOmsOrderId());
-                    }
-                }
-            }
-
-            if (triggeredIds != null) {
-                for (long id : triggeredIds) {
-                    OmsOrder order = trailingOrders.remove(id);
-                    if (order != null) {
-                        if (toTrigger == null) toTrigger = new ArrayList<>();
-                        toTrigger.add(order);
-                    }
-                }
-            }
+            trailingOrders.values().forEach(candidates::add);
         }
-
-        if (toTrigger != null) {
-            for (OmsOrder order : toTrigger) {
-                log.info("Trailing stop triggered: omsOrderId={}, armPrice={}, delta={}",
-                    order.getOmsOrderId(), order.getTrailingArmPrice(), order.getTrailingDelta());
-                triggerCallback.onTrigger(order, OmsOrderType.MARKET, 0);
+        for (OmsOrder order : candidates) {
+            synchronized (order) {
+                if (order.getMarketId() != marketId || order.isCancelRequested()
+                        || order.getStatus() != OmsOrderStatus.PENDING_TRIGGER) continue;
+                long quote = order.getSide() == OrderSide.SELL ? bid : ask;
+                if (quote <= 0) continue; // No quote is not a price move.
+                long arm = order.getTrailingArmPrice();
+                boolean advance = arm == 0 || (order.getSide() == OrderSide.SELL ? quote > arm : quote < arm);
+                if (advance) {
+                    order.setTrailingArmPrice(quote);
+                    // Checkpoint outside the map lock, before any later trigger.
+                    checkpointCallback.accept(order);
+                    continue;
+                }
+                boolean triggered = order.getSide() == OrderSide.SELL
+                        ? arm - quote >= order.getTrailingDelta() : quote - arm >= order.getTrailingDelta();
+                if (triggered) {
+                    synchronized (lock) {
+                        if (trailingOrders.remove(order.getOmsOrderId()) == null) continue;
+                    }
+                    triggerCallback.onTrigger(order, OmsOrderType.MARKET, 0);
+                }
             }
         }
     }

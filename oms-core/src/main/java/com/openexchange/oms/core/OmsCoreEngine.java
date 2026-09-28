@@ -28,6 +28,7 @@ public class OmsCoreEngine {
     private SettlementHandler settlementHandler;
     // Pluggable persistence handler
     private PersistenceHandler persistenceHandler;
+    private volatile boolean durableStateHealthy = true;
     // Pluggable cluster submit handler
     private ClusterSubmitHandler clusterSubmitHandler;
     private Runnable postReconcileHook;
@@ -52,9 +53,24 @@ public class OmsCoreEngine {
 
         // Wire synthetic trigger callback to create child orders
         syntheticEngine.setTriggerCallback(this::onSyntheticTriggered);
+        syntheticEngine.setCheckpointCallback(this::persistOrderState);
         // Refill slices go through the same public submitIcebergSlice(...) used for
         // the FIRST slice at order creation (oms#82) — one path, not two.
         syntheticEngine.setIcebergCallback(this::submitIcebergSlice);
+    }
+
+    public boolean isDurableStateHealthy() { return durableStateHealthy; }
+    public void markDurableStateFailed() { durableStateHealthy = false; }
+
+    /** A persistence error is latched until an authoritative restart/recovery. */
+    public void persistOrderState(OmsOrder order) {
+        if (!durableStateHealthy) throw new IllegalStateException("Durable order recovery required");
+        try {
+            if (persistenceHandler != null) persistenceHandler.persistOrderUpdate(order);
+        } catch (RuntimeException e) {
+            durableStateHealthy = false;
+            throw e;
+        }
     }
 
     public void setSettlementHandler(SettlementHandler handler) { this.settlementHandler = handler; }
@@ -98,7 +114,7 @@ public class OmsCoreEngine {
 
         // Persist order update
         if (persistenceHandler != null) {
-            persistenceHandler.persistOrderUpdate(order);
+            persistOrderState(order);
         }
     }
 
@@ -164,8 +180,8 @@ public class OmsCoreEngine {
                 ? lifecycleManager.applyFill(makerOmsOrderId, makerOrderId, tradeQuantity) : null;
 
         if (persistenceHandler != null) {
-            if (takerOrder != null) persistenceHandler.persistOrderUpdate(takerOrder);
-            if (makerOrder != null) persistenceHandler.persistOrderUpdate(makerOrder);
+            if (takerOrder != null) persistOrderState(takerOrder);
+            if (makerOrder != null) persistOrderState(makerOrder);
         }
 
         // Iceberg slice tracking (oms#86): drain each side's per-slice counter by the trade
@@ -184,13 +200,16 @@ public class OmsCoreEngine {
         if (order == null || order.getOrderType() != OmsOrderType.ICEBERG) {
             return;
         }
-        long remaining = Math.max(0, order.getSliceRemainingQty() - tradeQuantity);
-        order.setSliceRemainingQty(remaining);
-        if (remaining == 0) {
-            // Slice exhausted: the synthetic engine submits the next slice via
-            // submitIcebergSlice (re-arming the counter), or self-cleans when the
-            // hidden remainder is gone (the parent just went FILLED via applyFill).
-            syntheticEngine.onIcebergSliceFilled(omsOrderId);
+        synchronized (order) {
+            long remaining = Math.max(0, order.getSliceRemainingQty() - tradeQuantity);
+            order.setSliceRemainingQty(remaining);
+            persistOrderState(order);
+            if (remaining == 0) {
+                // Slice exhausted: the synthetic engine submits the next slice via
+                // submitIcebergSlice (re-arming the counter), or self-cleans when the
+                // hidden remainder is gone (the parent just went FILLED via applyFill).
+                syntheticEngine.onIcebergSliceFilled(omsOrderId);
+            }
         }
     }
 
@@ -199,16 +218,24 @@ public class OmsCoreEngine {
      * Updates synthetic order engine for stop/trailing evaluation.
      */
     public void onMarketDataUpdate(int marketId, long bestBid, long bestAsk) {
+        if (!durableStateHealthy) throw new IllegalStateException("Durable order recovery required");
         syntheticEngine.onMarketDataUpdate(marketId, bestBid, bestAsk);
     }
 
     // ==================== Synthetic Order Handling ====================
 
     private void onSyntheticTriggered(OmsOrder parentOrder, OmsOrderType childType, long childPrice) {
-        // The triggered synthetic order re-enters the pipeline as a child order
-        // The child will go through risk → hold → cluster submission
-        if (clusterSubmitHandler != null) {
-            clusterSubmitHandler.submitTriggeredOrder(parentOrder, childType, childPrice);
+        synchronized (parentOrder) {
+            if (parentOrder.isCancelRequested() || parentOrder.getStatus() != OmsOrderStatus.PENDING_TRIGGER) return;
+            // Persist disarming before send. An uncertain send stays PENDING_NEW
+            // across restart; re-arming could produce a second ME child.
+            parentOrder.setStatus(OmsOrderStatus.PENDING_NEW);
+            parentOrder.setUpdatedAtMs(System.currentTimeMillis());
+            persistOrderState(parentOrder);
+            if (clusterSubmitHandler == null
+                    || !clusterSubmitHandler.submitTriggeredOrder(parentOrder, childType, childPrice)) {
+                unresolvedOrderIds.add(parentOrder.getOmsOrderId());
+            }
         }
     }
 
@@ -222,18 +249,15 @@ public class OmsCoreEngine {
      * handling identical regardless of which slice it is.
      */
     public boolean submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {
-        // oms#86: arm the per-slice fill tracker. Slice completion is detected on the
-        // TRADE stream (trackIcebergSlice), taker or maker side alike, by draining this
-        // counter — the parent's cumulative status can never say "slice done".
-        icebergOrder.setSliceRemainingQty(sliceQuantity);
-        if (clusterSubmitHandler != null) {
-            // OMS-8: propagate the enqueue result so the FIRST-slice caller (order creation)
-            // can roll back a queue-full submit like the normal create path, instead of leaving
-            // a PENDING_NEW iceberg with the full hold locked and nothing on the book. (The refill
-            // callback wiring discards this — a queue-full refill is a separate follow-up.)
-            return clusterSubmitHandler.submitIcebergSlice(icebergOrder, sliceQuantity);
+        synchronized (icebergOrder) {
+            if (icebergOrder.isCancelRequested() || icebergOrder.isTerminal()) return false;
+            icebergOrder.setSliceRemainingQty(sliceQuantity);
+            persistOrderState(icebergOrder);
+            boolean enqueued = clusterSubmitHandler != null
+                    && clusterSubmitHandler.submitIcebergSlice(icebergOrder, sliceQuantity);
+            if (!enqueued) unresolvedOrderIds.add(icebergOrder.getOmsOrderId());
+            return enqueued;
         }
-        return true;
     }
 
     // ==================== GTD Expiry ====================
@@ -282,21 +306,23 @@ public class OmsCoreEngine {
         for (long omsOrderId : expiredIds) {
             OmsOrder order = lifecycleManager.getOrder(omsOrderId);
             if (order == null) continue;
-            if (order.getStatus() == OmsOrderStatus.PENDING_TRIGGER) {
-                // Dormant synthetic parent: no ME leg has been submitted.
-                OmsOrder expired = lifecycleManager.onExpired(omsOrderId);
-                if (expired != null && persistenceHandler != null) persistenceHandler.persistOrderUpdate(expired);
-            } else {
-                // Expiry requests cancellation; only the authoritative outcome closes a
-                // submitted order. In particular do not unlock while the cancel is in flight.
-                lifecycleManager.onCancelRequested(omsOrderId);
-                if (order.getClusterOrderId() != 0 && clusterSubmitHandler != null) {
-                    clusterSubmitHandler.submitCancel(order.getClusterOrderId(), order.getUserId(), order.getMarketId());
+            synchronized (order) {
+                if (order.getStatus() == OmsOrderStatus.PENDING_TRIGGER) {
+                    // Dormant synthetic parent: no ME leg has been submitted.
+                    OmsOrder expired = lifecycleManager.onExpired(omsOrderId);
+                    if (expired != null && persistenceHandler != null) persistOrderState(expired);
                 } else {
-                    unresolvedOrderIds.add(omsOrderId);
-                    requestOpenOrdersSnapshot(nowMs, "GTD awaiting cluster order identity");
+                    // Expiry requests cancellation; only the authoritative outcome closes a
+                    // submitted order. In particular do not unlock while the cancel is in flight.
+                    lifecycleManager.onCancelRequested(omsOrderId);
+                    persistOrderState(order);
+                    if (order.getClusterOrderId() != 0 && clusterSubmitHandler != null) {
+                        clusterSubmitHandler.submitCancel(order.getClusterOrderId(), order.getUserId(), order.getMarketId());
+                    } else {
+                        unresolvedOrderIds.add(omsOrderId);
+                        requestOpenOrdersSnapshot(nowMs, "GTD awaiting cluster order identity");
+                    }
                 }
-                if (persistenceHandler != null) persistenceHandler.persistOrderUpdate(order);
             }
         }
     }
@@ -417,7 +443,7 @@ public class OmsCoreEngine {
             } else {
                 lifecycleManager.onSentToCluster(order.getOmsOrderId(), cid);
             }
-            if (persistenceHandler != null) persistenceHandler.persistOrderUpdate(order);
+            if (persistenceHandler != null) persistOrderState(order);
         }
         totalRelinkedOrders += toRelink.size();
         if (postReconcileHook != null) postReconcileHook.run();
@@ -463,6 +489,7 @@ public class OmsCoreEngine {
         if (clusterSubmitHandler != null && order.getClusterOrderId() != 0) {
             // Mark cancel-intent so the reconcile can re-cancel if this is lost at a switchover seam.
             order.setCancelRequested(true);
+            persistOrderState(order);
             clusterSubmitHandler.submitCancel(order.getClusterOrderId(), order.getUserId(),
                 order.getMarketId());
         }
@@ -507,7 +534,7 @@ public class OmsCoreEngine {
     }
 
     public interface ClusterSubmitHandler {
-        void submitTriggeredOrder(OmsOrder parentOrder, OmsOrderType childType, long childPrice);
+        boolean submitTriggeredOrder(OmsOrder parentOrder, OmsOrderType childType, long childPrice);
         /** @return false when the cluster ingress queue was full (the slice was NOT enqueued). */
         boolean submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity);
         void submitCancel(long clusterOrderId, long userId, int marketId);

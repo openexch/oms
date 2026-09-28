@@ -48,7 +48,9 @@ class Phase1IcebergGuardrailTest {
         engine = new OmsCoreEngine(lifecycle, synthetic);
         engine.setClusterSubmitHandler(new OmsCoreEngine.ClusterSubmitHandler() {
             @Override
-            public void submitTriggeredOrder(OmsOrder parentOrder, OmsOrderType childType, long childPrice) { }
+            public boolean submitTriggeredOrder(OmsOrder parentOrder, OmsOrderType childType, long childPrice) {
+                return true;
+            }
 
             @Override
             public boolean submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {

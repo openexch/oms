@@ -42,6 +42,12 @@ public final class StartupStateRebuilder {
             RiskEngine riskEngine) {
 
         for (OmsOrder order : openOrders) {
+            if (order.getStateRevision() <= 0) {
+                throw new IllegalStateException("Legacy order requires verified workflow migration: " + order.getOmsOrderId());
+            }
+            if (order.isReplacePending() && order.getPendingHoldRequested() != order.getPendingHoldDelta()) {
+                throw new IllegalStateException("Unresolved durable amend hold: " + order.getOmsOrderId());
+            }
             if (order.getStatus() == OmsOrderStatus.PENDING_RISK || order.getStatus() == OmsOrderStatus.PENDING_HOLD) {
                 throw new IllegalStateException("Unresolved durable admission intent: " + order.getOmsOrderId());
             }
@@ -55,13 +61,17 @@ public final class StartupStateRebuilder {
             riskEngine.onOrderOpened(order.getUserId());
             restored++;
 
-            switch (order.getOrderType()) {
-                case STOP_LOSS, STOP_LIMIT, TRAILING_STOP, ICEBERG -> {
-                    syntheticEngine.registerOrder(order);
-                    synthetics++;
-                }
-                default -> {
-                }
+            // A triggered stop is already a submitted ME order. Re-arming it
+            // would allow a second child after restart. Cancel intent also
+            // prohibits both trigger and iceberg refill.
+            boolean monitor = !order.isCancelRequested() && switch (order.getOrderType()) {
+                case STOP_LOSS, STOP_LIMIT, TRAILING_STOP -> order.getStatus() == OmsOrderStatus.PENDING_TRIGGER;
+                case ICEBERG -> !order.isTerminal();
+                default -> false;
+            };
+            if (monitor) {
+                syntheticEngine.registerOrder(order);
+                synthetics++;
             }
         }
 

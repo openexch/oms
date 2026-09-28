@@ -286,11 +286,7 @@ public class OmsApplication {
             @Override
             public void persistOrderUpdate(OmsOrder order) {
                 if (finalOrderRepo != null) {
-                    try {
-                        finalOrderRepo.saveOrder(order);
-                    } catch (Exception e) {
-                        log.error("Failed to persist order update: omsOrderId={}", order.getOmsOrderId(), e);
-                    }
+                    finalOrderRepo.saveOrder(order);
                 }
             }
 
@@ -348,7 +344,7 @@ public class OmsApplication {
         // Wire cluster submit handler for synthetic triggered orders
         coreEngine.setClusterSubmitHandler(new OmsCoreEngine.ClusterSubmitHandler() {
             @Override
-            public void submitTriggeredOrder(OmsOrder parentOrder, com.openexchange.oms.common.enums.OmsOrderType childType, long childPrice) {
+            public boolean submitTriggeredOrder(OmsOrder parentOrder, com.openexchange.oms.common.enums.OmsOrderType childType, long childPrice) {
                 com.match.infrastructure.generated.OrderType sbeType;
                 if (childType == com.openexchange.oms.common.enums.OmsOrderType.MARKET) {
                     sbeType = com.match.infrastructure.generated.OrderType.MARKET;
@@ -370,14 +366,14 @@ public class OmsApplication {
                     log.error("Triggered child order notional overflows fixed-point — not submitted: "
                             + "parentOmsOrderId={}, childPrice={}, qty={}",
                             parentOrder.getOmsOrderId(), childPrice, parentOrder.getQuantity());
-                    return;
+                    return false;
                 }
 
                 OrderSubmission submission = OrderSubmission.createOrder(
                         parentOrder.getUserId(), parentOrder.getMarketId(),
                         childPrice, parentOrder.getRemainingQty(), totalPrice,
                         sbeType, sbeSide, parentOrder.getOmsOrderId());
-                clusterClient.submitOrder(submission);
+                return clusterClient.submitOrder(submission);
             }
 
             @Override

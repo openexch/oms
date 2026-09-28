@@ -81,8 +81,10 @@ class Phase1AmendLedgerGuardrailTest {
         // submitOrder boolean is exercised on the real path.
         coreEngine.setClusterSubmitHandler(new OmsCoreEngine.ClusterSubmitHandler() {
             @Override
-            public void submitTriggeredOrder(OmsOrder parentOrder,
-                                             com.openexchange.oms.common.enums.OmsOrderType childType, long childPrice) { }
+            public boolean submitTriggeredOrder(OmsOrder parentOrder,
+                                             com.openexchange.oms.common.enums.OmsOrderType childType, long childPrice) {
+                return true;
+            }
 
             @Override
             public boolean submitIcebergSlice(OmsOrder icebergOrder, long sliceQuantity) {

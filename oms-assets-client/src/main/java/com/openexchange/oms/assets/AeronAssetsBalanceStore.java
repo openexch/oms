@@ -5,7 +5,6 @@ import com.openexchange.oms.ledger.BalanceStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
@@ -18,17 +17,11 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p><b>HOLD is the synchronous gate</b> (same call shape as the Redis EVALSHA it replaces): the
  * caller blocks on a correlated future until HoldAck/HoldReject, bounded by {@code holdTimeoutMs}.
- * <b>Fail-CLOSED</b>: any timeout, disconnect, or queue-full rejects the order — a stale or absent
- * AE can only false-reject, never over-approve.</p>
- *
- * <p><b>The timeout compensator.</b> Blind hold retries are banned (a duplicate Hold is an atomic
- * top-up on the AE — retrying an ambiguous hold could double-lock). Instead, when a CREATE hold
- * times out with its outcome unknown, a {@code Release(orderId, -1)} is enqueued BEHIND the hold on
- * the same ordered ingress session: if the hold never applied the release is a gone-hold no-op; if
- * it applied late the release returns the full residual. Either way no orphaned lock survives. For
- * an AMEND delta (the base hold already acked — tracked in {@code ackedHoldOrderIds}) the {@code -1}
- * compensator would nuke the base hold, so it is SUPPRESSED: the worst case is a transient over-lock
- * (never money creation), cured by the order's terminal full-residual release, and counted.</p>
+ * A confirmed reject or failure to enqueue returns false. After enqueue, timeout,
+ * interruption and session loss mean OUTCOME UNKNOWN and throw. The caller must
+ * retain its durable intent and close admission until authoritative recovery.
+ * No automatic retry or release is issued: an existing hold may belong to a
+ * live ME order, including an amend whose base hold predates this OMS process.</p>
  *
  * <p><b>settle() moves no money.</b> The AE settles from the ME journal feed (the OMS is out of the
  * money path after submit); this method is only the LOCAL dedupe that gates the OMS's own side
@@ -53,13 +46,6 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
     private final long ackTimeoutMs;
 
     private final ConcurrentHashMap<Long, CompletableFuture<Ack>> pending = new ConcurrentHashMap<>();
-    /** corrId -> {orderId, userId} for pending CREATE holds, so a disconnect can compensate on reconnect. */
-    private final ConcurrentHashMap<Long, long[]> pendingCreateHolds = new ConcurrentHashMap<>();
-    /** Order ids with a live acked hold (populated from HoldAck; consulted by the compensator). */
-    private final Set<Long> ackedHoldOrderIds = ConcurrentHashMap.newKeySet();
-    /** orderId -> userId of create-holds whose outcome was unknown at disconnect; compensated on reconnect. */
-    private final ConcurrentHashMap<Long, Long> compensateOnReconnect = new ConcurrentHashMap<>();
-
     private final AtomicLong correlationIds = new AtomicLong(ThreadLocalRandom.current().nextLong(1, 1L << 40));
 
     /** Settle-side-effect dedupe high-water; single-writer (the OMS cluster-poll thread). */
@@ -98,9 +84,7 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
 
     // Anomaly counters (single-writer or monotonic; scraped by metrics).
     private volatile long holdTimeouts;
-    private volatile long amendOrphans;
     private volatile long lateAcks;
-    private volatile long compensatorsSent;
 
     public AeronAssetsBalanceStore(final AssetsTransport transport, final int assetCount,
                                    final long holdTimeoutMs, final long ackTimeoutMs) {
@@ -182,61 +166,25 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
         if (amount <= 0 || !transport.isConnected()) {
             return false; // fail-closed; nothing was enqueued, no compensator needed
         }
-        final boolean isAmendDelta = ackedHoldOrderIds.contains(orderId);
         final long corr = correlationIds.incrementAndGet();
         final CompletableFuture<Ack> future = new CompletableFuture<>();
         pending.put(corr, future);
-        if (!isAmendDelta) {
-            pendingCreateHolds.put(corr, new long[] {orderId, userId});
-        }
         try {
             if (!transport.submitHold(corr, orderId, userId, assetId, amount, omsManagedRelease)) {
-                return false; // queue full: command never left this process — safe plain reject
+                return false; // Command never left this process.
             }
-            final Ack ack = future.get(holdTimeoutMs, TimeUnit.MILLISECONDS);
-            return ack.accepted();
+            return future.get(holdTimeoutMs, TimeUnit.MILLISECONDS).accepted();
         } catch (TimeoutException e) {
             holdTimeouts = holdTimeouts + 1;
-            if (isAmendDelta) {
-                // A -1 release would nuke the acked base hold. Worst case: a transient over-lock
-                // (never money creation), cured by the order's terminal full-residual release.
-                amendOrphans = amendOrphans + 1;
-                log.error("AMEND hold delta timed out (order={} corr={}): compensator suppressed; "
-                        + "possible transient over-lock until terminal", orderId, corr);
-            } else {
-                sendCompensator(orderId, userId);
-            }
-            return false;
+            throw new IllegalStateException("hold OUTCOME UNKNOWN for order " + orderId + ": acknowledgement timed out", e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            if (!isAmendDelta) {
-                sendCompensator(orderId, userId);
-            }
-            return false;
-        } catch (Exception e) {
-            log.error("hold failed (order={} user={}): {}", orderId, userId, e.toString());
-            return false;
+            throw new IllegalStateException("hold OUTCOME UNKNOWN for order " + orderId + ": interrupted", e);
+        } catch (java.util.concurrent.ExecutionException e) {
+            throw new IllegalStateException("hold OUTCOME UNKNOWN for order " + orderId + ": session lost", e.getCause());
         } finally {
             pending.remove(corr);
-            pendingCreateHolds.remove(corr);
         }
-    }
-
-    /**
-     * Enqueued BEHIND the (possibly still queued) hold on the same ordered session: the release
-     * can never overtake it. Retried briefly on a full queue; a failure to enqueue is CRITICAL
-     * (the orphan-hold reconciler is the backstop).
-     */
-    private void sendCompensator(final long orderId, final long userId) {
-        for (int i = 0; i < 3; i++) {
-            if (transport.submitRelease(orderId, userId, -1L)) {
-                compensatorsSent = compensatorsSent + 1;
-                return;
-            }
-            Thread.onSpinWait();
-        }
-        log.error("CRITICAL: compensating release for order {} could not be enqueued — "
-                + "an orphaned hold may persist until the reconciler sweeps it", orderId);
     }
 
     @Override
@@ -249,7 +197,6 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
 
     @Override
     public boolean releaseAll(final long userId, final int assetId, final long orderId) {
-        ackedHoldOrderIds.remove(orderId);
         return transport.submitRelease(orderId, userId, -1L);
     }
 
@@ -343,7 +290,6 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
     @Override
     public void onHoldAck(final long correlationId, final long orderId, final long userId,
                           final int assetId, final long amount) {
-        ackedHoldOrderIds.add(orderId);
         // Read-your-hold: the projection reflects the hold BEFORE the waiting caller is released.
         projection.applyHoldDelta(userId, assetId, amount);
         // Change-tap: the delta case forwards the projection's current absolutes AFTER applying.
@@ -410,8 +356,7 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
 
     @Override
     public void onHoldSnapshotEntry(final long orderId, final long userId, final int assetId, final long remaining) {
-        // The store keeps its acked-hold set warm; the reconciler (if attached) consumes the stream.
-        ackedHoldOrderIds.add(orderId);
+        // Read-only discrepancy/recovery consumer, if attached.
         final HoldSnapshotConsumer consumer = holdSnapshotConsumer;
         if (consumer != null) {
             consumer.onHoldSnapshotEntry(orderId, userId, assetId, remaining);
@@ -435,20 +380,14 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
     public void onReconnected() {
         projectionReady = false;
         requestProjectionBootstrap();
-        // Compensate create-holds whose outcome was unknown when the session died.
-        compensateOnReconnect.forEach((orderId, userId) -> {
-            if (transport.submitRelease(orderId, userId, -1L)) {
-                compensateOnReconnect.remove(orderId);
-                compensatorsSent = compensatorsSent + 1;
-            }
-        });
+
     }
 
     @Override
     public void onDisconnected() {
         projectionReady = false;
-        // Fail-closed: every pending caller rejects; unknown create-holds get compensated later.
-        pendingCreateHolds.forEach((corr, hold) -> compensateOnReconnect.put(hold[0], hold[1]));
+        // Every enqueued caller retains an unknown outcome. Reconnect cannot
+        // authorize a financial compensator without durable command history.
         pending.forEach((corr, future) -> future.completeExceptionally(
                 new IllegalStateException("assets engine session lost")));
     }
@@ -477,7 +416,7 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
     }
 
     public long getAmendOrphans() {
-        return amendOrphans;
+        return 0; // Legacy metric retained; process-local amend classification was removed.
     }
 
     public long getLateAcks() {
@@ -485,7 +424,7 @@ public final class AeronAssetsBalanceStore implements BalanceStore, AssetsEgress
     }
 
     public long getCompensatorsSent() {
-        return compensatorsSent;
+        return 0; // Automatic financial compensation is no longer performed.
     }
 
     public long getSettleHighWater() {

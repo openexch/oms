@@ -147,8 +147,11 @@ public class OrderLifecycleManager {
      */
     public void onRiskPassed(long omsOrderId) {
         OmsOrder order = activeOrders.get(omsOrderId);
-        if (order == null || order.getStatus() != OmsOrderStatus.PENDING_RISK) return;
-        transition(order, OmsOrderStatus.PENDING_HOLD);
+        if (order == null) return;
+        synchronized (order) {
+            if (order.getStatus() != OmsOrderStatus.PENDING_RISK) return;
+            transition(order, OmsOrderStatus.PENDING_HOLD);
+        }
     }
 
     /**
@@ -156,10 +159,13 @@ public class OrderLifecycleManager {
      */
     public void onRiskRejected(long omsOrderId, String reason) {
         OmsOrder order = activeOrders.get(omsOrderId);
-        if (order == null || order.getStatus() != OmsOrderStatus.PENDING_RISK) return;
-        order.setRejectReason(reason);
-        transition(order, OmsOrderStatus.REJECTED);
-        removeOrder(omsOrderId);
+        if (order == null) return;
+        synchronized (order) {
+            if (order.getStatus() != OmsOrderStatus.PENDING_RISK) return;
+            order.setRejectReason(reason);
+            transition(order, OmsOrderStatus.REJECTED);
+            removeOrder(omsOrderId);
+        }
     }
 
     /**
@@ -167,8 +173,11 @@ public class OrderLifecycleManager {
      */
     public void onHoldPlaced(long omsOrderId) {
         OmsOrder order = activeOrders.get(omsOrderId);
-        if (order == null || order.getStatus() != OmsOrderStatus.PENDING_HOLD) return;
-        transition(order, OmsOrderStatus.PENDING_NEW);
+        if (order == null) return;
+        synchronized (order) {
+            if (order.getStatus() != OmsOrderStatus.PENDING_HOLD) return;
+            transition(order, OmsOrderStatus.PENDING_NEW);
+        }
     }
 
     /**
@@ -176,10 +185,13 @@ public class OrderLifecycleManager {
      */
     public void onHoldFailed(long omsOrderId, String reason) {
         OmsOrder order = activeOrders.get(omsOrderId);
-        if (order == null || order.getStatus() != OmsOrderStatus.PENDING_HOLD) return;
-        order.setRejectReason(reason);
-        transition(order, OmsOrderStatus.REJECTED);
-        removeOrder(omsOrderId);
+        if (order == null) return;
+        synchronized (order) {
+            if (order.getStatus() != OmsOrderStatus.PENDING_HOLD) return;
+            order.setRejectReason(reason);
+            transition(order, OmsOrderStatus.REJECTED);
+            removeOrder(omsOrderId);
+        }
     }
 
     /**
@@ -201,14 +213,16 @@ public class OrderLifecycleManager {
      */
     public void onSubmitFailed(long omsOrderId, String reason) {
         OmsOrder order = activeOrders.get(omsOrderId);
-        if (order == null
-                || order.getStatus() != OmsOrderStatus.PENDING_NEW
-                || order.getClusterOrderId() != 0) {
-            return;
+        if (order == null) return;
+        synchronized (order) {
+            if (order.getStatus() != OmsOrderStatus.PENDING_NEW
+                    || order.getClusterOrderId() != 0) {
+                return;
+            }
+            order.setRejectReason(reason);
+            transition(order, OmsOrderStatus.REJECTED);
+            removeOrder(omsOrderId);
         }
-        order.setRejectReason(reason);
-        transition(order, OmsOrderStatus.REJECTED);
-        removeOrder(omsOrderId);
     }
 
     /**
@@ -216,8 +230,11 @@ public class OrderLifecycleManager {
      */
     public void onPendingTrigger(long omsOrderId) {
         OmsOrder order = activeOrders.get(omsOrderId);
-        if (order == null || order.getStatus() != OmsOrderStatus.PENDING_NEW) return;
-        transition(order, OmsOrderStatus.PENDING_TRIGGER);
+        if (order == null) return;
+        synchronized (order) {
+            if (order.getStatus() != OmsOrderStatus.PENDING_NEW) return;
+            transition(order, OmsOrderStatus.PENDING_TRIGGER);
+        }
     }
 
     /**
@@ -227,8 +244,10 @@ public class OrderLifecycleManager {
     public void onSentToCluster(long omsOrderId, long clusterOrderId) {
         OmsOrder order = activeOrders.get(omsOrderId);
         if (order == null) return;
-        order.setClusterOrderId(clusterOrderId);
-        byClusterOrderId.put(clusterOrderId, order);
+        synchronized (order) {
+            order.setClusterOrderId(clusterOrderId);
+            byClusterOrderId.put(clusterOrderId, order);
+        }
     }
 
     /**
@@ -276,14 +295,17 @@ public class OrderLifecycleManager {
      * hooks and clears the marker; the order keeps its original price/quantity/holds.
      */
     public void abortReplace(OmsOrder order, String why) {
-        if (!order.isReplacePending()) {
-            return;
+        if (order == null) return;
+        synchronized (order) {
+            if (!order.isReplacePending()) {
+                return;
+            }
+            log.info("Replace aborted for omsOrderId={}: {}", order.getOmsOrderId(), why);
+            if (replaceHooks != null) {
+                replaceHooks.onReplaceAborted(order);
+            }
+            clearReplacePending(order);
         }
-        log.info("Replace aborted for omsOrderId={}: {}", order.getOmsOrderId(), why);
-        if (replaceHooks != null) {
-            replaceHooks.onReplaceAborted(order);
-        }
-        clearReplacePending(order);
     }
 
     /**
@@ -316,10 +338,13 @@ public class OrderLifecycleManager {
      */
     public void resolveReplaceFromReconcile(long omsOrderId, long newClusterOrderId) {
         OmsOrder order = activeOrders.get(omsOrderId);
-        if (order == null || !order.isReplacePending()) {
-            return;
+        if (order == null) return;
+        synchronized (order) {
+            if (!order.isReplacePending()) {
+                return;
+            }
+            resolveReplace(order, newClusterOrderId);
         }
-        resolveReplace(order, newClusterOrderId);
     }
 
     private void clearReplacePending(OmsOrder order) {
@@ -327,6 +352,7 @@ public class OrderLifecycleManager {
         order.setPendingPrice(0);
         order.setPendingQuantity(0);
         order.setPendingHoldDelta(0);
+        order.setPendingHoldRequested(0);
         order.setPendingHoldTarget(0);
         order.setReplaceRequestedAtMs(0);
     }
@@ -364,148 +390,151 @@ public class OrderLifecycleManager {
             return null;
         }
 
-        // Cancel-and-replace window (oms#67). The engine emits, for one amend:
-        //   CANCELLED(oldCid) + first-status(newCid)          — amend proceeded
-        //   REJECTED(oldCid)                                  — amend refused, old leg intact
-        //   CANCELLED(oldCid) + REJECTED/CANCELLED(newCid)    — cancelled but the new leg couldn't rest
-        // The two events arrive in either order (egress is unsequenced, match#19), so route by
-        // WHICH LEG the event names rather than by arrival order.
-        if (order.isReplacePending() && clusterOrderId != 0) {
-            long oldLegCid = order.getReplacePendingOldClusterOrderId();
-            if (clusterOrderId == oldLegCid) {
-                if (status == 3) {
-                    // Old leg cancelled by the replace: bookkeeping only. No transition, no
-                    // removal, holds untouched — the same omsOrderId lives on in the new leg.
-                    byClusterOrderId.remove(oldLegCid, order);
-                    if (order.getClusterOrderId() == oldLegCid) {
-                        order.setClusterOrderId(0);
-                    }
-                    log.debug("Replace old leg cancelled for omsOrderId={} (clusterOrderId={})",
-                            order.getOmsOrderId(), oldLegCid);
-                    return order;
-                }
-                if (status == 4) {
-                    // Engine refused the amend (bad price, cancel-miss): old leg intact, order
-                    // stays live with its original values. Returns BEFORE the switch, so the
-                    // rejectReason (match#75) is deliberately NOT applied here: a live order must
-                    // never carry a reject reason.
-                    abortReplace(order, "engine rejected the amend");
-                    return order;
-                }
-                // NEW/PARTIALLY_FILLED/FILLED for the OLD leg while pending (e.g. a fill racing
-                // the cancel): abort the replace bookkeeping BEFORE normal processing so a
-                // terminal outcome cannot leak the incremental hold.
-                if (status == 2) {
-                    abortReplace(order, "old leg filled before the replace applied");
-                }
-            } else {
-                // Any status for a different cid while pending is the NEW leg: resolve first,
-                // then let normal processing handle the status itself (NEW rests; FILLED /
-                // CANCELLED / REJECTED are real new-leg outcomes, incl. could-not-rest).
-                resolveReplace(order, clusterOrderId);
-            }
-        }
-
-        // Iceberg slice adoption (oms#86): each refill slice is a fresh cluster order carrying
-        // the parent's omsOrderId. Normally the prior slice's FILLED (case 2 below) zeroes the
-        // cid so the adopt block re-links; when that FILLED was coalesced away on the lossy
-        // status stream, a non-terminal status for the NEXT slice arrives while the cid still
-        // names the OLD slice — re-index so user cancels and membership repair target the
-        // slice actually resting.
-        if (order.getOrderType() == OmsOrderType.ICEBERG
-                && clusterOrderId != 0 && order.getClusterOrderId() != 0
-                && clusterOrderId != order.getClusterOrderId()
-                && (status == 0 || status == 1)) {
-            byClusterOrderId.remove(order.getClusterOrderId(), order);
-            order.setClusterOrderId(clusterOrderId);
-            byClusterOrderId.put(clusterOrderId, order);
-            log.debug("Iceberg slice re-linked for omsOrderId={}: clusterOrderId -> {}",
-                    order.getOmsOrderId(), clusterOrderId);
-        }
-
-        // STALE-LEG GUARD (oms#67): a terminal status naming a cluster leg this order no longer
-        // occupies (a re-delivered old-leg echo after the replace resolved, or an iceberg's
-        // already-superseded slice) must not terminalize the live order. Non-terminal stale
-        // echoes fall through harmlessly (monotonic guards). An iceberg slice's own FILLED
-        // names the CURRENT cid, so it is not swallowed here.
-        if (clusterOrderId != 0 && order.getClusterOrderId() != 0
-                && clusterOrderId != order.getClusterOrderId()
-                && (status == 2 || status == 3 || status == 4)) {
-            log.debug("Ignoring stale-leg terminal status for omsOrderId={}: event cid={} current cid={} status={}",
-                    order.getOmsOrderId(), clusterOrderId, order.getClusterOrderId(), status);
-            return order;
-        }
-
-        // Store clusterOrderId on first status update from cluster
-        if (clusterOrderId != 0 && order.getClusterOrderId() == 0) {
-            order.setClusterOrderId(clusterOrderId);
-            byClusterOrderId.put(clusterOrderId, order);
-        }
-
-        // MONOTONIC GUARD: the OrderStatus egress stream is coalesced/lossy and unsequenced, so a
-        // stale/out-of-order update can carry a LOWER filledQty than reality. filledQty is driven
-        // authoritatively by applyFill() from the lossless TradeExecution stream; here we only ever
-        // RAISE it, never let the status stream regress the trade-derived value (the bug #9 fix).
-        long guardedFilled = Math.max(order.getFilledQty(), filledQty);
-        order.setFilledQty(guardedFilled);
-        order.setRemainingQty(Math.max(0, order.getQuantity() - guardedFilled));
-
-        switch (status) {
-            case 0: // NEW — do not regress an order already advanced by trade-driven fills
-                if (order.getStatus() != OmsOrderStatus.PARTIALLY_FILLED
-                        && order.getStatus() != OmsOrderStatus.FILLED) {
-                    transition(order, OmsOrderStatus.NEW);
-                }
-                break;
-            case 1: // PARTIALLY_FILLED
-                if (order.getStatus() != OmsOrderStatus.FILLED) {
-                    transition(order, OmsOrderStatus.PARTIALLY_FILLED);
-                }
-                break;
-            case 2: // FILLED — cluster confirms the order left the book fully filled; reconcile to qty
-                // Iceberg SLICE FILLED (oms#86): the cluster order that filled is one display
-                // slice, not the parent — the parent still has hidden quantity working. This
-                // status used to setFilledQty(total) and terminalize the whole iceberg after
-                // its FIRST slice (wrong filledQty, hold leaked, refills dead). Slice-level
-                // bookkeeping only: unindex the finished slice and clear the cid so the next
-                // slice's NEW is adopted. Refill timing is driven by the lossless trade stream
-                // (trackIcebergSlice); parent-terminal comes from applyFill when cumulative
-                // fills reach the total.
-                if (order.getOrderType() == OmsOrderType.ICEBERG
-                        && order.getFilledQty() < order.getQuantity()) {
-                    if (clusterOrderId != 0) {
-                        byClusterOrderId.remove(clusterOrderId, order);
-                        if (order.getClusterOrderId() == clusterOrderId) {
+        synchronized (order) {
+            if (order.isTerminal()) return null;
+            // Cancel-and-replace window (oms#67). The engine emits, for one amend:
+            //   CANCELLED(oldCid) + first-status(newCid)          — amend proceeded
+            //   REJECTED(oldCid)                                  — amend refused, old leg intact
+            //   CANCELLED(oldCid) + REJECTED/CANCELLED(newCid)    — cancelled but the new leg couldn't rest
+            // The two events arrive in either order (egress is unsequenced, match#19), so route by
+            // WHICH LEG the event names rather than by arrival order.
+            if (order.isReplacePending() && clusterOrderId != 0) {
+                long oldLegCid = order.getReplacePendingOldClusterOrderId();
+                if (clusterOrderId == oldLegCid) {
+                    if (status == 3) {
+                        // Old leg cancelled by the replace: bookkeeping only. No transition, no
+                        // removal, holds untouched — the same omsOrderId lives on in the new leg.
+                        byClusterOrderId.remove(oldLegCid, order);
+                        if (order.getClusterOrderId() == oldLegCid) {
                             order.setClusterOrderId(0);
                         }
+                        log.debug("Replace old leg cancelled for omsOrderId={} (clusterOrderId={})",
+                                order.getOmsOrderId(), oldLegCid);
+                        return order;
                     }
-                    log.debug("Iceberg slice FILLED for omsOrderId={} (slice cid={}, parent {}/{} filled)",
-                            order.getOmsOrderId(), clusterOrderId,
-                            order.getFilledQty(), order.getQuantity());
-                    return order;
+                    if (status == 4) {
+                        // Engine refused the amend (bad price, cancel-miss): old leg intact, order
+                        // stays live with its original values. Returns BEFORE the switch, so the
+                        // rejectReason (match#75) is deliberately NOT applied here: a live order must
+                        // never carry a reject reason.
+                        abortReplace(order, "engine rejected the amend");
+                        return order;
+                    }
+                    // NEW/PARTIALLY_FILLED/FILLED for the OLD leg while pending (e.g. a fill racing
+                    // the cancel): abort the replace bookkeeping BEFORE normal processing so a
+                    // terminal outcome cannot leak the incremental hold.
+                    if (status == 2) {
+                        abortReplace(order, "old leg filled before the replace applied");
+                    }
+                } else {
+                    // Any status for a different cid while pending is the NEW leg: resolve first,
+                    // then let normal processing handle the status itself (NEW rests; FILLED /
+                    // CANCELLED / REJECTED are real new-leg outcomes, incl. could-not-rest).
+                    resolveReplace(order, clusterOrderId);
                 }
-                order.setFilledQty(order.getQuantity());
-                order.setRemainingQty(0);
-                transition(order, OmsOrderStatus.FILLED);
-                removeOrder(order.getOmsOrderId());
-                break;
-            case 3: // CANCELLED — filledQty preserved by the monotonic guard above (do not reset)
-                transition(order, OmsOrderStatus.CANCELLED);
-                removeOrder(order.getOmsOrderId());
-                break;
-            case 4: // REJECTED
-                // Attach the engine reason (match#75) BEFORE the transition, so the state
-                // listener's WS/gRPC push and OrderResponse.fromOrder both carry it. Only on a
-                // genuine reject; null (NONE / pre-v6 / no reason) leaves the field untouched.
-                if (rejectReason != null) {
-                    order.setRejectReason(rejectReason);
-                }
-                transition(order, OmsOrderStatus.REJECTED);
-                removeOrder(order.getOmsOrderId());
-                break;
-        }
+            }
 
-        return order;
+            // Iceberg slice adoption (oms#86): each refill slice is a fresh cluster order carrying
+            // the parent's omsOrderId. Normally the prior slice's FILLED (case 2 below) zeroes the
+            // cid so the adopt block re-links; when that FILLED was coalesced away on the lossy
+            // status stream, a non-terminal status for the NEXT slice arrives while the cid still
+            // names the OLD slice — re-index so user cancels and membership repair target the
+            // slice actually resting.
+            if (order.getOrderType() == OmsOrderType.ICEBERG
+                    && clusterOrderId != 0 && order.getClusterOrderId() != 0
+                    && clusterOrderId != order.getClusterOrderId()
+                    && (status == 0 || status == 1)) {
+                byClusterOrderId.remove(order.getClusterOrderId(), order);
+                order.setClusterOrderId(clusterOrderId);
+                byClusterOrderId.put(clusterOrderId, order);
+                log.debug("Iceberg slice re-linked for omsOrderId={}: clusterOrderId -> {}",
+                        order.getOmsOrderId(), clusterOrderId);
+            }
+
+            // STALE-LEG GUARD (oms#67): a terminal status naming a cluster leg this order no longer
+            // occupies (a re-delivered old-leg echo after the replace resolved, or an iceberg's
+            // already-superseded slice) must not terminalize the live order. Non-terminal stale
+            // echoes fall through harmlessly (monotonic guards). An iceberg slice's own FILLED
+            // names the CURRENT cid, so it is not swallowed here.
+            if (clusterOrderId != 0 && order.getClusterOrderId() != 0
+                    && clusterOrderId != order.getClusterOrderId()
+                    && (status == 2 || status == 3 || status == 4)) {
+                log.debug("Ignoring stale-leg terminal status for omsOrderId={}: event cid={} current cid={} status={}",
+                        order.getOmsOrderId(), clusterOrderId, order.getClusterOrderId(), status);
+                return order;
+            }
+
+            // Store clusterOrderId on first status update from cluster
+            if (clusterOrderId != 0 && order.getClusterOrderId() == 0) {
+                order.setClusterOrderId(clusterOrderId);
+                byClusterOrderId.put(clusterOrderId, order);
+            }
+
+            // MONOTONIC GUARD: the OrderStatus egress stream is coalesced/lossy and unsequenced, so a
+            // stale/out-of-order update can carry a LOWER filledQty than reality. filledQty is driven
+            // authoritatively by applyFill() from the lossless TradeExecution stream; here we only ever
+            // RAISE it, never let the status stream regress the trade-derived value (the bug #9 fix).
+            long guardedFilled = Math.max(order.getFilledQty(), filledQty);
+            order.setFilledQty(guardedFilled);
+            order.setRemainingQty(Math.max(0, order.getQuantity() - guardedFilled));
+
+            switch (status) {
+                case 0: // NEW — do not regress an order already advanced by trade-driven fills
+                    if (order.getStatus() != OmsOrderStatus.PARTIALLY_FILLED
+                            && order.getStatus() != OmsOrderStatus.FILLED) {
+                        transition(order, OmsOrderStatus.NEW);
+                    }
+                    break;
+                case 1: // PARTIALLY_FILLED
+                    if (order.getStatus() != OmsOrderStatus.FILLED) {
+                        transition(order, OmsOrderStatus.PARTIALLY_FILLED);
+                    }
+                    break;
+                case 2: // FILLED — cluster confirms the order left the book fully filled; reconcile to qty
+                    // Iceberg SLICE FILLED (oms#86): the cluster order that filled is one display
+                    // slice, not the parent — the parent still has hidden quantity working. This
+                    // status used to setFilledQty(total) and terminalize the whole iceberg after
+                    // its FIRST slice (wrong filledQty, hold leaked, refills dead). Slice-level
+                    // bookkeeping only: unindex the finished slice and clear the cid so the next
+                    // slice's NEW is adopted. Refill timing is driven by the lossless trade stream
+                    // (trackIcebergSlice); parent-terminal comes from applyFill when cumulative
+                    // fills reach the total.
+                    if (order.getOrderType() == OmsOrderType.ICEBERG
+                            && order.getFilledQty() < order.getQuantity()) {
+                        if (clusterOrderId != 0) {
+                            byClusterOrderId.remove(clusterOrderId, order);
+                            if (order.getClusterOrderId() == clusterOrderId) {
+                                order.setClusterOrderId(0);
+                            }
+                        }
+                        log.debug("Iceberg slice FILLED for omsOrderId={} (slice cid={}, parent {}/{} filled)",
+                                order.getOmsOrderId(), clusterOrderId,
+                                order.getFilledQty(), order.getQuantity());
+                        return order;
+                    }
+                    order.setFilledQty(order.getQuantity());
+                    order.setRemainingQty(0);
+                    transition(order, OmsOrderStatus.FILLED);
+                    removeOrder(order.getOmsOrderId());
+                    break;
+                case 3: // CANCELLED — filledQty preserved by the monotonic guard above (do not reset)
+                    transition(order, OmsOrderStatus.CANCELLED);
+                    removeOrder(order.getOmsOrderId());
+                    break;
+                case 4: // REJECTED
+                    // Attach the engine reason (match#75) BEFORE the transition, so the state
+                    // listener's WS/gRPC push and OrderResponse.fromOrder both carry it. Only on a
+                    // genuine reject; null (NONE / pre-v6 / no reason) leaves the field untouched.
+                    if (rejectReason != null) {
+                        order.setRejectReason(rejectReason);
+                    }
+                    transition(order, OmsOrderStatus.REJECTED);
+                    removeOrder(order.getOmsOrderId());
+                    break;
+            }
+
+            return order;
+        }
     }
 
     /**
@@ -527,38 +556,41 @@ public class OrderLifecycleManager {
      */
     public OmsOrder applyFill(long omsOrderId, long clusterOrderId, long fillQty) {
         OmsOrder order = activeOrders.get(omsOrderId);
-        if (order == null || order.getStatus().isTerminal()) {
-            return null;
+        if (order == null) return null;
+        synchronized (order) {
+            if (order.getStatus().isTerminal()) {
+                return null;
+            }
+            // oms#110: an order that crosses on entry fills fully in the SAME egress batch as its
+            // accept, and the flush emits TradeExecution BEFORE OrderStatus — so this trade-driven path
+            // is where such an order FIRST learns its ME-assigned clusterOrderId. Set + index it here,
+            // BEFORE a full fill removes the order, or the trade-driven persistOrderUpdate writes
+            // cluster_order_id=0 and the later FILLED status can no longer correlate the (removed) order
+            // to correct it (byClusterOrderId miss -> "Unknown order"). Indexing byClusterOrderId also
+            // links a partial fill for egress correlation and membership repair. Guarded on 0 so a
+            // resting maker — or a replace / iceberg leg — that already carries its cid is never
+            // overwritten (onClusterOrderStatus keeps its set-on-first-status behavior as the fallback).
+            if (clusterOrderId != 0 && order.getClusterOrderId() == 0) {
+                order.setClusterOrderId(clusterOrderId);
+                byClusterOrderId.put(clusterOrderId, order);
+            }
+            long newFilled = order.getFilledQty() + fillQty;
+            order.setFilledQty(newFilled);
+            order.setRemainingQty(Math.max(0, order.getQuantity() - newFilled));
+            if (newFilled >= order.getQuantity()) {
+                // OMS-2: a trade that completes the order while a replace is in flight must abort the
+                // replace — releasing the incremental amend hold (pendingHoldDelta) via the hooks —
+                // before the order is terminalized and removed, or that hold is leaked. Mirrors the
+                // status==2 "old leg filled before the replace applied" path in onClusterOrderStatus.
+                // No-op when no replace is pending.
+                abortReplace(order, "order fully filled before the replace applied");
+                transition(order, OmsOrderStatus.FILLED);
+                removeOrder(omsOrderId);
+            } else {
+                transition(order, OmsOrderStatus.PARTIALLY_FILLED);
+            }
+            return order;
         }
-        // oms#110: an order that crosses on entry fills fully in the SAME egress batch as its
-        // accept, and the flush emits TradeExecution BEFORE OrderStatus — so this trade-driven path
-        // is where such an order FIRST learns its ME-assigned clusterOrderId. Set + index it here,
-        // BEFORE a full fill removes the order, or the trade-driven persistOrderUpdate writes
-        // cluster_order_id=0 and the later FILLED status can no longer correlate the (removed) order
-        // to correct it (byClusterOrderId miss -> "Unknown order"). Indexing byClusterOrderId also
-        // links a partial fill for egress correlation and membership repair. Guarded on 0 so a
-        // resting maker — or a replace / iceberg leg — that already carries its cid is never
-        // overwritten (onClusterOrderStatus keeps its set-on-first-status behavior as the fallback).
-        if (clusterOrderId != 0 && order.getClusterOrderId() == 0) {
-            order.setClusterOrderId(clusterOrderId);
-            byClusterOrderId.put(clusterOrderId, order);
-        }
-        long newFilled = order.getFilledQty() + fillQty;
-        order.setFilledQty(newFilled);
-        order.setRemainingQty(Math.max(0, order.getQuantity() - newFilled));
-        if (newFilled >= order.getQuantity()) {
-            // OMS-2: a trade that completes the order while a replace is in flight must abort the
-            // replace — releasing the incremental amend hold (pendingHoldDelta) via the hooks —
-            // before the order is terminalized and removed, or that hold is leaked. Mirrors the
-            // status==2 "old leg filled before the replace applied" path in onClusterOrderStatus.
-            // No-op when no replace is pending.
-            abortReplace(order, "order fully filled before the replace applied");
-            transition(order, OmsOrderStatus.FILLED);
-            removeOrder(omsOrderId);
-        } else {
-            transition(order, OmsOrderStatus.PARTIALLY_FILLED);
-        }
-        return order;
     }
 
     /**
@@ -567,11 +599,13 @@ public class OrderLifecycleManager {
     public OmsOrder onCancelRequested(long omsOrderId) {
         OmsOrder order = activeOrders.get(omsOrderId);
         if (order == null) return null;
-        if (order.getStatus().isTerminal()) return null;
-        // Mark cancel-intent so the post-reconnect reconcile can re-submit this cancel if it (or its
-        // terminal egress) is lost at a leader-switchover seam (oms#21).
-        order.setCancelRequested(true);
-        return order;
+        synchronized (order) {
+            if (order.getStatus().isTerminal()) return null;
+            // Mark cancel-intent so the post-reconnect reconcile can re-submit this cancel if it (or its
+            // terminal egress) is lost at a leader-switchover seam (oms#21).
+            order.setCancelRequested(true);
+            return order;
+        }
     }
 
     /**
@@ -579,10 +613,13 @@ public class OrderLifecycleManager {
      */
     public OmsOrder onExpired(long omsOrderId) {
         OmsOrder order = activeOrders.get(omsOrderId);
-        if (order == null || order.getStatus().isTerminal()) return null;
-        transition(order, OmsOrderStatus.EXPIRED);
-        removeOrder(omsOrderId);
-        return order;
+        if (order == null) return null;
+        synchronized (order) {
+            if (order.getStatus().isTerminal()) return null;
+            transition(order, OmsOrderStatus.EXPIRED);
+            removeOrder(omsOrderId);
+            return order;
+        }
     }
 
     public OmsOrder getOrder(long omsOrderId) {

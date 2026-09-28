@@ -32,8 +32,11 @@ public class PostgresOrderRepository {
             INSERT INTO orders (oms_order_id, cluster_order_id, client_order_id, user_id, market_id,
                 side, order_type, time_in_force, price, quantity, filled_qty, remaining_qty,
                 stop_price, trailing_delta, display_quantity, status, reject_reason, hold_amount,
-                expires_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                expires_at, created_at, updated_at,
+                trailing_arm_price, hidden_quantity, slice_remaining_qty, cancel_requested, hold_id, parent_oms_order_id,
+                replace_pending_old_cluster_order_id, pending_price, pending_quantity, pending_hold_delta,
+                pending_hold_target, replace_requested_at_ms, pending_hold_requested, state_revision)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (oms_order_id) DO UPDATE SET
                 cluster_order_id = EXCLUDED.cluster_order_id,
                 status = EXCLUDED.status,
@@ -47,19 +50,32 @@ public class PostgresOrderRepository {
                 trailing_delta = EXCLUDED.trailing_delta,
                 display_quantity = EXCLUDED.display_quantity,
                 expires_at = EXCLUDED.expires_at,
-                updated_at = EXCLUDED.updated_at
-            """;
-
-    private static final String UPDATE_STATUS = """
-            UPDATE orders SET status = ?, filled_qty = ?, remaining_qty = ?, updated_at = NOW()
-            WHERE oms_order_id = ?
+                updated_at = EXCLUDED.updated_at,
+                trailing_arm_price = EXCLUDED.trailing_arm_price,
+                hidden_quantity = EXCLUDED.hidden_quantity,
+                slice_remaining_qty = EXCLUDED.slice_remaining_qty,
+                cancel_requested = EXCLUDED.cancel_requested,
+                hold_id = EXCLUDED.hold_id,
+                parent_oms_order_id = EXCLUDED.parent_oms_order_id,
+                replace_pending_old_cluster_order_id = EXCLUDED.replace_pending_old_cluster_order_id,
+                pending_price = EXCLUDED.pending_price,
+                pending_quantity = EXCLUDED.pending_quantity,
+                pending_hold_delta = EXCLUDED.pending_hold_delta,
+                pending_hold_target = EXCLUDED.pending_hold_target,
+                replace_requested_at_ms = EXCLUDED.replace_requested_at_ms,
+                pending_hold_requested = EXCLUDED.pending_hold_requested,
+                state_revision = EXCLUDED.state_revision
+            WHERE orders.state_revision = EXCLUDED.state_revision - 1
             """;
 
     private static final String SELECT_BY_ID = """
             SELECT oms_order_id, cluster_order_id, client_order_id, user_id, market_id,
                 side, order_type, time_in_force, price, quantity, filled_qty, remaining_qty,
                 stop_price, trailing_delta, display_quantity, status, reject_reason, hold_amount,
-                expires_at, created_at, updated_at
+                expires_at, created_at, updated_at,
+                trailing_arm_price, hidden_quantity, slice_remaining_qty, cancel_requested, hold_id, parent_oms_order_id,
+                replace_pending_old_cluster_order_id, pending_price, pending_quantity, pending_hold_delta,
+                pending_hold_target, replace_requested_at_ms, pending_hold_requested, state_revision
             FROM orders WHERE oms_order_id = ?
             """;
 
@@ -67,7 +83,10 @@ public class PostgresOrderRepository {
             SELECT oms_order_id, cluster_order_id, client_order_id, user_id, market_id,
                 side, order_type, time_in_force, price, quantity, filled_qty, remaining_qty,
                 stop_price, trailing_delta, display_quantity, status, reject_reason, hold_amount,
-                expires_at, created_at, updated_at
+                expires_at, created_at, updated_at,
+                trailing_arm_price, hidden_quantity, slice_remaining_qty, cancel_requested, hold_id, parent_oms_order_id,
+                replace_pending_old_cluster_order_id, pending_price, pending_quantity, pending_hold_delta,
+                pending_hold_target, replace_requested_at_ms, pending_hold_requested, state_revision
             FROM orders WHERE user_id = ? AND status = ?
             ORDER BY created_at DESC LIMIT ? OFFSET ?
             """;
@@ -76,7 +95,10 @@ public class PostgresOrderRepository {
             SELECT oms_order_id, cluster_order_id, client_order_id, user_id, market_id,
                 side, order_type, time_in_force, price, quantity, filled_qty, remaining_qty,
                 stop_price, trailing_delta, display_quantity, status, reject_reason, hold_amount,
-                expires_at, created_at, updated_at
+                expires_at, created_at, updated_at,
+                trailing_arm_price, hidden_quantity, slice_remaining_qty, cancel_requested, hold_id, parent_oms_order_id,
+                replace_pending_old_cluster_order_id, pending_price, pending_quantity, pending_hold_delta,
+                pending_hold_target, replace_requested_at_ms, pending_hold_requested, state_revision
             FROM orders WHERE user_id = ?
             ORDER BY created_at DESC LIMIT ? OFFSET ?
             """;
@@ -85,7 +107,10 @@ public class PostgresOrderRepository {
             SELECT oms_order_id, cluster_order_id, client_order_id, user_id, market_id,
                 side, order_type, time_in_force, price, quantity, filled_qty, remaining_qty,
                 stop_price, trailing_delta, display_quantity, status, reject_reason, hold_amount,
-                expires_at, created_at, updated_at
+                expires_at, created_at, updated_at,
+                trailing_arm_price, hidden_quantity, slice_remaining_qty, cancel_requested, hold_id, parent_oms_order_id,
+                replace_pending_old_cluster_order_id, pending_price, pending_quantity, pending_hold_delta,
+                pending_hold_target, replace_requested_at_ms, pending_hold_requested, state_revision
             FROM orders WHERE user_id = ? AND status NOT IN ('FILLED', 'CANCELLED', 'EXPIRED', 'REJECTED')
             ORDER BY created_at DESC
             """;
@@ -94,7 +119,10 @@ public class PostgresOrderRepository {
             SELECT oms_order_id, cluster_order_id, client_order_id, user_id, market_id,
                 side, order_type, time_in_force, price, quantity, filled_qty, remaining_qty,
                 stop_price, trailing_delta, display_quantity, status, reject_reason, hold_amount,
-                expires_at, created_at, updated_at
+                expires_at, created_at, updated_at,
+                trailing_arm_price, hidden_quantity, slice_remaining_qty, cancel_requested, hold_id, parent_oms_order_id,
+                replace_pending_old_cluster_order_id, pending_price, pending_quantity, pending_hold_delta,
+                pending_hold_target, replace_requested_at_ms, pending_hold_requested, state_revision
             FROM orders WHERE status NOT IN ('FILLED', 'CANCELLED', 'EXPIRED', 'REJECTED')
             ORDER BY created_at ASC
             """;
@@ -106,44 +134,25 @@ public class PostgresOrderRepository {
     }
 
     /**
-     * Persists an order, updating the mutable columns (status, fills,
-     * clusterOrderId, ...) when the row already exists. Called on every
-     * lifecycle change; the in-memory order is the authority (its monotonic
-     * fill guards prevent regressions), so a straight overwrite is correct.
+     * Commit a complete workflow snapshot using the revision read with that order.
+     * A stale detached copy or uncertain earlier COMMIT must be recovered, never
+     * blindly retried over a newer row. The order monitor serializes local saves.
      */
     public void saveOrder(OmsOrder order) {
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(INSERT_ORDER)) {
-
-            bindOrderInsert(ps, order);
-            ps.executeUpdate();
-
-        } catch (SQLException e) {
-            log.error("Failed to save order omsOrderId={}", order.getOmsOrderId(), e);
-            throw new PersistenceException("Failed to save order", e);
-        }
-    }
-
-    /**
-     * Updates order status and fill quantities atomically.
-     */
-    public void updateOrderStatus(long omsOrderId, OmsOrderStatus status, long filledQty, long remainingQty) {
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(UPDATE_STATUS)) {
-
-            ps.setString(1, status.name());
-            ps.setLong(2, filledQty);
-            ps.setLong(3, remainingQty);
-            ps.setLong(4, omsOrderId);
-
-            int rows = ps.executeUpdate();
-            if (rows == 0) {
-                log.warn("No order found to update: omsOrderId={}", omsOrderId);
+        synchronized (order) {
+            long nextRevision = Math.addExact(order.getStateRevision(), 1);
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement ps = conn.prepareStatement(INSERT_ORDER)) {
+                bindOrderInsert(ps, order);
+                ps.setLong(35, nextRevision);
+                if (ps.executeUpdate() != 1) {
+                    throw new PersistenceException("Stale order recovery revision: " + order.getOmsOrderId());
+                }
+                order.setStateRevision(nextRevision);
+            } catch (SQLException e) {
+                log.error("Failed to save order omsOrderId={}", order.getOmsOrderId(), e);
+                throw new PersistenceException("Failed to save order", e);
             }
-
-        } catch (SQLException e) {
-            log.error("Failed to update order status omsOrderId={}", omsOrderId, e);
-            throw new PersistenceException("Failed to update order status", e);
         }
     }
 
@@ -280,6 +289,19 @@ public class PostgresOrderRepository {
         }
         ps.setTimestamp(20, Timestamp.from(Instant.ofEpochMilli(order.getCreatedAtMs())));
         ps.setTimestamp(21, Timestamp.from(Instant.ofEpochMilli(order.getUpdatedAtMs())));
+        ps.setLong(22, order.getTrailingArmPrice());
+        ps.setLong(23, order.getHiddenQuantity());
+        ps.setLong(24, order.getSliceRemainingQty());
+        ps.setBoolean(25, order.isCancelRequested());
+        ps.setLong(26, order.getHoldId());
+        ps.setLong(27, order.getParentOmsOrderId());
+        ps.setLong(28, order.getReplacePendingOldClusterOrderId());
+        ps.setLong(29, order.getPendingPrice());
+        ps.setLong(30, order.getPendingQuantity());
+        ps.setLong(31, order.getPendingHoldDelta());
+        ps.setLong(32, order.getPendingHoldTarget());
+        ps.setLong(33, order.getReplaceRequestedAtMs());
+        ps.setLong(34, order.getPendingHoldRequested());
     }
 
     private List<OmsOrder> collectOrders(PreparedStatement ps) throws SQLException {
@@ -318,6 +340,20 @@ public class PostgresOrderRepository {
 
         o.setCreatedAtMs(rs.getTimestamp("created_at").toInstant().toEpochMilli());
         o.setUpdatedAtMs(rs.getTimestamp("updated_at").toInstant().toEpochMilli());
+        o.setTrailingArmPrice(rs.getLong("trailing_arm_price"));
+        o.setHiddenQuantity(rs.getLong("hidden_quantity"));
+        o.setSliceRemainingQty(rs.getLong("slice_remaining_qty"));
+        o.setCancelRequested(rs.getBoolean("cancel_requested"));
+        o.setHoldId(rs.getLong("hold_id"));
+        o.setParentOmsOrderId(rs.getLong("parent_oms_order_id"));
+        o.setReplacePendingOldClusterOrderId(rs.getLong("replace_pending_old_cluster_order_id"));
+        o.setPendingPrice(rs.getLong("pending_price"));
+        o.setPendingQuantity(rs.getLong("pending_quantity"));
+        o.setPendingHoldDelta(rs.getLong("pending_hold_delta"));
+        o.setPendingHoldTarget(rs.getLong("pending_hold_target"));
+        o.setReplaceRequestedAtMs(rs.getLong("replace_requested_at_ms"));
+        o.setPendingHoldRequested(rs.getLong("pending_hold_requested"));
+        o.setStateRevision(rs.getLong("state_revision"));
         return o;
     }
 }

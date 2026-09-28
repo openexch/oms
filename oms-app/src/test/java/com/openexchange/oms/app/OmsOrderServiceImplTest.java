@@ -84,9 +84,11 @@ class OmsOrderServiceImplTest {
         // (the iceberg first-slice + refill path under test, oms#82).
         coreEngine.setClusterSubmitHandler(new OmsCoreEngine.ClusterSubmitHandler() {
             @Override
-            public void submitTriggeredOrder(com.openexchange.oms.common.domain.OmsOrder parentOrder,
+            public boolean submitTriggeredOrder(com.openexchange.oms.common.domain.OmsOrder parentOrder,
                                              OmsOrderType childType, long childPrice) {
                 // not exercised here
+
+                return true;
             }
 
             @Override
@@ -1000,4 +1002,80 @@ class OmsOrderServiceImplTest {
         assertEquals(Boolean.FALSE, resp.get("accepted"));
         assertFalse(order.isReplacePending());
     }
+    @Test
+    void cancelIntentMustCommitBeforeCommandCanBeSent() {
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(200000));
+        var order = restingBuy(1, 50000, 1, 900);
+        clearInvocations(clusterClient);
+        var repo = mock(com.openexchange.oms.persistence.PostgresOrderRepository.class);
+        orderService.setRepositories(repo, null);
+        doAnswer(c -> { assertTrue(order.isCancelRequested()); return null; }).when(repo).saveOrder(order);
+        assertTrue(orderService.cancelOrder(order.getOmsOrderId()).isAccepted());
+        var ordered = inOrder(repo, clusterClient);
+        ordered.verify(repo).saveOrder(order);
+        ordered.verify(clusterClient).submitOrder(any());
+    }
+
+    @Test
+    void failedCancelIntentCommitMustNotSendCommand() {
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(200000));
+        var order = restingBuy(1, 50000, 1, 900);
+        clearInvocations(clusterClient);
+        var repo = mock(com.openexchange.oms.persistence.PostgresOrderRepository.class);
+        orderService.setRepositories(repo, null);
+        doThrow(new com.openexchange.oms.persistence.PersistenceException("offline")).when(repo).saveOrder(any());
+        assertThrows(IllegalStateException.class, () -> orderService.cancelOrder(order.getOmsOrderId()));
+        verifyNoInteractions(clusterClient);
+        assertFalse(orderService.isAdmissionReady());
+    }
+
+    @Test
+    void amendIntentMustCommitBeforeAdditionalFundsAreHeld() {
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(200000));
+        var order = restingBuy(1, 50000, 1, 900);
+        clearInvocations(clusterClient);
+        var repo = mock(com.openexchange.oms.persistence.PostgresOrderRepository.class);
+        orderService.setRepositories(repo, null);
+        doThrow(new com.openexchange.oms.persistence.PersistenceException("offline")).when(repo).saveOrder(any());
+        assertThrows(IllegalStateException.class, () -> orderService.updateOrder(order.getOmsOrderId(),
+                FixedPoint.fromDouble(60000), 0));
+        assertEquals(FixedPoint.fromDouble(50000), balanceStore.getLocked(1, 0));
+        verifyNoInteractions(clusterClient);
+    }
+
+    @Test
+    void unknownHoldPreservesAdmissionIntentAndClosesReadiness() {
+        var failingLedger = mock(LedgerService.class);
+        when(failingLedger.holdForOrder(any())).thenThrow(new IllegalStateException("hold OUTCOME UNKNOWN"));
+        var service = new OmsOrderServiceImpl(coreEngine, riskEngine, failingLedger, clusterClient,
+                balanceStore, new OmsEgressAdapter(coreEngine, marketDataProvider),
+                new SnowflakeIdGenerator(0), marketDataProvider);
+        service.setRepositories(mock(com.openexchange.oms.persistence.PostgresOrderRepository.class), null);
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(200000));
+        assertThrows(IllegalStateException.class, () -> service.createOrder(createLimitBuyRequest(1, 1, 50000, 1)));
+        assertFalse(service.isAdmissionReady());
+        verifyNoInteractions(clusterClient);
+        assertEquals(1, coreEngine.getLifecycleManager().getActiveOrderCount());
+        coreEngine.getLifecycleManager().forEachActiveOrder(o -> assertEquals(OmsOrderStatus.PENDING_HOLD, o.getStatus()));
+    }
+
+    @Test void unknownAmendHoldPreservesRequestedDeltaAndClosesReadiness() {
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(200000));
+        var order = restingBuy(1, 50000, 1, 900);
+        clearInvocations(clusterClient);
+        var failingLedger = spy(ledgerService);
+        doThrow(new IllegalStateException("hold OUTCOME UNKNOWN")).when(failingLedger).holdAmendDelta(any(), anyLong());
+        var service = new OmsOrderServiceImpl(coreEngine, riskEngine, failingLedger, clusterClient,
+                balanceStore, new OmsEgressAdapter(coreEngine, marketDataProvider),
+                new SnowflakeIdGenerator(0), marketDataProvider);
+        service.setRepositories(mock(com.openexchange.oms.persistence.PostgresOrderRepository.class), null);
+        assertThrows(IllegalStateException.class, () -> service.updateOrder(order.getOmsOrderId(),
+                FixedPoint.fromDouble(60000), 0));
+        assertFalse(service.isAdmissionReady());
+        assertTrue(order.isReplacePending());
+        assertEquals(FixedPoint.fromDouble(10000), order.getPendingHoldRequested());
+        assertEquals(0, order.getPendingHoldDelta());
+        verifyNoInteractions(clusterClient);
+    }
+
 }

@@ -9,6 +9,9 @@ import com.openexchange.oms.common.enums.*;
  */
 public class OmsOrder {
 
+    // Durable optimistic revision; zero denotes a new or unmigrated row.
+    private long stateRevision;
+
     // === Identifiers ===
     private long omsOrderId;          // Snowflake ID assigned by OMS
     private long clusterOrderId;      // Assigned by matching engine
@@ -66,6 +69,7 @@ public class OmsOrder {
     private volatile long replacePendingOldClusterOrderId; // != 0 ⇒ replace in flight
     private volatile long pendingPrice;                    // amended limit price (parent-total semantics)
     private volatile long pendingQuantity;                 // amended TOTAL quantity (incl. prior fills)
+    private volatile long pendingHoldRequested;            // durable attempted delta, may not yet be acknowledged
     private volatile long pendingHoldDelta;                // incremental hold placed at submit (rollback amount)
     private volatile long pendingHoldTarget;               // holdAmount to install at resolution
     private volatile long replaceRequestedAtMs;            // timeout fallback anchor
@@ -81,6 +85,9 @@ public class OmsOrder {
     }
 
     // === Getters and Setters ===
+
+    public long getStateRevision() { return stateRevision; }
+    public void setStateRevision(long stateRevision) { this.stateRevision = stateRevision; }
 
     public long getOmsOrderId() { return omsOrderId; }
     public void setOmsOrderId(long omsOrderId) { this.omsOrderId = omsOrderId; }
@@ -157,6 +164,8 @@ public class OmsOrder {
     public void setPendingPrice(long v) { this.pendingPrice = v; }
     public long getPendingQuantity() { return pendingQuantity; }
     public void setPendingQuantity(long v) { this.pendingQuantity = v; }
+    public long getPendingHoldRequested() { return pendingHoldRequested; }
+    public void setPendingHoldRequested(long value) { pendingHoldRequested = value; }
     public long getPendingHoldDelta() { return pendingHoldDelta; }
     public void setPendingHoldDelta(long v) { this.pendingHoldDelta = v; }
     public long getPendingHoldTarget() { return pendingHoldTarget; }
