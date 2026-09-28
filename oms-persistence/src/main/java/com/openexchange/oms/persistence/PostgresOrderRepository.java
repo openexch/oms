@@ -41,6 +41,12 @@ public class PostgresOrderRepository {
                 remaining_qty = EXCLUDED.remaining_qty,
                 reject_reason = EXCLUDED.reject_reason,
                 hold_amount = EXCLUDED.hold_amount,
+                price = EXCLUDED.price,
+                quantity = EXCLUDED.quantity,
+                stop_price = EXCLUDED.stop_price,
+                trailing_delta = EXCLUDED.trailing_delta,
+                display_quantity = EXCLUDED.display_quantity,
+                expires_at = EXCLUDED.expires_at,
                 updated_at = EXCLUDED.updated_at
             """;
 

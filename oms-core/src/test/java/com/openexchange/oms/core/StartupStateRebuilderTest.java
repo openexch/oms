@@ -83,6 +83,16 @@ class StartupStateRebuilderTest {
     }
 
     @Test
+    void ambiguousHoldIntentCannotBeSilentlySkippedOnRestart() {
+        var pending = order(999, 4, OmsOrderType.LIMIT, OrderSide.BUY, 50000, 5);
+        pending.setStatus(OmsOrderStatus.PENDING_HOLD);
+        var lifecycle = new OrderLifecycleManager();
+        assertThrows(IllegalStateException.class, () -> StartupStateRebuilder.rebuild(
+                List.of(pending), List.of(), lifecycle, new SyntheticOrderEngine(), newRiskEngine()));
+        assertEquals(0, lifecycle.getActiveOrderCount());
+    }
+
+    @Test
     void rebuildReproducesPreRestartState() {
         // ---- pre-restart: live components driven through the normal call paths ----
         OrderLifecycleManager lifecycleA = new OrderLifecycleManager();
@@ -124,7 +134,7 @@ class StartupStateRebuilderTest {
 
         // ---- "restart": Postgres-shaped rows + executions aggregate into fresh components ----
         List<OmsOrder> persistedOpenOrders = List.of(
-                persistedCopy(buy), persistedCopy(rest), persistedCopy(stop), persistedCopy(limbo));
+                persistedCopy(buy), persistedCopy(rest), persistedCopy(stop));
         List<PositionAggregate> aggregates = List.of(
                 new PositionAggregate(1, MARKET, 30),
                 new PositionAggregate(2, MARKET, -30));
@@ -137,7 +147,7 @@ class StartupStateRebuilderTest {
                 persistedOpenOrders, aggregates, lifecycleB, syntheticB, riskB);
 
         assertEquals(3, result.ordersRestored());
-        assertEquals(1, result.ordersSkippedPreCluster());
+        assertEquals(0, result.ordersSkippedPreCluster());
         assertEquals(1, result.syntheticsRegistered());
         assertEquals(2, result.positionsRestored());
 

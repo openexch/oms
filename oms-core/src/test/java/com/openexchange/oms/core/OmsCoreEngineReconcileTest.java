@@ -71,21 +71,20 @@ class OmsCoreEngineReconcileTest {
     }
 
     @Test
-    void zombiePartiallyFilledWithoutClusterIdIsTerminalized() {
-        OmsOrder zombie = activeOrder(101, OmsOrderStatus.PARTIALLY_FILLED, 0, OLD, 3_00000000L);
-
-        int repaired = reconcile(new LongHashSet(), new Long2LongHashMap(0L));
-
-        assertEquals(1, repaired);
-        assertEquals(OmsOrderStatus.CANCELLED, zombie.getStatus());
-        assertTrue(persisted.contains(zombie), "repair must persist or it resurrects on rebuild");
+    void missingPartiallyFilledOrderWaitsForDurableOutcome() {
+        OmsOrder o = activeOrder(101, OmsOrderStatus.PARTIALLY_FILLED, 0, OLD, 3_00000000L);
+        assertEquals(0, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
+        assertEquals(OmsOrderStatus.PARTIALLY_FILLED, o.getStatus());
+        assertFalse(persisted.contains(o));
+        assertEquals(1, engine.getUnresolvedOrderCount());
     }
 
     @Test
-    void zombieNewWithoutClusterIdIsTerminalized() {
-        OmsOrder zombie = activeOrder(102, OmsOrderStatus.NEW, 0, OLD, 0);
-        assertEquals(1, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
-        assertEquals(OmsOrderStatus.CANCELLED, zombie.getStatus());
+    void missingNewOrderWaitsForDurableOutcome() {
+        OmsOrder o = activeOrder(102, OmsOrderStatus.NEW, 0, OLD, 0);
+        assertEquals(0, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
+        assertEquals(OmsOrderStatus.NEW, o.getStatus());
+        assertEquals(1, engine.getUnresolvedOrderCount());
     }
 
     @Test
@@ -137,53 +136,39 @@ class OmsCoreEngineReconcileTest {
     }
 
     @Test
-    void linkedOrderRepairStillWorksAndFullyFilledBecomesFilled() {
+    void linkedAbsenceDoesNotInventAnOrderOutcome() {
         OmsOrder gone = activeOrder(107, OmsOrderStatus.NEW, 555, OLD, 0);
         OmsOrder full = activeOrder(108, OmsOrderStatus.PARTIALLY_FILLED, 556, OLD, 10_00000000L);
         OmsOrder open = activeOrder(109, OmsOrderStatus.NEW, 557, OLD, 0);
-
-        LongHashSet clusterOpen = new LongHashSet();
-        clusterOpen.add(557L);
-
-        assertEquals(2, reconcile(clusterOpen, new Long2LongHashMap(0L)));
-        assertEquals(OmsOrderStatus.CANCELLED, gone.getStatus());
-        assertEquals(OmsOrderStatus.FILLED, full.getStatus());
+        LongHashSet ids = new LongHashSet(); ids.add(557);
+        assertEquals(0, reconcile(ids, new Long2LongHashMap(0L)));
+        assertEquals(OmsOrderStatus.NEW, gone.getStatus());
+        assertEquals(OmsOrderStatus.PARTIALLY_FILLED, full.getStatus());
         assertEquals(OmsOrderStatus.NEW, open.getStatus());
+        assertEquals(2, engine.getUnresolvedOrderCount());
     }
 
     // ==================== MONEY-A: defer release-bearing terminalize while a fill may be in flight ====
 
     @Test
-    void partiallyFilledVanishedWithRecentFillIsDeferredThenTerminalizedWhenQuiet() {
-        // MONEY-A: order 900 vanished from the cluster while a fill may still be in flight (recent
-        // fill activity — this repair is often gap-triggered, so filledQty can be stale). Marking it
-        // CANCELLED now would release a hold the cluster already consumed; the late fill's settlement
-        // then double-debits `locked`. It must be DEFERRED, not terminalized, while fills are recent.
+    void quietPeriodCannotTurnMissingOutcomeIntoCancellation() {
         OmsOrder o = activeOrder(150, OmsOrderStatus.PARTIALLY_FILLED, 900, OLD, 3_00000000L);
-        o.setUpdatedAtMs(FRESH); // fill activity 1s ago — inside ORPHAN_MIN_AGE
-
-        assertEquals(0, reconcile(new LongHashSet(), new Long2LongHashMap(0L)),
-                "recent fill activity: the release-bearing terminalize must be deferred");
-        assertEquals(OmsOrderStatus.PARTIALLY_FILLED, o.getStatus(),
-                "not terminalized while a late fill may still be settling");
-        assertFalse(persisted.contains(o), "nothing terminalized: nothing to persist");
-
-        // Once fill activity has been quiet past the gate, a genuinely-cancelled order terminalizes.
-        o.setUpdatedAtMs(OLD);
-        assertEquals(1, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
-        assertEquals(OmsOrderStatus.CANCELLED, o.getStatus());
-        assertTrue(persisted.contains(o));
+        for (long lastUpdate : new long[]{FRESH, OLD}) {
+            o.setUpdatedAtMs(lastUpdate);
+            assertEquals(0, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
+            assertEquals(OmsOrderStatus.PARTIALLY_FILLED, o.getStatus());
+            assertFalse(persisted.contains(o));
+        }
     }
 
     @Test
-    void fullyFilledVanishedIsTerminalizedImmediatelyEvenWhenFillIsRecent() {
-        // A fully-filled vanished order releases no hold (→ FILLED), so it is always safe to
-        // terminalize now — the freshness gate applies only to the release-bearing (CANCELLED) case.
+    void authoritativeTerminalResolvesAnAbsentOrder() {
         OmsOrder o = activeOrder(151, OmsOrderStatus.PARTIALLY_FILLED, 901, OLD, 10_00000000L);
-        o.setUpdatedAtMs(FRESH);
-
-        assertEquals(1, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
+        assertEquals(0, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
+        assertEquals(1, engine.getUnresolvedOrderCount());
+        lifecycle.onClusterOrderStatus(151, 901, 2, 0, 10_00000000L);
         assertEquals(OmsOrderStatus.FILLED, o.getStatus());
+        assertEquals(0, engine.getUnresolvedOrderCount());
     }
 
     // ==================== Cancel-and-replace repair (oms#67) ====================
@@ -229,15 +214,14 @@ class OmsCoreEngineReconcileTest {
     }
 
     @Test
-    void replacePendingWithBothLegsGoneIsTerminalizedPastTheWindow() {
-        OmsOrder order = activeOrder(142, OmsOrderStatus.NEW, 800, OLD, 0);
-        assertTrue(lifecycle.onReplaceSubmitted(142, 120_00000000L, 10_00000000L, 0, 1_200L));
-        // Simulate an old replace: requested well past the age gate.
-        order.setReplaceRequestedAtMs(OLD);
-
-        assertEquals(1, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
-        assertEquals(OmsOrderStatus.CANCELLED, order.getStatus());
-        assertFalse(order.isReplacePending(), "marker cleared before the terminal repair");
-        assertTrue(persisted.contains(order));
+    void missingReplaceLegsPreservePendingReservation() {
+        OmsOrder o = activeOrder(142, OmsOrderStatus.NEW, 800, OLD, 0);
+        assertTrue(lifecycle.onReplaceSubmitted(142, 120_00000000L, 10_00000000L, 0, 1200));
+        o.setReplaceRequestedAtMs(OLD);
+        assertEquals(0, reconcile(new LongHashSet(), new Long2LongHashMap(0L)));
+        assertEquals(OmsOrderStatus.NEW, o.getStatus());
+        assertTrue(o.isReplacePending());
+        assertFalse(persisted.contains(o));
+        assertEquals(1, engine.getUnresolvedOrderCount());
     }
 }

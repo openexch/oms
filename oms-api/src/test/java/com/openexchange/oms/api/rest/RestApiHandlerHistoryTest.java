@@ -156,6 +156,32 @@ class RestApiHandlerHistoryTest {
     }
 
     @Test
+    void readinessIsPublicAndRequiresAllAdmissionDependencies() {
+        when(orderService.isClusterConnected()).thenReturn(true);
+        when(orderService.isAssetsProjectionReady()).thenReturn(true);
+        assertEquals(HttpResponseStatus.SERVICE_UNAVAILABLE,
+                exchange(request(HttpMethod.GET, "/ready", null, null)).status());
+        when(orderService.isAdmissionReady()).thenReturn(true);
+        assertEquals(HttpResponseStatus.OK, exchange(request(HttpMethod.GET, "/ready", null, null)).status());
+        when(orderService.isAssetsProjectionReady()).thenReturn(false);
+        assertEquals(HttpResponseStatus.SERVICE_UNAVAILABLE,
+                exchange(request(HttpMethod.GET, "/api/v1/ready", null, null)).status());
+    }
+
+    @Test
+    void uncertainAdmissionIs503AndRequestIdentityReachesService() {
+        when(orderService.createOrder(any())).thenThrow(new IllegalStateException("Request outcome unresolved"));
+        var response = exchange(request(HttpMethod.POST, "/api/v1/orders",
+                "{\"marketId\":1,\"side\":\"BUY\",\"orderType\":\"LIMIT\",\"price\":\"100\",\"quantity\":\"1\",\"requestId\":\"stable-1\"}",
+                "userA-key"));
+        assertEquals(HttpResponseStatus.SERVICE_UNAVAILABLE, response.status());
+        var captor = org.mockito.ArgumentCaptor.forClass(com.openexchange.oms.api.dto.CreateOrderRequest.class);
+        verify(orderService).createOrder(captor.capture());
+        assertEquals("stable-1", captor.getValue().getRequestId());
+        assertEquals(1, captor.getValue().getUserId());
+    }
+
+    @Test
     void duplicateCreateReturns200NotCreated() {
         when(orderService.createOrder(any())).thenReturn(CreateOrderResponse.duplicate(42L, "NEW"));
         FullHttpResponse resp = exchange(request(HttpMethod.POST, "/api/v1/orders",

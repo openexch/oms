@@ -68,6 +68,7 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
             dto.setExpiresAtMs(request.getExpiresAtMs());
             dto.setClientOrderId(request.getClientOrderId().isEmpty() ? null : request.getClientOrderId());
 
+            dto.setRequestId(request.getRequestId().isEmpty() ? null : request.getRequestId());
             CreateOrderResponse resp = orderService.createOrder(dto);
             auditLog.record(GrpcAuthInterceptor.PRINCIPAL.get(), "order.create", "user:" + userId,
                     resp.isAccepted(),
@@ -86,6 +87,8 @@ public class GrpcOrderService extends OrderServiceGrpc.OrderServiceImplBase {
             responseObserver.onCompleted();
         } catch (io.grpc.StatusRuntimeException e) {
             responseObserver.onError(e); // e.g. INVALID_ARGUMENT from protoMoney
+        } catch (IllegalStateException e) {
+            responseObserver.onError(io.grpc.Status.UNAVAILABLE.withDescription(e.getMessage()).asRuntimeException());
         } catch (Exception e) {
             log.error("gRPC createOrder failed", e);
             responseObserver.onError(io.grpc.Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());

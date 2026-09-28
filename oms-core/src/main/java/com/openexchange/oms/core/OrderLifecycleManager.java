@@ -88,13 +88,23 @@ public class OrderLifecycleManager {
     /**
      * Register a new order entering the lifecycle.
      */
-    public void registerOrder(OmsOrder order) {
+    public synchronized OmsOrder registerOrder(OmsOrder order) {
+        if (order.getClientOrderId() != null && !order.getClientOrderId().isEmpty()) {
+            long existingId = findActiveByClientOrderId(order.getUserId(), order.getClientOrderId());
+            OmsOrder existing = activeOrders.get(existingId);
+            if (existing != null) {
+                return existing;
+            }
+        }
         order.setStatus(OmsOrderStatus.PENDING_RISK);
         order.setCreatedAtMs(System.currentTimeMillis());
-        activeOrders.put(order.getOmsOrderId(), order);
+        if (activeOrders.putIfAbsent(order.getOmsOrderId(), order) != null) {
+            throw new IllegalStateException("Duplicate OMS order id: " + order.getOmsOrderId());
+        }
         indexClientOrderId(order);
         log.debug("Order registered: omsOrderId={}, type={}, side={}",
             order.getOmsOrderId(), order.getOrderType(), order.getSide());
+        return order;
     }
 
     /**
@@ -102,7 +112,7 @@ public class OrderLifecycleManager {
      * preserving status/filledQty/createdAt from Postgres. No state transition,
      * no listener, no persistence — the order already lived through those.
      */
-    public void restoreOrder(OmsOrder order) {
+    public synchronized void restoreOrder(OmsOrder order) {
         activeOrders.put(order.getOmsOrderId(), order);
         if (order.getClusterOrderId() != 0) {
             byClusterOrderId.put(order.getClusterOrderId(), order);
@@ -126,10 +136,9 @@ public class OrderLifecycleManager {
         Long prior = byClientOrderId.putIfAbsent(
                 clientKey(order.getUserId(), order.getClientOrderId()), order.getOmsOrderId());
         if (prior != null && prior != order.getOmsOrderId()) {
-            // Lost the race with a concurrent submit that passed the duplicate
-            // check in the same window; keep the first claim (best-effort dedupe).
-            log.warn("clientOrderId collision: userId={} clientOrderId={} kept omsOrderId={} dropped {}",
-                    order.getUserId(), order.getClientOrderId(), prior, order.getOmsOrderId());
+            // Registration is atomic. A collision here indicates conflicting
+            // persisted recovery state and must not be silently accepted.
+            throw new IllegalStateException("Conflicting active clientOrderId for user " + order.getUserId());
         }
     }
 
@@ -607,7 +616,7 @@ public class OrderLifecycleManager {
         }
     }
 
-    private void removeOrder(long omsOrderId) {
+    private synchronized void removeOrder(long omsOrderId) {
         OmsOrder removed = activeOrders.remove(omsOrderId);
         if (removed != null && removed.getClusterOrderId() != 0) {
             byClusterOrderId.remove(removed.getClusterOrderId());

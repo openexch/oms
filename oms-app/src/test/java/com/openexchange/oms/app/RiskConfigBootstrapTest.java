@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Boot replay: stored rows merge over the hardcoded defaults, manual trips re-arm the
- * breaker, and a corrupt or out-of-range row is skipped instead of failing the boot.
+ * breaker, and corrupt or out-of-range rows prevent admission from opening.
  */
 class RiskConfigBootstrapTest {
 
@@ -67,22 +67,12 @@ class RiskConfigBootstrapTest {
     }
 
     @Test
-    void corruptOrOutOfRangeRowsAreSkippedNotFatal() {
-        Map<Integer, RiskConfigStore.StoredRow> rows = Map.of(
-                1, new RiskConfigStore.StoredRow(Map.of("minQuantity", "garbage"), true),
-                99, new RiskConfigStore.StoredRow(Map.of("maxOpenOrders", 1), true),
-                3, new RiskConfigStore.StoredRow(Map.of("maxOpenOrders", 7), false));
-
-        RiskConfigBootstrap.Result result = RiskConfigBootstrap.replay(rows, configManager, riskEngine);
-
-        assertEquals(1, result.marketsLoaded());
-        assertEquals(7, configManager.getConfig(3).getMaxOpenOrders());
-        assertSame(defaults, configManager.getConfig(1)); // corrupt row left market 1 on defaults
-
-        // A corrupt config document must NOT drop the operator's halt on the market
-        assertEquals(1, result.tripsRearmed());
-        assertTrue(riskEngine.isCircuitBreakerTripped(1));
-        assertTrue(riskEngine.isCircuitBreakerManuallyTripped(1));
+    void corruptOrOutOfRangeRowsFailBootstrap() {
+        for (var row : Map.of(1, new RiskConfigStore.StoredRow(Map.of("minQuantity", "garbage"), true),
+                99, new RiskConfigStore.StoredRow(Map.of("maxOpenOrders", 1), true)).entrySet()) {
+            assertThrows(IllegalStateException.class, () -> RiskConfigBootstrap.replay(
+                    Map.of(row.getKey(), row.getValue()), configManager, riskEngine));
+        }
     }
 
     private static final class NoopMarketData implements MarketDataProvider {

@@ -120,6 +120,71 @@ class OmsOrderServiceImplTest {
         orderService = new OmsOrderServiceImpl(
                 coreEngine, riskEngine, ledgerService, clusterClient,
                 balanceStore, egressAdapter, idGenerator, marketDataProvider);
+        orderService.setRepositories(mock(com.openexchange.oms.persistence.PostgresOrderRepository.class), null);
+    }
+
+    @Test
+    void completedRequestReplaysOriginalResponseWithoutAnotherOrder() {
+        var repo = mock(com.openexchange.oms.persistence.PostgresOrderRequestRepository.class);
+        orderService.setRequestRepository(repo);
+        var req = createLimitBuyRequest(1, 1, 50000, 1);
+        req.setRequestId("stable-1");
+        when(repo.find(1, "stable-1")).thenReturn(new com.openexchange.oms.persistence.PostgresOrderRequestRepository.Entry(
+                123L, OrderRequestFingerprint.hash(req), true, "PENDING_NEW", null));
+        var response = orderService.createOrder(req);
+        assertTrue(response.isAccepted());
+        assertTrue(response.isDuplicate());
+        assertEquals(123L, response.getOmsOrderId());
+        assertEquals("PENDING_NEW", response.getStatus());
+        assertEquals(0, coreEngine.getLifecycleManager().getActiveOrderCount());
+        verify(clusterClient, never()).submitOrder(any());
+    }
+
+    @Test
+    void pendingRequestNeverRepeatsAnUncertainExternalAction() {
+        var repo = mock(com.openexchange.oms.persistence.PostgresOrderRequestRepository.class);
+        orderService.setRequestRepository(repo);
+        var req = createLimitBuyRequest(1, 1, 50000, 1);
+        req.setRequestId("pending-1");
+        when(repo.find(1, "pending-1")).thenReturn(new com.openexchange.oms.persistence.PostgresOrderRequestRepository.Entry(
+                123L, OrderRequestFingerprint.hash(req), null, null, null));
+        assertThrows(IllegalStateException.class, () -> orderService.createOrder(req));
+        verify(clusterClient, never()).submitOrder(any());
+        assertEquals(0, coreEngine.getLifecycleManager().getActiveOrderCount());
+    }
+
+    @Test
+    void requestIdentityCannotBeReusedForDifferentEconomics() {
+        var repo = mock(com.openexchange.oms.persistence.PostgresOrderRequestRepository.class);
+        orderService.setRequestRepository(repo);
+        var req = createLimitBuyRequest(1, 1, 50000, 1);
+        req.setRequestId("conflict-1");
+        when(repo.find(1, "conflict-1")).thenReturn(new com.openexchange.oms.persistence.PostgresOrderRequestRepository.Entry(
+                123L, "another-payload", true, "PENDING_NEW", null));
+        var response = orderService.createOrder(req);
+        assertFalse(response.isAccepted());
+        assertEquals("requestId already belongs to a different request", response.getRejectReason());
+        verify(clusterClient, never()).submitOrder(any());
+    }
+
+    @Test
+    void requestResponseIsCommittedBeforeSuccessAndClaimSelectsOrderId() {
+        var repo = mock(com.openexchange.oms.persistence.PostgresOrderRequestRepository.class);
+        orderService.setRequestRepository(repo);
+        var req = createLimitBuyRequest(1, 1, 50000, 1);
+        req.setRequestId("new-1");
+        when(repo.claim(eq(1L), eq("new-1"), anyString(), anyLong())).thenAnswer(call ->
+                new com.openexchange.oms.persistence.PostgresOrderRequestRepository.Claim(true,
+                    new com.openexchange.oms.persistence.PostgresOrderRequestRepository.Entry(
+                        call.getArgument(3), call.getArgument(2), null, null, null)));
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(1000000));
+        var response = orderService.createOrder(req);
+        assertTrue(response.isAccepted());
+        var result = ArgumentCaptor.forClass(com.openexchange.oms.persistence.PostgresOrderRequestRepository.Entry.class);
+        verify(repo).complete(eq(1L), eq("new-1"), result.capture());
+        assertEquals(response.getOmsOrderId(), result.getValue().omsOrderId());
+        assertEquals(response.getStatus(), result.getValue().status());
+        assertTrue(result.getValue().accepted());
     }
 
     @Test
@@ -133,6 +198,35 @@ class OmsOrderServiceImplTest {
         assertTrue(resp.isAccepted());
         assertTrue(resp.getOmsOrderId() > 0);
         verify(clusterClient).submitOrder(any(OrderSubmission.class));
+    }
+
+    @Test
+    void acceptedStopHasADurableIntentBeforeTheResponse() {
+        var repository = mock(com.openexchange.oms.persistence.PostgresOrderRepository.class);
+        orderService.setRepositories(repository, null);
+        var snapshots = new java.util.ArrayList<OmsOrderStatus>();
+        doAnswer(call -> { snapshots.add(((OmsOrder) call.getArgument(0)).getStatus()); return null; })
+                .when(repository).saveOrder(any());
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(1000000));
+        var req = createStopTriggerBuyRequest(1, 1, "STOP_LIMIT", 1, 50900);
+        req.setPrice(FixedPoint.fromDouble(51500));
+        var response = orderService.createOrder(req);
+        assertTrue(response.isAccepted());
+        assertTrue(snapshots.contains(OmsOrderStatus.PENDING_RISK), "intent before hold");
+        assertEquals(OmsOrderStatus.PENDING_TRIGGER, snapshots.getLast(), "recoverable accepted stop");
+    }
+
+    @Test
+    void intentWriteFailureCannotReachHoldOrMatchingEngine() {
+        var repository = mock(com.openexchange.oms.persistence.PostgresOrderRepository.class);
+        orderService.setRepositories(repository, null);
+        doThrow(new com.openexchange.oms.persistence.PersistenceException("PG unavailable", new RuntimeException()))
+                .when(repository).saveOrder(any());
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(1000000));
+        var request = createLimitBuyRequest(1, 1, 50000, 1);
+        assertThrows(RuntimeException.class, () -> orderService.createOrder(request));
+        assertEquals(0, balanceStore.getLocked(1, 0));
+        verify(clusterClient, never()).submitOrder(any());
     }
 
     @Test
@@ -691,6 +785,7 @@ class OmsOrderServiceImplTest {
 
     @Test
     void testQueryOrdersTerminalStatusWithoutPersistenceIsEmpty() {
+        orderService.setRepositories(null, null);
         // Terminal statuses never live in the active map; without Postgres the
         // query degrades to the pre-oms#40 behavior (empty), not an error.
         assertTrue(orderService.queryOrders(1L, "FILLED").isEmpty());

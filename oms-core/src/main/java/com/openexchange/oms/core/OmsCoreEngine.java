@@ -42,9 +42,8 @@ public class OmsCoreEngine {
     private static final long RECONCILE_RETRY_MS = 3_000;   // between retry rounds
     private static final int RECONCILE_MAX_ROUNDS = 10;     // bound — a re-cancel lost during leader
                                                             // stabilization is retried until it lands
-    // Replace-pending fallback (oms#67): an amend whose egress is entirely lost is aborted
-    // after this long and handed to membership repair. Comfortably above the engine
-    // round-trip, below anything a user would notice as a wedged order.
+    // Mark an unacknowledged replace unresolved after this interval. A timeout
+    // does not prove an abort and cannot authorize rollback of its hold.
     private static final long REPLACE_PENDING_TIMEOUT_MS = 10_000;
 
     public OmsCoreEngine(OrderLifecycleManager lifecycleManager, SyntheticOrderEngine syntheticEngine) {
@@ -256,22 +255,18 @@ public class OmsCoreEngine {
             }
         }
 
-        // Replace timeout fallback (oms#67): lost egress must not wedge an order in
-        // replace-pending forever. Abort the marker (releases the incremental hold; the
-        // order keeps its original values) and request an open-orders snapshot so
-        // membership repair trues up whichever leg actually survived on the cluster.
-        ArrayList<OmsOrder> timedOutReplaces = new ArrayList<>();
+        // A lost acknowledgement leaves the replace outcome UNKNOWN. A timeout cannot
+        // authorize rolling back the extra hold: the new leg may already be live.
+        java.util.concurrent.atomic.AtomicBoolean timedOutReplace = new java.util.concurrent.atomic.AtomicBoolean();
         lifecycleManager.forEachActiveOrder(order -> {
             if (order.isReplacePending()
                     && nowMs - order.getReplaceRequestedAtMs() > REPLACE_PENDING_TIMEOUT_MS) {
-                timedOutReplaces.add(order);
+                unresolvedOrderIds.add(order.getOmsOrderId());
+                timedOutReplace.set(true);
             }
         });
-        for (OmsOrder order : timedOutReplaces) {
-            lifecycleManager.abortReplace(order, "replace timed out awaiting egress");
-        }
-        if (!timedOutReplaces.isEmpty()) {
-            requestOpenOrdersSnapshot(nowMs, "replace-pending timeout");
+        if (timedOutReplace.get()) {
+            requestOpenOrdersSnapshot(nowMs, "replace outcome requires recovery");
         }
 
         // Collect expired GTD orders (cannot modify map during iteration)
@@ -285,17 +280,23 @@ public class OmsCoreEngine {
         });
 
         for (long omsOrderId : expiredIds) {
-            OmsOrder order = lifecycleManager.onExpired(omsOrderId);
-            if (order != null) {
-                // Cancel the order on the cluster if it was submitted
+            OmsOrder order = lifecycleManager.getOrder(omsOrderId);
+            if (order == null) continue;
+            if (order.getStatus() == OmsOrderStatus.PENDING_TRIGGER) {
+                // Dormant synthetic parent: no ME leg has been submitted.
+                OmsOrder expired = lifecycleManager.onExpired(omsOrderId);
+                if (expired != null && persistenceHandler != null) persistenceHandler.persistOrderUpdate(expired);
+            } else {
+                // Expiry requests cancellation; only the authoritative outcome closes a
+                // submitted order. In particular do not unlock while the cancel is in flight.
+                lifecycleManager.onCancelRequested(omsOrderId);
                 if (order.getClusterOrderId() != 0 && clusterSubmitHandler != null) {
-                    clusterSubmitHandler.submitCancel(order.getClusterOrderId(),
-                            order.getUserId(), order.getMarketId());
+                    clusterSubmitHandler.submitCancel(order.getClusterOrderId(), order.getUserId(), order.getMarketId());
+                } else {
+                    unresolvedOrderIds.add(omsOrderId);
+                    requestOpenOrdersSnapshot(nowMs, "GTD awaiting cluster order identity");
                 }
-                if (persistenceHandler != null) {
-                    persistenceHandler.persistOrderUpdate(order);
-                }
-                log.info("GTD order expired: omsOrderId={}", omsOrderId);
+                if (persistenceHandler != null) persistenceHandler.persistOrderUpdate(order);
             }
         }
     }
@@ -370,7 +371,7 @@ public class OmsCoreEngine {
         return found[0];
     }
 
-    /** Delegate an OpenOrdersSnapshot request to the cluster (match#31). */
+    /** Request a fresh positive membership view; it cannot supply terminal history. */
     public void requestOpenOrdersSnapshot(long requestId, String reason) {
         if (clusterSubmitHandler != null) {
             log.info("Requesting open-orders snapshot: requestId={} reason={}", requestId, reason);
@@ -379,144 +380,55 @@ public class OmsCoreEngine {
     }
 
     /**
-     * Membership repair (match#31 / oms#34): terminalize OMS-active orders the
-     * cluster no longer has open. Their terminal statuses were lost on the wire
-     * (publisher drops / batch shed / switchover seams) — the 14.05% divergence
-     * measured by the P1.5 gate. Terminalizing through onClusterOrderStatus
-     * reuses the normal paths, so holds are released and the per-user
-     * open-order slot is freed (the oms#34 leak).
-     *
-     * Race guards: only orders with clusterOrderId BELOW the snapshot's orderId
-     * cutoff are eligible (created-after-snapshot orders are legitimately
-     * absent), and clusterOrderId-less orders are only reconciled by omsOrderId
-     * when older than ORPHAN_MIN_AGE_MS at request time.
-     * Fills already settled via TradeExecution decide FILLED vs CANCELLED.
-     *
-     * clusterOrderId-less repair covers every submitted-to-cluster state, not
-     * just PENDING_NEW (oms#53): when the ack carrying the clusterOrderId is
-     * lost at a seam but TradeExecutions still arrive (matched by omsOrderId),
-     * the order sits NEW/PARTIALLY_FILLED with cid=0 — invisible to the
-     * clusterOrderId membership check and previously outside the orphan path,
-     * i.e. a permanent zombie that resurrected on every startup rebuild. Such
-     * an order still open on the cluster (snapshot carries its omsOrderId) is
-     * RE-LINKED by adopting the snapshot's clusterOrderId; one the cluster no
-     * longer has open is terminalized like any other lost order.
+     * Positive membership can restore a lost cluster-id link. Absence has no terminal
+     * semantics: a filled order and a cancelled order are both absent. Such orders
+     * remain unresolved until their durable outcome is replayed; age is not proof.
      */
     public int reconcileAgainstOpenOrders(org.agrona.collections.LongHashSet clusterOpenOrderIds,
                                           org.agrona.collections.Long2LongHashMap clusterOmsToClusterId,
                                           long snapshotMaxOrderId, long requestTimeMs) {
-        // Retain the cluster-open omsOrderId set for the orphan-hold reconciler: a hold whose
-        // omsOrderId is OPEN ON THE CLUSTER but has no OMS record is a crash-lost resting order —
-        // it must be SURFACED, never released (its fills are still coming via the settlement feed).
         final org.agrona.collections.LongHashSet openOms =
                 new org.agrona.collections.LongHashSet(clusterOmsToClusterId.size());
-        for (final long omsId : clusterOmsToClusterId.keySet()) {
-            openOms.add(omsId);
-        }
-        this.lastClusterOpenOmsOrderIds = openOms;
-        ArrayList<OmsOrder> toTerminalize = new ArrayList<>();
+        for (final long id : clusterOmsToClusterId.keySet()) openOms.add(id);
+        lastClusterOpenOmsOrderIds = openOms;
         ArrayList<OmsOrder> toRelink = new ArrayList<>();
         lifecycleManager.forEachActiveOrder(order -> {
-            OmsOrderStatus st = order.getStatus();
-            if (st == OmsOrderStatus.PENDING_TRIGGER) {
-                return; // synthetic parent: legitimately not on the cluster book
-            }
+            OmsOrderStatus status = order.getStatus();
+            if (status == OmsOrderStatus.PENDING_TRIGGER || status == OmsOrderStatus.PENDING_RISK
+                    || status == OmsOrderStatus.PENDING_HOLD) return;
             long cid = order.getClusterOrderId();
-            if (order.isReplacePending()) {
-                // Cancel-and-replace in flight (oms#67): the stored cid is the old (cancelled)
-                // leg — or 0 mid-swap — so the plain not-in-snapshot check would wrongly
-                // terminalize a healthy amend. The new leg carries the same omsOrderId, so
-                // consult the snapshot by omsOrderId: present under a different cid ⇒ the
-                // new-leg egress was lost, resolve; present under the stored cid ⇒ the amend
-                // has not applied yet, leave it to the replace timeout; absent ⇒ both legs
-                // gone, terminalize once clearly past the leg-swap window.
-                if (clusterOmsToClusterId.containsKey(order.getOmsOrderId())) {
-                    if (clusterOmsToClusterId.get(order.getOmsOrderId()) != cid) {
-                        toRelink.add(order);
-                    }
-                } else if (requestTimeMs - order.getReplaceRequestedAtMs() > ORPHAN_MIN_AGE_MS) {
-                    toTerminalize.add(order);
-                }
-                return;
-            }
-            if (cid != 0) {
-                if (cid < snapshotMaxOrderId && !clusterOpenOrderIds.contains(cid)) {
-                    // MONEY-A: a vanished order left the book via a FILL or a CANCEL. Terminalizing a
-                    // fully-filled order is always safe (→ FILLED releases no hold). But if it only
-                    // looks PARTIALLY filled, the missing quantity may be a fill the lossless
-                    // TradeExecution stream has not delivered yet — this repair is frequently
-                    // gap-triggered, so filledQty can be stale. Marking such an order CANCELLED here
-                    // releases a hold the cluster already consumed, and the late fill's settlement then
-                    // double-debits `locked`, leaving it permanently short of the user's open exposure.
-                    // Defer the release-bearing (not-fully-filled) case until fill activity has been
-                    // quiet for ORPHAN_MIN_AGE_MS: by then a real fill has arrived (→ FILLED, no
-                    // release) or the order was genuinely cancelled (→ CANCELLED, release is correct).
-                    boolean fullyFilled = order.getFilledQty() >= order.getQuantity();
-                    if (fullyFilled || requestTimeMs - order.getUpdatedAtMs() > ORPHAN_MIN_AGE_MS) {
-                        toTerminalize.add(order);
-                    }
-                }
-            } else if ((st == OmsOrderStatus.PENDING_NEW || st == OmsOrderStatus.NEW
-                    || st == OmsOrderStatus.PARTIALLY_FILLED)
-                    && requestTimeMs - order.getCreatedAtMs() > ORPHAN_MIN_AGE_MS) {
-                // PENDING_RISK/PENDING_HOLD stay out: pre-cluster admission states.
-                if (clusterOmsToClusterId.containsKey(order.getOmsOrderId())) {
+            if (clusterOmsToClusterId.containsKey(order.getOmsOrderId())) {
+                long observedCid = clusterOmsToClusterId.get(order.getOmsOrderId());
+                if (cid == 0 || (order.isReplacePending() && observedCid != cid)) {
                     toRelink.add(order);
-                } else {
-                    toTerminalize.add(order);
                 }
+                if (!order.isReplacePending() || observedCid != cid) unresolvedOrderIds.remove(order.getOmsOrderId());
+            } else if ((cid != 0 && cid < snapshotMaxOrderId && !clusterOpenOrderIds.contains(cid))
+                    || (cid == 0 && requestTimeMs - order.getCreatedAtMs() > ORPHAN_MIN_AGE_MS)) {
+                // An open-order snapshot has no terminal history. Keep the order and hold
+                // intact until durable trade/terminal recovery resolves this absence.
+                unresolvedOrderIds.add(order.getOmsOrderId());
             }
         });
         for (OmsOrder order : toRelink) {
-            long clusterOrderId = clusterOmsToClusterId.get(order.getOmsOrderId());
+            long cid = clusterOmsToClusterId.get(order.getOmsOrderId());
             if (order.isReplacePending()) {
-                log.warn("Membership repair: resolving replace for omsOrderId={} to clusterOrderId={} "
-                        + "(new-leg egress lost)", order.getOmsOrderId(), clusterOrderId);
-                lifecycleManager.resolveReplaceFromReconcile(order.getOmsOrderId(), clusterOrderId);
+                lifecycleManager.resolveReplaceFromReconcile(order.getOmsOrderId(), cid);
             } else {
-                log.warn("Membership repair: re-linking open order omsOrderId={} to clusterOrderId={} "
-                        + "(ack lost, order still open on cluster)", order.getOmsOrderId(), clusterOrderId);
-                lifecycleManager.onSentToCluster(order.getOmsOrderId(), clusterOrderId);
+                lifecycleManager.onSentToCluster(order.getOmsOrderId(), cid);
             }
-            if (persistenceHandler != null) {
-                persistenceHandler.persistOrderUpdate(order);
-            }
+            if (persistenceHandler != null) persistenceHandler.persistOrderUpdate(order);
         }
-        for (OmsOrder order : toTerminalize) {
-            // A replace-pending order reaching this point has BOTH legs missing from the
-            // snapshot: release the incremental hold and clear the marker first, or the
-            // pending guard in onClusterOrderStatus would swallow the repair (oms#67).
-            lifecycleManager.abortReplace(order, "membership repair: both replace legs gone");
-            boolean fullyFilled = order.getFilledQty() >= order.getQuantity();
-            log.warn("Membership repair: terminalizing lost order omsOrderId={} clusterOrderId={} "
-                            + "filled={}/{} as {}",
-                    order.getOmsOrderId(), order.getClusterOrderId(),
-                    order.getFilledQty(), order.getQuantity(),
-                    fullyFilled ? "FILLED" : "CANCELLED");
-            OmsOrder repaired = lifecycleManager.onClusterOrderStatus(
-                    order.getOmsOrderId(), order.getClusterOrderId(),
-                    fullyFilled ? 2 : 3, // cluster raw status: FILLED : CANCELLED
-                    fullyFilled ? 0L : order.getRemainingQty(), order.getFilledQty());
-            // Persist the repair: this path bypasses onOrderStatus (which persists),
-            // and unpersisted repairs would resurrect on the next startup rebuild
-            // (oms#35) and be re-repaired forever.
-            if (repaired != null && persistenceHandler != null) {
-                persistenceHandler.persistOrderUpdate(repaired);
-            }
-        }
-        if (!toTerminalize.isEmpty()) {
-            log.info("Membership repair terminalized {} lost order(s)", toTerminalize.size());
-        }
-        totalRepairedOrders += toTerminalize.size();
         totalRelinkedOrders += toRelink.size();
-        // Post-reconcile audit hook (oms#49): lifecycle state is freshly trued
-        // up against the cluster here, making this the right moment to
-        // rebaseline derived bookkeeping (risk open-order slot counts) that
-        // can drift when status transitions are dropped at switchover seams.
-        if (postReconcileHook != null) {
-            postReconcileHook.run();
-        }
-        return toTerminalize.size();
+        if (postReconcileHook != null) postReconcileHook.run();
+        return 0; // No terminal state was invented from negative evidence.
+    }
+
+    private final java.util.Set<Long> unresolvedOrderIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    public int getUnresolvedOrderCount() {
+        unresolvedOrderIds.removeIf(id -> lifecycleManager.getOrder(id) == null);
+        return unresolvedOrderIds.size();
     }
 
     /** Cluster-open omsOrderIds from the LAST membership reconcile (volatile immutable copy). */

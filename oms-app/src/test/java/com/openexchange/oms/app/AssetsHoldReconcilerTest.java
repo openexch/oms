@@ -25,13 +25,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * Pins the money-critical orphan-hold contract: the reconciler releases ONLY a provably-never-submitted
- * hold (2a unknown / 2b known-pre-cluster / 2c terminal-never-reached-cluster), gated on the 60s age
- * gate AND two consecutive sweeps, and SURFACES (never sweeps) anything that reached the cluster or is
- * otherwise unprovable. No cluster boot: a real {@link AeronAssetsBalanceStore} over a scripted fake
- * transport, a real {@link OrderLifecycleManager}, a fake PG lookup, and an adjustable clock.
- */
+/** Snapshot discrepancies remain observable but never authorize money movement. */
 class AssetsHoldReconcilerTest {
 
     private static final int ASSET = 0;
@@ -194,18 +188,18 @@ class AssetsHoldReconcilerTest {
     }
 
     @Test
-    void unknownOrderPastAgeGateIsEligible() {
+    void unknownOrderPastAgeGateIsSurfaced() {
         long id = idAtMs(baseMs);
         clock.set(baseMs + 120_000); // 120s old
-        assertEquals(AssetsHoldReconciler.Kind.ELIGIBLE, classifyNow(id)); // 2a
+        assertEquals(AssetsHoldReconciler.Kind.SURFACE, classifyNow(id)); // 2a
     }
 
     @Test
-    void knownPreClusterAgedIsEligible_2b() {
+    void knownPreClusterAgedIsSurfaced() {
         long id = idAtMs(baseMs);
         pg.put(id, order(id, OmsOrderStatus.PENDING_NEW, 0, baseMs));
         clock.set(baseMs + 120_000);
-        assertEquals(AssetsHoldReconciler.Kind.ELIGIBLE, classifyNow(id)); // 2b
+        assertEquals(AssetsHoldReconciler.Kind.SURFACE, classifyNow(id)); // 2b
     }
 
     @Test
@@ -233,11 +227,11 @@ class AssetsHoldReconcilerTest {
     }
 
     @Test
-    void terminalWithoutClusterOrderIdAgedIsEligible_2c() {
+    void terminalWithoutClusterOrderIdAgedIsSurfaced() {
         long id = idAtMs(baseMs);
         pg.put(id, order(id, OmsOrderStatus.REJECTED, 0, baseMs)); // pre-cluster reject
         clock.set(baseMs + 120_000);
-        assertEquals(AssetsHoldReconciler.Kind.ELIGIBLE, classifyNow(id)); // 2c
+        assertEquals(AssetsHoldReconciler.Kind.SURFACE, classifyNow(id)); // 2c
     }
 
     @Test
@@ -252,24 +246,14 @@ class AssetsHoldReconcilerTest {
     // ==================== two-sweep gate + release-through-store ====================
 
     @Test
-    void eligibleOrphanReleasesOnlyOnTheSecondSweep() {
-        long id = idAtMs(baseMs);
-        clock.set(baseMs + 120_000);
-        List<AssetsHoldReconciler.HoldEntry> snap = List.of(hold(id));
-
-        reconciler.processSnapshot(snap);                  // 1st observation -> candidate, no release
-        assertEquals(0, transport.releases.size());
-        assertEquals(0, reconciler.getOrphanReleasesTotal());
-        assertEquals(1, reconciler.getUnresolvedOrphansLastSweep());
-
-        reconciler.processSnapshot(snap);                  // 2nd observation -> RELEASE
-        assertEquals(1, transport.releases.size());
-        long[] r = transport.releases.get(0);
-        assertEquals(id, r[0]);
-        assertEquals(USER, r[1]);
-        assertEquals(-1L, r[2]);                           // full-residual sentinel via releaseAll
-        assertEquals(1, reconciler.getOrphanReleasesTotal());
-        assertEquals(0, reconciler.getUnresolvedOrphansLastSweep());
+    void repeatedUnknownHoldNeverBecomesReleaseAuthority() {
+        long id = idAtMs(baseMs); clock.set(baseMs + 120000);
+        for (int i = 0; i < 5; i++) {
+            reconciler.processSnapshot(List.of(hold(id)));
+            assertEquals(0, transport.releases.size());
+            assertEquals(0, reconciler.getOrphanReleasesTotal());
+            assertEquals(1, reconciler.getUnresolvedOrphansLastSweep());
+        }
     }
 
     @Test
@@ -292,22 +276,14 @@ class AssetsHoldReconcilerTest {
     }
 
     @Test
-    void youngUnknownIsHeldAcrossSweepsThenReleasesOnceAged() {
+    void agingUnknownHoldDoesNotAuthorizeRelease() {
         long id = idAtMs(baseMs);
-        clock.set(baseMs + 5_000); // young
-        List<AssetsHoldReconciler.HoldEntry> snap = List.of(hold(id));
-
-        reconciler.processSnapshot(snap); // PENDING (age) -> not a candidate
-        reconciler.processSnapshot(snap); // still young -> still not eligible, never released
-        assertEquals(0, transport.releases.size());
-        assertEquals(1, reconciler.getUnresolvedOrphansLastSweep());
-
-        clock.set(baseMs + 120_000);      // now aged
-        reconciler.processSnapshot(snap); // 1st ELIGIBLE observation -> candidate
-        assertEquals(0, transport.releases.size());
-        reconciler.processSnapshot(snap); // 2nd ELIGIBLE observation -> RELEASE
-        assertEquals(1, transport.releases.size());
-        assertEquals(1, reconciler.getOrphanReleasesTotal());
+        for (long elapsed : new long[]{5000, 120000, 240000}) {
+            clock.set(baseMs + elapsed);
+            reconciler.processSnapshot(List.of(hold(id)));
+            assertEquals(0, transport.releases.size());
+            assertEquals(1, reconciler.getUnresolvedOrphansLastSweep());
+        }
     }
 
     @Test
@@ -342,25 +318,14 @@ class AssetsHoldReconcilerTest {
     // ==================== end-to-end wiring: forwarding seam + projection gate ====================
 
     @Test
-    void endToEndSweepForwardsSnapshotAndReleasesThroughTheStore() throws Exception {
-        reconciler.start();                    // attaches the store's hold-snapshot forwarding seam
+    void endToEndSweepForwardsSnapshotWithoutChangingFunds() throws Exception {
+        reconciler.start();
         try {
-            makeProjectionReady();
-            long id = idAtMs(baseMs);
-            clock.set(baseMs + 120_000);
-
-            driveSweep(id);                    // 1st sweep -> candidate
-            awaitUnresolved(1);
-            assertEquals(0, reconciler.getOrphanReleasesTotal());
-
-            driveSweep(id);                    // 2nd sweep -> release via store.releaseAll
-            awaitReleases(1);
-            long[] r = transport.releases.get(0);
-            assertEquals(id, r[0]);
-            assertEquals(-1L, r[2]);
-        } finally {
-            reconciler.stop();
-        }
+            makeProjectionReady(); long id = idAtMs(baseMs); clock.set(baseMs + 120000);
+            for (int i = 1; i <= 2; i++) { driveSweep(id); awaitProcessed(i); }
+            assertEquals(1, reconciler.getUnresolvedOrphansLastSweep());
+            assertEquals(0, transport.releases.size());
+        } finally { reconciler.stop(); }
     }
 
     @Test
@@ -405,9 +370,9 @@ class AssetsHoldReconcilerTest {
                     awaitUnresolved(1); // ONLY the money-bearing hold was classified
                 }
             }
-            awaitReleases(1);
-            assertEquals(moneyId, transport.releases.get(0)[0]);
-            assertEquals(1, transport.releases.size()); // the tombstone never released
+            awaitProcessed(2);
+            assertEquals(1, reconciler.getUnresolvedOrphansLastSweep());
+            assertEquals(0, transport.releases.size());
         } finally {
             reconciler.stop();
         }
@@ -432,15 +397,15 @@ class AssetsHoldReconcilerTest {
         assertEquals(expected, reconciler.getUnresolvedOrphansLastSweep());
     }
 
-    private void awaitReleases(long expected) throws InterruptedException {
+    private void awaitProcessed(long expected) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 2_000;
         while (System.currentTimeMillis() < deadline) {
-            if (reconciler.getOrphanReleasesTotal() == expected) {
+            if (reconciler.getProcessedSnapshots() == expected) {
                 return;
             }
             Thread.sleep(5);
         }
-        assertEquals(expected, reconciler.getOrphanReleasesTotal());
+        assertEquals(expected, reconciler.getProcessedSnapshots());
     }
 
     @Test

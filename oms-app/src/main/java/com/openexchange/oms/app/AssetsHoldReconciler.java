@@ -13,10 +13,8 @@ import org.slf4j.LoggerFactory;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
@@ -25,82 +23,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Q3 orphan-hold reconciler for the Assets Engine (AE) money store.
- *
- * <h2>The orphan</h2>
- * <p>When the OMS crashes (or the AE session dies with the outcome unknown) between the AE
- * {@code HoldAck} and the cluster {@code CreateOrder} submit, a hold lives on in the AE with no live
- * order anywhere. The AE cannot expire it — it has NO hold TTL by design (a timer expiry would race
- * an in-flight fill and release funds a settle is about to draw). So the OMS must find such orphans
- * and release them. The {@link AeronAssetsBalanceStore} timeout compensator is the first line of
- * defence; this reconciler is the backstop for the cases the compensator could not enqueue or that
- * outlived a whole process restart.</p>
- *
- * <h2>The hazard (why the release predicate is deliberately tight)</h2>
- * <p>Releasing a hold whose order might still receive fills makes a later ME-journal settle draw
- * from a hold that is already gone: a {@code SettleFault}. That is survivable since D5, but it is a
- * wrong money posture, so the predicate releases <b>only a provably-never-submitted hold</b>. Every
- * hold that cannot be proven never-submitted is surfaced (WARN + a gauge), never swept — a human
- * decides.</p>
- *
- * <h2>The contract — release IFF ALL of</h2>
- * <ol>
- *   <li>The OMS has NO active (non-terminal) order with that omsOrderId in the
- *       {@link OrderLifecycleManager}; AND</li>
- *   <li>EITHER
- *     <ul>
- *       <li>(a) the OMS has NO record of the order at all (not in the lifecycle map, not in the PG
- *           {@code orders} table) — the crash-before-persist case; OR</li>
- *       <li>(b) the order IS known and provably never reached the cluster: {@code clusterOrderId==0}
- *           AND a pre-cluster status ({@code PENDING_RISK}/{@code PENDING_HOLD}/{@code PENDING_NEW})
- *           AND it is past the age gate (so it is not still inside the submit path); OR</li>
- *       <li>(c) the order is known and TERMINAL in the OMS with zero fills possible: terminal AND
- *           {@code clusterOrderId} was never assigned; AND</li>
- *     </ul></li>
- *   <li>Age gate: the order (or, when unknown, the omsOrderId's own Snowflake timestamp) is at least
- *       {@value #MIN_AGE_MS} ms old; AND</li>
- *   <li>The same orphan was observed release-eligible in TWO consecutive sweeps (the candidate set is
- *       kept between sweeps; the release fires on the second observation).</li>
- * </ol>
- *
- * <h2>Persist-vs-submit ordering (verified in code — bears on case 2a)</h2>
- * <p>{@code OmsOrderServiceImpl.createOrder} does the AE hold (step 4) and then
- * {@code clusterClient.submitOrder} (step 6); it never writes the order to Postgres inline.
- * Persistence is <b>egress-driven and asynchronous</b>: {@code persistOrderUpdate} is only ever
- * called from {@code OmsCoreEngine} on cluster egress (the first {@code OrderStatus}=NEW ack, a
- * {@code TradeExecution} fill, GTD expiry, or membership repair). The pre-cluster lifecycle
- * transitions (PENDING_RISK -&gt; PENDING_HOLD -&gt; PENDING_NEW) route only through the state
- * listener (WS/gRPC push + hold release), which does not persist. Consequences:</p>
- * <ul>
- *   <li>An order's FIRST Postgres row appears strictly AFTER the submit, when the cluster's NEW
- *       egress is processed. So "no PG record" (case 2a) spans BOTH the intended crash-before-submit
- *       window AND a residual crash-after-submit-before-first-egress-persist window in which the
- *       order MAY have reached the cluster.</li>
- *   <li>A genuinely pre-cluster order (PENDING_RISK/HOLD/NEW with {@code clusterOrderId==0}) is,
- *       in the current codebase, essentially never in Postgres — so cases 2b and 2c via PG are
- *       largely defensive/forward-looking. They DO fire for a terminal straggler still in the
- *       lifecycle map, and for any future change that persists pre-cluster rows.</li>
- * </ul>
- * <p>The residual 2a window is mitigated (not eliminated) by: the 60s age gate, the two-sweep
- * confirmation, and the initial sweep running only AFTER the startup ME open-orders reconcile has
- * had its chance to re-link ack-lost orders. It is surfaced here and left for the design owner to
- * decide whether to add a cluster-open-orders cross-check; the reconciler does not widen the
- * predicate past the contract on its own.</p>
- *
- * <h2>omsOrderId generation (verified — enables the unknown-order age gate)</h2>
- * <p>omsOrderIds come from {@link SnowflakeIdGenerator}: a 41-bit millisecond timestamp in the high
- * bits. {@link SnowflakeIdGenerator#timestampMillis(long)} recovers the creation time, so a hold
- * whose order the OMS has no record of can still be age-gated by its own id.</p>
- *
- * <h2>Threading</h2>
- * <p>{@link #sweep()} runs on this reconciler's single-threaded scheduler and only ISSUES a hold
- * snapshot request (non-blocking). The AE answers on the {@code oms-assets-poll} thread, which feeds
- * {@link #onHoldSnapshotEntry} (cheap accumulation only) and {@link #onHoldSnapshotEnd}. To keep the
- * poll thread free of JDBC and iteration, {@code onHoldSnapshotEnd} hands the accumulated entries
- * back to the scheduler thread, where classification (including PG lookups), the two-sweep
- * bookkeeping, and the {@code releaseAll} calls all run. Releases go through
- * {@link AeronAssetsBalanceStore#releaseAll} (idempotent; double-release-safe with the settlement
- * feed).</p>
+ * Read-only hold discrepancy detector. Neither a missing intent nor a missing ME
+ * open-order entry proves that a hold is releasable. Age and repeated snapshots
+ * do not strengthen that proof. Financial repair belongs to the durable command
+ * owner / settlement feed, which can establish the actual submission outcome.
+ * Snapshot ingestion stays on the poll thread; PG lookups run on the scheduler.
  */
 public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
 
@@ -134,8 +61,6 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
     enum Kind {
         /** A live (non-terminal) OMS order holds these funds legitimately — not an orphan. */
         ACTIVE_LEGIT,
-        /** Passes contract conditions 1-3: subject to the two-sweep gate before release. */
-        ELIGIBLE,
         /** Cannot be proven never-submitted (reached the cluster / ambiguous): surfaced for a human. */
         SURFACE,
         /** An orphan that is not yet release-eligible for a benign reason (inside the age gate). */
@@ -164,10 +89,13 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
 
     /** Orphans that were release-eligible in the PREVIOUS sweep. Touched only on the scheduler thread
      *  (in {@link #processSnapshot}), so a plain field reassignment is safe. */
-    private Set<Long> priorCandidates = new HashSet<>();
 
     // ---- metrics (read by the /metrics scrape thread) ----
     private final AtomicLong sweepsTotal = new AtomicLong();
+    private final AtomicLong processedSnapshots = new AtomicLong();
+
+    public long getProcessedSnapshots() { return processedSnapshots.get(); }
+
     private final AtomicLong orphanReleasesTotal = new AtomicLong();
     private volatile long unresolvedOrphansLastSweep;
 
@@ -304,9 +232,7 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
 
     void processSnapshot(final List<HoldEntry> entries) {
         final long now = clock.millis();
-        final Set<Long> newCandidates = new HashSet<>();
         long unresolved = 0;
-        long released = 0;
         long activeLegit = 0;
         // The steady-state classes (SURFACE/PENDING/first-observation) are AGGREGATED: with a
         // large orphan backlog the old per-hold line logged every orphan every sweep — 13M+
@@ -315,7 +241,6 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
         // each one is a money-state action that must be individually auditable).
         long surfaced = 0;
         long pending = 0;
-        long firstObservations = 0;
         final Map<String, Long> unresolvedByReason = new HashMap<>();
 
         for (HoldEntry h : entries) {
@@ -326,35 +251,6 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
                     if (log.isDebugEnabled()) {
                         log.debug("Hold backed by a live order (skip): orderId={} user={} asset={} remaining={}",
                                 h.orderId(), h.userId(), h.assetId(), h.remaining());
-                    }
-                }
-                case ELIGIBLE -> {
-                    if (priorCandidates.contains(h.orderId())) {
-                        // Second consecutive eligible observation -> release.
-                        final boolean enqueued = store.releaseAll(h.userId(), h.assetId(), h.orderId());
-                        if (enqueued) {
-                            orphanReleasesTotal.incrementAndGet();
-                            released++;
-                            log.warn("Orphan hold RELEASED (provably never submitted): orderId={} user={} "
-                                            + "asset={} remaining={} reason={}",
-                                    h.orderId(), h.userId(), h.assetId(), h.remaining(), d.reason());
-                        } else {
-                            // Release could not be enqueued (back-pressure): keep it confirmed and retry.
-                            newCandidates.add(h.orderId());
-                            unresolved++;
-                            log.warn("Orphan hold release back-pressured; will retry next sweep: orderId={} reason={}",
-                                    h.orderId(), d.reason());
-                        }
-                    } else {
-                        // First eligible observation -> hold as a candidate for the next sweep.
-                        newCandidates.add(h.orderId());
-                        unresolved++;
-                        firstObservations++;
-                        if (firstObservations <= LOG_EXEMPLARS_PER_SWEEP) {
-                            log.info("Orphan hold candidate (1st confirmed observation, releases next sweep if "
-                                            + "still present): orderId={} user={} asset={} remaining={} reason={}",
-                                    h.orderId(), h.userId(), h.assetId(), h.remaining(), d.reason());
-                        }
                     }
                 }
                 case SURFACE -> {
@@ -379,14 +275,10 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
             }
         }
 
-        this.priorCandidates = newCandidates;
         this.unresolvedOrphansLastSweep = unresolved;
-        log.info("Orphan-hold sweep processed {} holds: {} live, {} released, {} unresolved "
-                        + "({} surfaced, {} pending, {} first-observations; exemplars capped at {}/class), "
-                        + "{} candidates carried; surfaced by reason: {}",
-                entries.size(), activeLegit, released, unresolved,
-                surfaced, pending, firstObservations, LOG_EXEMPLARS_PER_SWEEP,
-                newCandidates.size(), unresolvedByReason);
+        processedSnapshots.incrementAndGet();
+        log.info("Hold discrepancy scan: {} holds, {} live, {} unresolved ({} surfaced, {} pending); reasons={}",
+                entries.size(), activeLegit, unresolved, surfaced, pending, unresolvedByReason);
     }
 
     /**
@@ -431,30 +323,29 @@ public final class AssetsHoldReconciler implements HoldSnapshotConsumer {
         }
 
         if (known == null) {
-            // Contract 2(a): NO record at all. See class doc on the persist-after-submit residual.
+            // Submission may have happened before the missing record was persisted.
             if (!snowflakeAgeOk(h.orderId(), now)) {
                 return new Decision(Kind.PENDING, "unknown order younger than the age gate "
                         + "(CreateOrder may still be in flight)");
             }
-            return new Decision(Kind.ELIGIBLE, "no OMS record (2a: crash-before-persist)");
+            return new Decision(Kind.SURFACE, "missing intent: submission outcome is unknown");
         }
 
         // known && clusterOrderId == 0.
         if (st != null && st.isTerminal()) {
-            // Contract 2(c): terminal AND cluster order never assigned => zero fills possible.
+            // A missing cluster id can also be a lost acknowledgement.
             if (!orderAgeOk(known, now)) {
                 return new Decision(Kind.PENDING, "terminal pre-cluster order younger than the age gate");
             }
-            return new Decision(Kind.ELIGIBLE, "terminal, cluster order never assigned (2c)");
+            return new Decision(Kind.SURFACE, "terminal with no cluster id: missing ack is not abort proof");
         }
         if (isPreClusterClass(st)) {
-            // Contract 2(b): known, provably pre-cluster, cluster order never assigned. The age gate
-            // stands in for "not currently in the submit path".
+            // Persisted stage can lag a completed external action.
             if (!orderAgeOk(known, now)) {
                 return new Decision(Kind.PENDING, "pre-cluster order younger than the age gate "
                         + "(may still be in the submit path)");
             }
-            return new Decision(Kind.ELIGIBLE, "known pre-cluster (" + st + "), cluster order never assigned (2b)");
+            return new Decision(Kind.SURFACE, "unresolved intent (" + st + "): age is not abort proof");
         }
 
         // known, clusterOrderId == 0, but a post-cluster status (NEW/PARTIALLY_FILLED) or a synthetic

@@ -7,7 +7,7 @@
     <parent>
         <groupId>com.openexchange.oms</groupId>
         <artifactId>order-management</artifactId>
-        <version>1.0-runtime.20260927.r00b.g56e719e</version>
+        <version>1.0-runtime.20260928.r02pc1</version>
     </parent>
 
     <artifactId>oms-assets-client</artifactId>

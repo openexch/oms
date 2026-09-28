@@ -51,6 +51,37 @@ public class OmsOrderServiceImpl implements OrderService {
     // fallbacks. Null when the OMS runs without persistence.
     private com.openexchange.oms.persistence.PostgresOrderRepository orderRepository;
     private com.openexchange.oms.persistence.PostgresExecutionRepository executionRepository;
+    private volatile boolean persistenceHealthy = true;
+    private java.util.function.BooleanSupplier persistenceAvailable = () -> true;
+
+    public void setPersistenceAvailability(java.util.function.BooleanSupplier available) {
+        this.persistenceAvailable = Objects.requireNonNull(available);
+    }
+    // Bounded locks cover registration, durable intent, external action and response.
+    // Locking only the client-id index permits a duplicate to observe an uncommitted intent.
+    private final Object[] admissionLocks = java.util.stream.IntStream.range(0, 256)
+            .mapToObj(i -> new Object()).toArray();
+    private com.openexchange.oms.persistence.PostgresOrderRequestRepository requestRepository;
+
+    public void setRequestRepository(com.openexchange.oms.persistence.PostgresOrderRequestRepository repository) {
+        this.requestRepository = repository;
+    }
+
+    /** A failed write leaves the external action's recovery state uncertain. */
+    private void persistAdmission(OmsOrder order) {
+        try {
+            if (orderRepository == null) throw new IllegalStateException("Durable order repository is required");
+            orderRepository.saveOrder(order);
+        } catch (RuntimeException e) {
+            persistenceHealthy = false;
+            throw new IllegalStateException("Durable order storage unavailable; recovery required", e);
+        }
+    }
+
+    public boolean isAdmissionReady() {
+        return persistenceHealthy && persistenceAvailable.getAsBoolean() && orderRepository != null
+                && coreEngine.getUnresolvedOrderCount() == 0;
+    }
 
     public void setRepositories(com.openexchange.oms.persistence.PostgresOrderRepository orderRepository,
                                 com.openexchange.oms.persistence.PostgresExecutionRepository executionRepository) {
@@ -86,6 +117,56 @@ public class OmsOrderServiceImpl implements OrderService {
 
     @Override
     public CreateOrderResponse createOrder(CreateOrderRequest request) {
+        String requestId = request.getRequestId();
+        if (requestId != null && (requestId.isBlank() || requestId.length() > 128)) {
+            return CreateOrderResponse.rejected("requestId must contain 1 to 128 characters");
+        }
+        Object key = request.getClientOrderId() != null ? request.getClientOrderId() : requestId;
+        int stripe = Math.floorMod(Objects.hash(request.getUserId(), key), admissionLocks.length);
+        synchronized (admissionLocks[stripe]) {
+            if (requestId == null) return createOrderOnce(request, idGenerator.nextId());
+            if (requestRepository == null) throw new IllegalStateException("Durable request repository unavailable");
+            String hash = OrderRequestFingerprint.hash(request);
+            try {
+                var previous = requestRepository.find(request.getUserId(), requestId);
+                if (previous != null) return replayRequest(previous, hash);
+                if (!isAdmissionReady()) throw new IllegalStateException("Order admission requires recovery");
+                var claim = requestRepository.claim(request.getUserId(), requestId, hash, idGenerator.nextId());
+                if (!claim.created()) return replayRequest(claim.entry(), hash);
+                var response = createOrderOnce(request, claim.entry().omsOrderId());
+                requestRepository.complete(request.getUserId(), requestId,
+                        new com.openexchange.oms.persistence.PostgresOrderRequestRepository.Entry(
+                                response.getOmsOrderId(), hash, response.isAccepted(),
+                                response.getStatus(), response.getRejectReason()));
+                return response;
+            } catch (com.openexchange.oms.persistence.PersistenceException e) {
+                persistenceHealthy = false;
+                throw new IllegalStateException("Durable request storage unavailable; retry with the same requestId", e);
+            }
+        }
+    }
+
+    private CreateOrderResponse replayRequest(
+            com.openexchange.oms.persistence.PostgresOrderRequestRepository.Entry entry, String hash) {
+        if (!entry.requestHash().equals(hash)) {
+            return CreateOrderResponse.rejected("requestId already belongs to a different request");
+        }
+        if (!entry.complete()) {
+            throw new IllegalStateException("Request outcome unresolved; retain requestId until recovery completes");
+        }
+        var response = new CreateOrderResponse();
+        response.setAccepted(entry.accepted());
+        response.setOmsOrderId(entry.omsOrderId());
+        response.setStatus(entry.status());
+        response.setRejectReason(entry.rejectReason());
+        response.setDuplicate(true);
+        return response;
+    }
+
+    private CreateOrderResponse createOrderOnce(CreateOrderRequest request, long proposedOrderId) {
+        if (!isAdmissionReady()) {
+            throw new IllegalStateException("Order admission unavailable: persistence or outcome recovery required");
+        }
         try {
             // Validate
             if (request.getUserId() <= 0) {
@@ -121,7 +202,7 @@ public class OmsOrderServiceImpl implements OrderService {
 
             // Create OMS order
             OmsOrder order = new OmsOrder();
-            order.setOmsOrderId(idGenerator.nextId());
+            order.setOmsOrderId(proposedOrderId);
             order.setUserId(request.getUserId());
             order.setMarketId(request.getMarketId());
             order.setSide(side);
@@ -154,7 +235,12 @@ public class OmsOrderServiceImpl implements OrderService {
 
             // 1. Register with lifecycle manager → PENDING_RISK
             OrderLifecycleManager lcm = coreEngine.getLifecycleManager();
-            lcm.registerOrder(order);
+            OmsOrder registered = lcm.registerOrder(order);
+            if (registered != order) {
+                return CreateOrderResponse.duplicate(registered.getOmsOrderId(), registered.getStatus().name());
+            }
+            // Persist the accepted command intent before any hold or ME submission.
+            persistAdmission(order);
 
             // 2. Risk check
             long riskStart = System.nanoTime();
@@ -167,6 +253,7 @@ public class OmsOrderServiceImpl implements OrderService {
 
             if (!riskResult.isPassed()) {
                 lcm.onRiskRejected(order.getOmsOrderId(), riskResult.getRejectReason());
+                persistAdmission(order);
                 return CreateOrderResponse.rejected(riskResult.getRejectReason());
             }
 
@@ -187,6 +274,7 @@ public class OmsOrderServiceImpl implements OrderService {
                 long bestAsk = marketDataProvider.getBestAsk(order.getMarketId());
                 if (bestAsk <= 0) {
                     lcm.onHoldFailed(order.getOmsOrderId(), "No liquidity (no best ask)");
+                    persistAdmission(order);
                     return CreateOrderResponse.rejected("No liquidity available for market buy");
                 }
                 // Use best ask with slippage buffer as the estimated price for holding
@@ -195,6 +283,7 @@ public class OmsOrderServiceImpl implements OrderService {
             }
 
             // 4. Place ledger hold
+            persistAdmission(order); // PENDING_HOLD: a crash after this point may have placed a hold.
             long holdStart = System.nanoTime();
             boolean holdPlaced = ledgerService.holdForOrder(order);
             if (ledgerHoldTimer != null) {
@@ -202,11 +291,13 @@ public class OmsOrderServiceImpl implements OrderService {
             }
             if (!holdPlaced) {
                 lcm.onHoldFailed(order.getOmsOrderId(), "Insufficient balance");
+                persistAdmission(order);
                 return CreateOrderResponse.rejected("Insufficient balance");
             }
 
             // 5. Hold placed → PENDING_NEW
             lcm.onHoldPlaced(order.getOmsOrderId());
+            persistAdmission(order); // PENDING_NEW: a lost send acknowledgement remains unresolved.
 
             // 6. Synthetic orders go to PENDING_TRIGGER — EXCEPT icebergs.
             //
@@ -245,6 +336,7 @@ public class OmsOrderServiceImpl implements OrderService {
                     // releases the hold/slot AND drops the iceberg from the synthetic engine
                     // (OmsApplication's terminal cleanup) — so no explicit removeOrder here.
                     lcm.onSubmitFailed(order.getOmsOrderId(), "Order queue full");
+                    persistAdmission(order);
                     return CreateOrderResponse.rejected("Order queue full");
                 }
                 return CreateOrderResponse.accepted(order.getOmsOrderId(), order.getStatus().name());
@@ -252,6 +344,7 @@ public class OmsOrderServiceImpl implements OrderService {
 
             if (orderType.isSynthetic()) {
                 lcm.onPendingTrigger(order.getOmsOrderId());
+                persistAdmission(order); // Commit before arming the trigger or returning success.
                 coreEngine.getSyntheticEngine().registerOrder(order);
                 return CreateOrderResponse.accepted(order.getOmsOrderId(), order.getStatus().name());
             }
@@ -274,6 +367,7 @@ public class OmsOrderServiceImpl implements OrderService {
                 // Releasing here too double-releases the hold, which can succeed against the
                 // user's OTHER locked funds — money creation. This is the double-release trap.
                 lcm.onSubmitFailed(order.getOmsOrderId(), "Order queue full");
+                persistAdmission(order);
                 return CreateOrderResponse.rejected("Order queue full");
             }
 
@@ -340,6 +434,7 @@ public class OmsOrderServiceImpl implements OrderService {
 
     @Override
     public Map<String, Object> updateOrder(long omsOrderId, long newPrice, long newQuantity) {
+        if (!isAdmissionReady()) throw new IllegalStateException("Order amendment requires persistence/outcome recovery");
         OrderLifecycleManager lcm = coreEngine.getLifecycleManager();
         OmsOrder order = lcm.getOrder(omsOrderId);
         if (order == null) {

@@ -18,16 +18,9 @@ import java.util.List;
  * Positions replay from the persisted executions aggregate. Balances need no
  * rebuild (Redis-backed, survives restart).
  *
- * Orders that never reached the cluster pipeline (PENDING_RISK/PENDING_HOLD:
- * the restart interrupted them before a hold or submission existed) are NOT
- * restored — there is nothing to repair against; their Postgres rows remain
- * as history.
- *
- * The rebuild runs BEFORE the cluster client connects, so the P1.2
- * open-orders-snapshot reconciliation then trues the restored set up against
- * cluster reality: orders the cluster no longer knows are terminalized through
- * the normal path (holds + slots released), and restored clusterOrderId-less
- * PENDING_NEW rows age out via the orphan guard.
+ * A persisted PENDING_HOLD can precede a successful external reservation whose
+ * acknowledgement was lost. Pre-cluster intents therefore block startup until
+ * explicit recovery; skipping them would erase an unresolved liability.
  */
 public final class StartupStateRebuilder {
 
@@ -48,17 +41,16 @@ public final class StartupStateRebuilder {
             SyntheticOrderEngine syntheticEngine,
             RiskEngine riskEngine) {
 
+        for (OmsOrder order : openOrders) {
+            if (order.getStatus() == OmsOrderStatus.PENDING_RISK || order.getStatus() == OmsOrderStatus.PENDING_HOLD) {
+                throw new IllegalStateException("Unresolved durable admission intent: " + order.getOmsOrderId());
+            }
+        }
         int restored = 0;
         int skipped = 0;
         int synthetics = 0;
 
         for (OmsOrder order : openOrders) {
-            OmsOrderStatus status = order.getStatus();
-            if (status == OmsOrderStatus.PENDING_RISK || status == OmsOrderStatus.PENDING_HOLD) {
-                skipped++;
-                continue;
-            }
-
             lifecycleManager.restoreOrder(order);
             riskEngine.onOrderOpened(order.getUserId());
             restored++;

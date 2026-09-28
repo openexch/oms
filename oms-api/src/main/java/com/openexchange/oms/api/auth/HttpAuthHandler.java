@@ -80,7 +80,7 @@ public final class HttpAuthHandler extends ChannelInboundHandlerAdapter {
         // work without credentials. Never proxy it publicly (docs/deploy-tls.md).
         // The auth endpoints are how credentials are OBTAINED (demo mode), so
         // they are necessarily reachable without a token.
-        return path.equals("/api/v1/health") || path.equals("/metrics")
+        return path.equals("/api/v1/health") || path.equals("/ready") || path.equals("/api/v1/ready") || path.equals("/metrics")
                 || path.equals("/api/v1/auth/register") || path.equals("/api/v1/auth/login");
     }
 

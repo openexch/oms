@@ -75,6 +75,7 @@ public class OmsApplication {
     private AssetsHoldReconciler assetsHoldReconciler;
     /** The CQRS balance read-model writer (E6); set when PG is present. */
     private PgBalanceReadModelWriter balanceReadModelWriter;
+    private java.util.concurrent.ScheduledExecutorService persistenceProbeScheduler;
 
     public static void main(String[] args) {
         OmsApplication app = new OmsApplication();
@@ -100,7 +101,7 @@ public class OmsApplication {
         log.info("Configuration loaded: httpPort={}, grpcPort={}, nodeId={}",
                 config.httpPort(), config.grpcPort(), config.nodeId());
 
-        // 1b. Initialize PostgreSQL connection pool (optional — degrades gracefully)
+        // 1b. Durable admission and recovery require PostgreSQL.
         HikariDataSource dataSource = null;
         PostgresOrderRepository orderRepo = null;
         PostgresExecutionRepository executionRepo = null;
@@ -119,7 +120,7 @@ public class OmsApplication {
             userRepo = new PostgresUserRepository(dataSource); // demo accounts (V002__users.sql)
             log.info("PostgreSQL persistence initialized: {}", config.postgresUrl());
         } catch (Exception e) {
-            log.warn("PostgreSQL not available — running without persistence: {}", e.getMessage());
+            throw new IllegalStateException("PostgreSQL required for durable order admission and recovery", e);
         }
 
         // 2. Balance store: the Assets Engine cluster is the money authority (v0.4).
@@ -214,8 +215,7 @@ public class OmsApplication {
                 log.info("Risk config restored from PG: {} markets loaded, {} manual circuit-breaker "
                         + "trips re-armed", restored.marketsLoaded(), restored.tripsRearmed());
             } catch (Exception e) {
-                log.warn("Risk config load failed (running on hardcoded defaults until the next "
-                        + "admin update): {}", e.toString());
+                throw new IllegalStateException("Risk config recovery failed; admission remains closed", e);
             }
         } else {
             log.warn("PostgreSQL not configured: risk config is not durable");
@@ -334,9 +334,7 @@ public class OmsApplication {
                         orderRepo.findAllOpenOrders(), executionRepo.aggregatePositions(),
                         lifecycleManager, syntheticEngine, riskEngine);
             } catch (Exception e) {
-                log.error("State rebuild from Postgres failed — starting with empty state "
-                        + "(open orders will be repaired by the cluster snapshot reconcile; "
-                        + "positions stay unknown until fills arrive)", e);
+                throw new IllegalStateException("Order/position recovery failed; admission remains closed", e);
             }
         } else {
             log.warn("Postgres unavailable — skipping startup state rebuild (oms#35)");
@@ -452,7 +450,21 @@ public class OmsApplication {
                 coreEngine, riskEngine, ledgerService, clusterClient,
                 balanceStore, egressAdapter, idGenerator, marketDataProvider);
         orderServiceImpl.setMeterRegistry(meterRegistry);
-        orderServiceImpl.setRepositories(orderRepo, executionRepo); // history reads (oms#40)
+        orderServiceImpl.setRepositories(orderRepo, executionRepo);
+        if (dataSource != null) orderServiceImpl.setRequestRepository(
+                new com.openexchange.oms.persistence.PostgresOrderRequestRepository(dataSource));
+        final HikariDataSource probeDataSource = dataSource;
+        var persistenceAvailability = new PersistenceAvailability(() -> {
+            try (var connection = probeDataSource.getConnection()) {
+                return connection.isValid(2);
+            } catch (java.sql.SQLException e) { return false; }
+        });
+        orderServiceImpl.setPersistenceAvailability(persistenceAvailability);
+        persistenceProbeScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "oms-persistence-probe"); t.setDaemon(true); return t;
+        });
+        persistenceProbeScheduler.scheduleWithFixedDelay(persistenceAvailability, 0, 1,
+                java.util.concurrent.TimeUnit.SECONDS);
         OrderService orderService = orderServiceImpl;
 
         // 12a. Auth seam (oms#36): provider per OMS_AUTH_MODE
@@ -462,6 +474,10 @@ public class OmsApplication {
         AuthenticationProvider authProvider = buildAuthProvider(config, demoAuthService);
 
         // 12b. Operational gauges (oms#38)
+        Gauge.builder("oms_admission_ready", orderService, s -> s.isAdmissionReady() ? 1 : 0)
+                .register(meterRegistry);
+        Gauge.builder("oms_unresolved_order_outcomes", coreEngine, OmsCoreEngine::getUnresolvedOrderCount)
+                .register(meterRegistry);
         Gauge.builder("oms_active_orders", orderService, OrderService::getActiveOrderCount)
                 .description("Orders active in the OMS lifecycle").register(meterRegistry);
         Gauge.builder("oms_ws_connections", wsHandler, WebSocketHandler::getConnectionCount)
@@ -743,6 +759,7 @@ public class OmsApplication {
     }
 
     public void stop() {
+        if (persistenceProbeScheduler != null) persistenceProbeScheduler.shutdownNow();
         log.info("Stopping OMS Application...");
 
         if (grpcServer != null) {

@@ -4,8 +4,6 @@ package com.openexchange.oms.app;
 import com.openexchange.oms.risk.RiskConfigManager;
 import com.openexchange.oms.risk.RiskConfigStore;
 import com.openexchange.oms.risk.RiskEngine;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 
@@ -18,7 +16,6 @@ import java.util.Map;
  */
 final class RiskConfigBootstrap {
 
-    private static final Logger log = LoggerFactory.getLogger(RiskConfigBootstrap.class);
 
     record Result(int marketsLoaded, int tripsRearmed) {
     }
@@ -36,19 +33,15 @@ final class RiskConfigBootstrap {
                 configManager.updateConfig(marketId, e.getValue().config());
                 markets++;
             } catch (RuntimeException ex) {
-                // A corrupt or out-of-range row must not take boot down; that market
-                // simply runs on defaults until the next admin update.
-                log.warn("Skipping stored risk config for market {}: {}", marketId, ex.toString());
+                throw new IllegalStateException("Cannot restore risk config for market " + marketId, ex);
             }
-            // Re-arm independently of the config merge: a corrupt config document must
-            // not silently drop an operator's halt on the market.
+            // Restore the halt before admission. Any failure aborts the rebuild.
             if (e.getValue().manualTrip()) {
                 try {
                     riskEngine.tripCircuitBreakerManual(marketId);
                     trips++;
                 } catch (RuntimeException ex) {
-                    log.warn("Cannot re-arm manual circuit-breaker trip for market {}: {}",
-                            marketId, ex.toString());
+                    throw new IllegalStateException("Cannot restore market halt for market " + marketId, ex);
                 }
             }
         }

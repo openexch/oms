@@ -42,6 +42,9 @@ public interface OrderService {
 
     boolean isClusterConnected();
 
+    /** Durable admission and outcome recovery are healthy. */
+    default boolean isAdmissionReady() { return false; }
+
     int getActiveOrderCount();
 
     /**

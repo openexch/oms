@@ -113,6 +113,7 @@ class Phase1AmendLedgerGuardrailTest {
         orderService = new OmsOrderServiceImpl(
                 coreEngine, riskEngine, ledgerService, clusterClient,
                 balanceStore, egressAdapter, idGenerator, marketDataProvider);
+        orderService.setRepositories(mock(com.openexchange.oms.persistence.PostgresOrderRepository.class), null);
 
         // Terminal hold-release + amend hooks, wired exactly as OmsApplication does.
         lcm.setStateListener((order, oldStatus, newStatus) -> {

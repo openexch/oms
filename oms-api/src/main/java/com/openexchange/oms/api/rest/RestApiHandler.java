@@ -160,6 +160,11 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         try {
             if (uri.equals("/metrics") && method == HttpMethod.GET) {
                 handleMetrics(rc);
+            } else if ((uri.equals("/ready") || uri.equals("/api/v1/ready")) && method == HttpMethod.GET) {
+                boolean ready = orderService.isAdmissionReady() && orderService.isClusterConnected()
+                        && !Boolean.FALSE.equals(orderService.isAssetsProjectionReady());
+                sendResponse(rc, ready ? HttpResponseStatus.OK : HttpResponseStatus.SERVICE_UNAVAILABLE,
+                        "{\"ready\":" + ready + "}");
             } else if (uri.equals("/api/v1/health") && method == HttpMethod.GET) {
                 handleHealth(rc);
             } else if (uri.equals("/api/v1/auth/register") && method == HttpMethod.POST) {
@@ -406,6 +411,7 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
         health.put("status", "ok");
         health.put("clusterConnected", orderService.isClusterConnected());
         health.put("activeOrders", orderService.getActiveOrderCount());
+        health.put("admissionReady", orderService.isAdmissionReady());
         // E3/E4: only present when an AE-backed balance store is active (null otherwise).
         Boolean assetsProjectionReady = orderService.isAssetsProjectionReady();
         if (assetsProjectionReady != null) {
@@ -445,7 +451,13 @@ public class RestApiHandler extends SimpleChannelInboundHandler<FullHttpRequest>
             return;
         }
 
-        CreateOrderResponse resp = orderService.createOrder(req);
+        CreateOrderResponse resp;
+        try {
+            resp = orderService.createOrder(req);
+        } catch (IllegalStateException e) {
+            sendError(rc, HttpResponseStatus.SERVICE_UNAVAILABLE, ERR_UNAVAILABLE, e.getMessage());
+            return;
+        }
 
         // Reject reasons are a small fixed set (risk enum + admission strings).
         Counter.builder("oms_orders_total")

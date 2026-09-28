@@ -35,6 +35,8 @@ message CreateOrderRequest {
     string display_quantity = 10;
     int64 expires_at_ms = 11;
     string client_order_id = 12;
+    // Durable retry identity, scoped to the authenticated user; never reuse for a new order.
+    string request_id = 13;
 }
 
 message CreateOrderResponse {

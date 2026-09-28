@@ -31,6 +31,12 @@ public class CreateOrderRequest {
     private long displayQuantity;
     private long expiresAtMs;
     private String clientOrderId; // User-supplied idempotency key
+    // Durable retry identity, scoped to the authenticated user. Unlike clientOrderId,
+    // this key remains reserved after the order becomes terminal.
+    private String requestId; // Durable retry identity, independent of reusable clientOrderId
+
+    public String getRequestId() { return requestId; }
+    public void setRequestId(String requestId) { this.requestId = requestId; }
 
     public long getUserId() { return userId; }
     public void setUserId(long userId) { this.userId = userId; }
