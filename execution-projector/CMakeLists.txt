@@ -84,7 +84,7 @@ enable_testing()
 
 add_executable(projector-store-test tests/store_test.cpp)
 target_link_libraries(projector-store-test PRIVATE oe_projection)
-target_compile_definitions(projector-store-test PRIVATE OE_PROJECTOR_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/schema/projector.sql")
+target_compile_definitions(projector-store-test PRIVATE OE_WRITER_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/../oms-persistence/src/main/resources/db/migration/V007__execution_writer_ownership.sql" OE_PROJECTOR_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/schema/projector.sql")
 add_test(NAME projector-store COMMAND projector-store-test)
 set_tests_properties(projector-store PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 

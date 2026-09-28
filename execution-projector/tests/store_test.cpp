@@ -67,6 +67,13 @@ int main() {
                 "user_id bigint, market_id int, side text, price bigint, quantity bigint, is_maker boolean, executed_at timestamptz)");
             std::ifstream input(OE_PROJECTOR_SCHEMA); std::string sql((std::istreambuf_iterator<char>(input)), {});
             check(!sql.empty(), "Missing schema"); db.sql(sql);
+            std::ifstream ownership(OE_WRITER_SCHEMA);
+            std::string fenceSql((std::istreambuf_iterator<char>(ownership)), {});
+            check(!fenceSql.empty(), "Missing writer ownership migration"); db.sql(fenceSql);
+            rejects([&] { oe::Store premature(scoped, "test-generation", "recording-0"); },
+                    "Archive worker started while legacy still owned executions");
+            db.sql("SELECT transition_execution_writer('legacy',1,'paused','test quiesce'); "
+                   "SELECT transition_execution_writer('paused',2,'archive','test activation')");
             db.sql("CREATE FUNCTION fail_maker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.is_maker THEN "
                    "RAISE EXCEPTION 'injected'; END IF; RETURN NEW; END $$; "
                    "CREATE TRIGGER injected BEFORE INSERT ON executions FOR EACH ROW EXECUTE FUNCTION fail_maker()");
@@ -103,6 +110,13 @@ int main() {
             auto end = terminal(); restarted.apply(std::span(&end, 1));
             check(db.scalar("SELECT count(*) FROM execution_journal_terminals") == 1, "Terminal lost");
             check(db.scalar("SELECT count(*) FROM executions") == 2, "Terminal changed execution count");
+            db.sql("SELECT transition_execution_writer('archive',3,'paused','test pause')");
+            rejects([&] { restarted.probe(); }, "Idle worker ignored revoked ownership");
+            auto lateTerminal = terminal(); lateTerminal.position = 352;
+            rejects([&] { restarted.apply(std::span(&lateTerminal, 1)); }, "Terminal batch ignored revoked ownership");
+            check(db.scalar("SELECT position FROM execution_projector_checkpoint") == 256, "Revoked writer advanced checkpoint");
+            db.sql("SELECT transition_execution_writer('paused',4,'archive','test reactivate')");
+            rejects([&] { restarted.probe(); }, "Stale epoch resumed after reactivation");
         }
         rejects([&] { oe::Store wrong(scoped, "different-generation", "recording-0"); }, "Generation fence failed");
         rejects([&] { oe::Store wrong(scoped, "test-generation", "different-recording"); }, "Recording fence failed");

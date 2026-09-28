@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: Apache-2.0
--- Apply with OMS execution writes stopped. Conflicting legacy duplicates must
+-- Apply with OMS execution writes stopped and V007 ownership migration installed. Conflicting legacy duplicates must
 -- be investigated; this migration deliberately fails instead of deleting them.
 BEGIN;
 CREATE UNIQUE INDEX IF NOT EXISTS executions_trade_leg ON executions(trade_id, is_maker);

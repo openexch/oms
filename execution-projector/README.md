@@ -42,8 +42,9 @@ integration PASS. HTTP tests exercise actual loopback probes.
 
 ## Run
 
-Apply `schema/projector.sql` explicitly with `psql -v ON_ERROR_STOP=1` after
-stopping the legacy execution writer. The migration rejects conflicting
+Stop OMS admission and the legacy execution writer. Apply
+`../oms-persistence/src/main/resources/db/migration/V007__execution_writer_ownership.sql`
+and `schema/projector.sql` explicitly with `psql -v ON_ERROR_STOP=1`. The migration rejects conflicting
 legacy duplicate legs instead of deleting history. The existing `orders`
 table and its durable intents are required; the worker does not invent them.
 
@@ -78,10 +79,37 @@ after three seconds.
 
 ## Integration boundary
 
-The legacy OMS execution callback is still present. Do not run it concurrently
-against the same execution table: the PostgreSQL advisory lock fences C++
-projectors, not legacy Java writers. Current Archive repair tests use an
-isolated database with the OMS writer stopped.
+The database now fences legacy writers, including binaries unaware of this
+protocol. `execution_writer_ownership` starts as `legacy` at epoch 1. Handoffs
+must pass through `paused`; that state rejects every execution mutation. The
+transition locks the ownership row until commit, so it cannot overtake an
+in-flight execution write. Use the expected owner/epoch and a concrete audit
+reason with `transition_execution_writer`; stale operator commands fail.
+
+The Archive worker starts only with owner `archive`. It pins the epoch in its
+connection, validates it on every batch and idle probe, and retains the separate
+advisory lock excluding a second C++ worker. Pausing or changing epoch fences
+both execution writes and checkpoint-only/terminal batches. Re-enabling archive
+ownership never revives an old worker epoch.
+
+For an isolated installation starting at epoch 1, the explicit transition is:
+
+```sql
+SELECT transition_execution_writer('legacy', 1, 'paused', 'legacy process stopped; writes drained');
+SELECT transition_execution_writer('paused', 2, 'archive', 'verified recording and replay boundary');
+```
+
+Read the actual owner/epoch before any later transition. Rollback first stops
+admission and the worker, transitions `archive -> paused`, verifies the exact
+committed cursor and both-leg economic equality, and restores a compatible OMS
+recovery state. Only then may `paused -> legacy` re-enable writes. Retain all
+repaired executions, journal rows and checkpoints; do not rewind financial
+state. The transition function records every successful ownership change.
+
+The current legacy OMS startup deliberately refuses `paused` or `archive`
+ownership. Its durable outcome consumer must be completed before enabling OMS
+admission after a production cutover. Current Archive repair tests perform the
+ownership transitions only in an isolated schema.
 
 Production writer cutover still requires durable OMS outcome/risk recovery,
 history freshness exposure, recording rotation/retention integration, and the

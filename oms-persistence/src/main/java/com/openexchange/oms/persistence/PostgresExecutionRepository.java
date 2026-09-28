@@ -62,6 +62,20 @@ public class PostgresExecutionRepository {
         this.dataSource = dataSource;
     }
 
+    /** The legacy OMS cannot boot against a table transferred to the Archive worker. */
+    public void requireLegacyWriterOwnership() {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT owner FROM execution_writer_ownership WHERE consumer='executions'");
+             ResultSet rs = ps.executeQuery()) {
+            if (!rs.next() || !"legacy".equals(rs.getString(1))) {
+                throw new PersistenceException("Legacy execution writer is fenced; durable consumer activation required");
+            }
+        } catch (SQLException e) {
+            throw new PersistenceException("Execution ownership migration/verification required", e);
+        }
+    }
+
     /**
      * Persists a single execution report.
      */

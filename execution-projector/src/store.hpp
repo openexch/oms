@@ -15,11 +15,12 @@ public:
     Store& operator=(const Store&) = delete;
     std::int64_t position() const { return position_; }
     void apply(std::span<const Event> batch);
-    void probe() { query("SELECT 1"); }
+    void probe();
 private:
     PGconn* db_{};
     std::string source_;
-    std::int64_t position_{}, trade_{};
+    std::int64_t position_{}, trade_{}, writerEpoch_{};
+    void checkOwnership(bool lock);
     Result query(const char* sql, const std::vector<std::string>& values = {});
     void leg(const Journal& j, bool maker);
 };

@@ -25,6 +25,13 @@ Store::Store(const std::string& conninfo, std::string source, std::string descri
         query("SET statement_timeout='5s'"); query("SET lock_timeout='2s'");
         auto lock = query("SELECT pg_try_advisory_lock(1751474543, 1702390115)");
         if (std::string(PQgetvalue(lock.get(), 0, 0)) != "t") throw std::runtime_error("Execution writer already active");
+        auto owner = query("SELECT epoch FROM execution_writer_ownership WHERE consumer='executions' AND owner='archive'");
+        if (PQntuples(owner.get()) != 1) throw std::runtime_error("Execution writer ownership is not archive");
+        writerEpoch_ = std::stoll(PQgetvalue(owner.get(), 0, 0));
+        query("SELECT set_config('oe.execution_writer','archive',false), "
+              "set_config('oe.execution_writer_epoch',$1,false)", {n(writerEpoch_)});
+        // Constructor checkpoint creation also needs the ownership row lock.
+        query("BEGIN"); checkOwnership(true);
         query("INSERT INTO execution_projector_checkpoint(consumer,source_identity,recording_descriptor,position) "
               "VALUES ('executions',$1,$2,0) ON CONFLICT(consumer) DO NOTHING", {source_, descriptor});
         auto r = query("SELECT source_identity,recording_descriptor,position,last_trade_id "
@@ -32,9 +39,19 @@ Store::Store(const std::string& conninfo, std::string source, std::string descri
         if (PQntuples(r.get()) != 1 || source_ != PQgetvalue(r.get(), 0, 0) || descriptor != PQgetvalue(r.get(), 0, 1))
             throw std::runtime_error("Source/recording fence mismatch; explicit recovery required");
         position_ = std::stoll(PQgetvalue(r.get(), 0, 2)); trade_ = std::stoll(PQgetvalue(r.get(), 0, 3));
+        query("COMMIT");
     } catch (...) { PQfinish(db_); db_ = nullptr; throw; }
 }
 Store::~Store() { if (db_) PQfinish(db_); }
+
+void Store::checkOwnership(bool lock) {
+    auto owner = query(lock
+            ? "SELECT epoch FROM execution_writer_ownership WHERE consumer='executions' AND owner='archive' AND epoch=$1 FOR SHARE"
+            : "SELECT epoch FROM execution_writer_ownership WHERE consumer='executions' AND owner='archive' AND epoch=$1",
+            {n(writerEpoch_)});
+    if (PQntuples(owner.get()) != 1) throw std::runtime_error("Execution writer owner/epoch changed; recovery required");
+}
+void Store::probe() { checkOwnership(false); }
 
 void Store::leg(const Journal& j, bool maker) {
     const bool buy = maker ? !j.sideOrStatus : j.sideOrStatus;
@@ -57,6 +74,7 @@ void Store::apply(std::span<const Event> batch) {
     query("BEGIN");
     auto nextPosition = position_, nextTrade = trade_;
     try {
+        checkOwnership(true);
         auto fence = query("SELECT position FROM execution_projector_checkpoint WHERE consumer='executions' FOR UPDATE");
         if (std::stoll(PQgetvalue(fence.get(), 0, 0)) != position_) throw std::runtime_error("Checkpoint changed externally");
         for (const auto& event : batch) {

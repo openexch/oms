@@ -117,6 +117,7 @@ public class OmsApplication {
             dataSource = new HikariDataSource(hikariConfig);
             orderRepo = new PostgresOrderRepository(dataSource);
             executionRepo = new PostgresExecutionRepository(dataSource);
+            executionRepo.requireLegacyWriterOwnership();
             userRepo = new PostgresUserRepository(dataSource); // demo accounts (V002__users.sql)
             log.info("PostgreSQL persistence initialized: {}", config.postgresUrl());
         } catch (Exception e) {
@@ -315,7 +316,8 @@ public class OmsApplication {
                     } catch (Exception retry) {
                         failure = retry;
                     }
-                    log.error("Failed to persist execution: tradeId={}", report.getTradeId(), failure);
+                    coreEngine.markDurableStateFailed();
+                    throw new IllegalStateException("Execution persistence failed; admission closed", failure);
                 }
             }
         });

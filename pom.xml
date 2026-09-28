@@ -6,7 +6,7 @@
 
     <groupId>com.openexchange.oms</groupId>
     <artifactId>order-management</artifactId>
-    <version>1.0-runtime.20260928.r02pc2</version>
+    <version>1.0-runtime.20260928.r02pc3</version>
     <packaging>pom</packaging>
 
     <name>Order Management System</name>
