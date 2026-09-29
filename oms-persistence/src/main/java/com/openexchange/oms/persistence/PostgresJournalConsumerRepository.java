@@ -21,8 +21,18 @@ public final class PostgresJournalConsumerRepository implements JournalConsumerS
         return readCheckpoint("SELECT source_identity,position,last_trade_id FROM oms_journal_consumer_checkpoint WHERE consumer='oms-live'");
     }
 
-    @Override public Optional<Checkpoint> projectorCheckpoint() {
-        return readCheckpoint("SELECT source_identity,position,last_trade_id FROM execution_projector_checkpoint WHERE consumer='executions'");
+    @Override public Optional<ProjectorStatus> projectorStatus() {
+        try (Connection c = dataSource.getConnection(); PreparedStatement p = c.prepareStatement("""
+                SELECT source_identity,position,last_trade_id,observed_target,
+                       COALESCE(NOW()-observed_at < interval '3 seconds', false)
+                FROM execution_projector_checkpoint WHERE consumer='executions'""");
+             ResultSet rows = p.executeQuery()) {
+            if (!rows.next()) return Optional.empty();
+            return Optional.of(new ProjectorStatus(new Checkpoint(rows.getString(1), rows.getLong(2), rows.getLong(3)),
+                    rows.getLong(4), rows.getBoolean(5)));
+        } catch (SQLException e) {
+            throw new PersistenceException("Cannot read projector status", e);
+        }
     }
 
     private Optional<Checkpoint> readCheckpoint(String sql) {

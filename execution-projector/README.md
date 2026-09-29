@@ -77,6 +77,12 @@ events, readiness, and failure. Database probes continue on idle recordings.
 The high-water mark is refreshed every second; stale observations fail ready
 after three seconds.
 
+For consumers on other hosts the worker also writes the recorded journal end it
+last observed and the database time of that observation (`observed_target`,
+`observed_at` on `execution_projector_checkpoint`) after every batch and idle
+probe, under the same ownership fence. The OMS journal consumer compares
+`observed_at` with the database clock, so no host clock is trusted.
+
 ## Integration boundary
 
 The database now fences legacy writers, including binaries unaware of this

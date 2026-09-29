@@ -42,6 +42,7 @@ void writeLoop(Queue& q, oe::Store& store) {
                 }
             }
             if (batch.empty()) store.probe(); else store.apply(batch);
+            store.observe(std::max(q.target.load(), store.position()));
             q.committed.store(store.position());
             q.queued.fetch_sub(static_cast<std::int64_t>(batch.size()));
             q.databaseMs.store(oe::monotonicMs());

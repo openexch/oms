@@ -34,6 +34,7 @@ public final class JournalOutcomeConsumer implements Runnable {
 
     static final int BATCH = 256;
     static final long FRESHNESS_NS = 3_000_000_000L;
+    static final long MAX_LAG_BYTES = 1L << 20;
     private static final int JOURNAL_SCHEMA = 3, JOURNAL_VERSION = 1;
     private static final int TEMPLATE_TRADE = 1, TEMPLATE_TERMINAL = 2, TEMPLATE_COMMAND_OUTCOME = 28;
 
@@ -96,12 +97,13 @@ public final class JournalOutcomeConsumer implements Runnable {
     }
 
     private void step() {
-        Optional<Checkpoint> projector = store.projectorCheckpoint();
+        Optional<JournalConsumerStore.ProjectorStatus> status = store.projectorStatus();
         observedAtNs = System.nanoTime();
-        if (projector.isEmpty()) {
+        if (status.isEmpty()) {
             caughtUp = false; // nothing proves the projector has covered the journal
             return;
         }
+        Optional<Checkpoint> projector = Optional.of(status.get().checkpoint());
         String source = projector.get().source();
         if (checkpoint.isPresent() && !checkpoint.get().source().equals(source)) {
             fail("projector source changed from " + checkpoint.get().source() + " to " + source);
@@ -111,7 +113,7 @@ public final class JournalOutcomeConsumer implements Runnable {
         long lastTrade = checkpoint.map(Checkpoint::lastTradeId).orElse(0L);
         List<Event> events = store.eventsAfter(source, from, BATCH);
         if (events.isEmpty()) {
-            caughtUp = from >= projector.get().position();
+            caughtUp = withinBound(status.get(), from);
             return;
         }
 
@@ -161,7 +163,7 @@ public final class JournalOutcomeConsumer implements Runnable {
             fail(stop);
             return;
         }
-        caughtUp = lastPosition >= projector.get().position();
+        caughtUp = withinBound(status.get(), lastPosition);
     }
 
     private boolean applyAndCommit(List<Planned> plan, Checkpoint next) {
@@ -210,6 +212,18 @@ public final class JournalOutcomeConsumer implements Runnable {
             coreEngine.getSyntheticEngine().onIcebergSliceFilled(id);
         }
         return true;
+    }
+
+    /**
+     * Admission barrier: the projector is live (database-clock freshness) and within a bounded lag of
+     * the recorded journal, and this consumer is within the same bound of the projector. A bound, not
+     * equality, so steady traffic does not flap admission; a stalled projector closes it.
+     */
+    private static boolean withinBound(JournalConsumerStore.ProjectorStatus status, long consumerPosition) {
+        long projectorPosition = status.checkpoint().position();
+        return status.fresh()
+                && status.observedTarget() - projectorPosition <= MAX_LAG_BYTES
+                && projectorPosition - consumerPosition <= MAX_LAG_BYTES;
     }
 
     private static void withMonitors(List<OmsOrder> orders, int index, Runnable body) {

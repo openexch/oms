@@ -24,8 +24,13 @@ public interface JournalConsumerStore {
     /** Absent only before the first commit of a fresh installation. */
     Optional<Checkpoint> loadCheckpoint();
 
-    /** The projector's committed checkpoint, or empty before the projector has committed anything. */
-    Optional<Checkpoint> projectorCheckpoint();
+    /**
+     * The projector's checkpoint plus the recorded journal end it last observed; {@code fresh} is
+     * decided by the database clock, so no host clock is trusted.
+     */
+    record ProjectorStatus(Checkpoint checkpoint, long observedTarget, boolean fresh) {}
+
+    Optional<ProjectorStatus> projectorStatus();
 
     /** Events of {@code source} strictly after {@code position}, in journal order. */
     List<Event> eventsAfter(String source, long position, int limit);

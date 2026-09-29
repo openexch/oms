@@ -137,8 +137,15 @@ int main() {
             auto badOutcome=retry; badOutcome.position=672; put(badOutcome.bytes,56,123,8);
             rejects([&] { restarted.apply(std::span(&badOutcome,1)); },"Different canonical command accepted");
             check(db.scalar("SELECT position FROM execution_projector_checkpoint")==512,"Conflict advanced cursor");
+            restarted.observe(900);
+            check(db.scalar("SELECT observed_target FROM execution_projector_checkpoint") == 900, "Observed target not published");
+            check(db.scalar("SELECT CASE WHEN NOW()-observed_at < interval '3 seconds' THEN 1 ELSE 0 END "
+                            "FROM execution_projector_checkpoint") == 1, "Observation not stamped with database time");
+            check(db.scalar("SELECT position FROM execution_projector_checkpoint") == 512, "Observation moved the cursor");
+            rejects([&] { restarted.observe(100); }, "Observed target regressed below the durable cursor");
             db.sql("SELECT transition_execution_writer('archive',3,'paused','test pause')");
             rejects([&] { restarted.probe(); }, "Idle worker ignored revoked ownership");
+            rejects([&] { restarted.observe(1000); }, "Revoked worker still published freshness");
             auto lateTerminal = terminal(); lateTerminal.position = 704;
             rejects([&] { restarted.apply(std::span(&lateTerminal, 1)); }, "Terminal batch ignored revoked ownership");
             check(db.scalar("SELECT position FROM execution_projector_checkpoint") == 512, "Revoked writer advanced checkpoint");

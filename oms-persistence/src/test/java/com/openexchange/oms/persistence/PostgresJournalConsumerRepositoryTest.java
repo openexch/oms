@@ -69,7 +69,7 @@ class PostgresJournalConsumerRepositoryTest {
 
     @Test void freshInstallationHasNoCheckpointAndNoOrders() {
         assertTrue(repo.loadCheckpoint().isEmpty());
-        assertTrue(repo.projectorCheckpoint().isEmpty());
+        assertTrue(repo.projectorStatus().isEmpty());
         assertFalse(repo.hasOrders());
         assertTrue(repo.loadPositions().isEmpty());
         orders.saveOrder(order(1));
@@ -81,7 +81,7 @@ class PostgresJournalConsumerRepositoryTest {
                 + " VALUES('executions','me0-gen1','rec-7',192,2)");
         sql("INSERT INTO execution_journal_events VALUES('me0-gen1',96,1,'\\x01'),('me0-gen1',32,1,'\\x00'),"
                 + "('me0-gen1',192,2,'\\x02'),('other',64,1,'\\x09')");
-        assertEquals(Optional.of(new Checkpoint("me0-gen1", 192, 2)), repo.projectorCheckpoint());
+        assertEquals(new Checkpoint("me0-gen1", 192, 2), repo.projectorStatus().orElseThrow().checkpoint());
         var events = repo.eventsAfter("me0-gen1", 32, 10);
         assertEquals(List.of(96L, 192L), events.stream().map(Event::position).toList());
         assertEquals(1, events.get(0).templateId());
@@ -131,5 +131,17 @@ class PostgresJournalConsumerRepositoryTest {
         assertThrows(IllegalArgumentException.class, () -> repo.commit(List.of(), Map.of(),
                 Optional.of(first), new Checkpoint("me1-gen1", 128, 1)));
         assertEquals(Optional.of(first), repo.loadCheckpoint());
+    }
+
+    @Test void projectorStatusCarriesObservedTargetAndDatabaseClockFreshness() throws Exception {
+        assertTrue(repo.projectorStatus().isEmpty());
+        sql("INSERT INTO execution_projector_checkpoint(consumer,source_identity,recording_descriptor,position,last_trade_id)"
+                + " VALUES('executions','me0-gen1','rec-7',192,2)");
+        var never = repo.projectorStatus().orElseThrow();
+        assertFalse(never.fresh(), "a worker that never observed is not fresh");
+        sql("UPDATE execution_projector_checkpoint SET observed_target=4096, observed_at=NOW()");
+        assertEquals(new ProjectorStatus(new Checkpoint("me0-gen1", 192, 2), 4096, true), repo.projectorStatus().orElseThrow());
+        sql("UPDATE execution_projector_checkpoint SET observed_at=NOW() - interval '10 seconds'");
+        assertFalse(repo.projectorStatus().orElseThrow().fresh());
     }
 }

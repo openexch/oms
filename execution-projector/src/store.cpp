@@ -52,6 +52,23 @@ void Store::checkOwnership(bool lock) {
     if (PQntuples(owner.get()) != 1) throw std::runtime_error("Execution writer owner/epoch changed; recovery required");
 }
 void Store::probe() { checkOwnership(false); }
+void Store::observe(std::int64_t recordedTarget) {
+    // Consumers on other hosts read this with the database clock to know this worker is live and
+    // how far the recording extends beyond the committed cursor.
+    if (recordedTarget < position_) throw std::runtime_error("Observed recording end is behind the durable cursor");
+    query("BEGIN");
+    try {
+        checkOwnership(true);
+        auto r = query("UPDATE execution_projector_checkpoint SET observed_target=$1,observed_at=NOW() "
+                       "WHERE consumer='executions' AND position=$2", {n(recordedTarget), n(position_)});
+        if (std::string(PQcmdTuples(r.get())) != "1") throw std::runtime_error("Checkpoint changed externally");
+        query("COMMIT");
+    } catch (...) {
+        auto error = std::current_exception();
+        try { query("ROLLBACK"); } catch (...) {}
+        std::rethrow_exception(error);
+    }
+}
 
 void Store::leg(const Journal& j, bool maker) {
     const bool buy = maker ? !j.sideOrStatus : j.sideOrStatus;

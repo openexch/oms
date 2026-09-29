@@ -71,9 +71,11 @@ consumer. Iceberg refills are sent after the commit. A batch that fails while me
 is ahead of PostgreSQL halts the process for recovery from the checkpoint.
 
 Live egress still links cluster orders, accepts them and drives FOK/IOC cancels, but
-never changes fill quantity or ends an order. Admission stays closed until the
-consumer has applied the projector's committed position and has observed it within
-three seconds. A dormant stop is cancelled locally since it never reached the engine.
+never changes fill quantity or ends an order. Admission stays open only while the
+projector's own observation is fresh by the database clock (three seconds), the
+projector is within 1 MiB of the recorded journal, and the consumer is within 1 MiB
+of the projector. A bound rather than equality keeps steady traffic from flapping
+admission; a stalled projector closes it. A dormant stop is cancelled locally since it never reached the engine.
 Amend is refused in this mode: its incremental hold is released by amount, which a
 replay after a crash could repeat.
 

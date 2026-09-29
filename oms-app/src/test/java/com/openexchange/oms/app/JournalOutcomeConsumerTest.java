@@ -27,6 +27,8 @@ class JournalOutcomeConsumerTest {
     static class FakeStore implements JournalConsumerStore {
         final TreeMap<Long, Event> events = new TreeMap<>();
         Optional<Checkpoint> projector = Optional.empty();
+        long targetAhead;          // recorded journal beyond the projector's cursor
+        boolean projectorFresh = true;
         Optional<Checkpoint> checkpoint = Optional.empty();
         final Map<PositionKey, Long> positions = new HashMap<>();
         final List<String> log = new ArrayList<>();
@@ -34,7 +36,9 @@ class JournalOutcomeConsumerTest {
         boolean failCommit;
         boolean orders;
         @Override public Optional<Checkpoint> loadCheckpoint() { return checkpoint; }
-        @Override public Optional<Checkpoint> projectorCheckpoint() { return projector; }
+        @Override public Optional<ProjectorStatus> projectorStatus() {
+            return projector.map(cp -> new ProjectorStatus(cp, cp.position() + targetAhead, projectorFresh));
+        }
         @Override public List<Event> eventsAfter(String source, long position, int limit) {
             assertEquals(projector.orElseThrow().source(), source);
             return events.tailMap(position, false).values().stream()
@@ -234,5 +238,47 @@ class JournalOutcomeConsumerTest {
         restarted.run();
         assertEquals(QTY / 2, buy.getFilledQty());
         assertEquals(Optional.of(new Checkpoint(SOURCE, 96, 2)), store.checkpoint);
+    }
+
+    @Test
+    void staleProjectorObservationClosesTheBarrier() {
+        live(1, 11, OrderSide.BUY, OmsOrderType.LIMIT);
+        live(2, 12, OrderSide.SELL, OmsOrderType.LIMIT);
+        store.trade(32, 1, 11, 1, 12, 2, QTY / 4);
+        consumer.start();
+        consumer.run();
+        assertTrue(consumer.isCaughtUp());
+        store.projectorFresh = false;
+        consumer.run();
+        assertFalse(consumer.isCaughtUp(), "a projector that stopped observing may be arbitrarily behind");
+        assertNull(consumer.failure(), "staleness is not a failure; it recovers when the projector does");
+        store.projectorFresh = true;
+        consumer.run();
+        assertTrue(consumer.isCaughtUp());
+    }
+
+    @Test
+    void projectorLagBeyondTheBoundClosesTheBarrier() {
+        live(1, 11, OrderSide.BUY, OmsOrderType.LIMIT);
+        live(2, 12, OrderSide.SELL, OmsOrderType.LIMIT);
+        store.trade(32, 1, 11, 1, 12, 2, QTY / 4);
+        store.targetAhead = JournalOutcomeConsumer.MAX_LAG_BYTES + 32;
+        consumer.start();
+        consumer.run();
+        assertFalse(consumer.isCaughtUp());
+        store.targetAhead = JournalOutcomeConsumer.MAX_LAG_BYTES;
+        consumer.run();
+        assertTrue(consumer.isCaughtUp(), "bounded lag under load keeps admission open");
+    }
+
+    @Test
+    void consumerWithinTheBoundStaysCaughtUpUnderLoad() {
+        live(1, 11, OrderSide.BUY, OmsOrderType.LIMIT);
+        live(2, 12, OrderSide.SELL, OmsOrderType.LIMIT);
+        for (int n = 1; n <= JournalOutcomeConsumer.BATCH + 10; n++) store.trade(32L * n, n, 11, 1, 12, 2, 1);
+        consumer.start();
+        consumer.run(); // one bounded batch; 10 events remain
+        assertTrue(consumer.isCaughtUp(), "admission must not flap while the consumer is a batch behind");
+        assertEquals(32L * JournalOutcomeConsumer.BATCH, consumer.checkpoint().orElseThrow().position());
     }
 }

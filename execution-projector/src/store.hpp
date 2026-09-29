@@ -16,6 +16,7 @@ public:
     std::int64_t position() const { return position_; }
     void apply(std::span<const Event> batch);
     void probe();
+    void observe(std::int64_t recordedTarget);
 private:
     PGconn* db_{};
     std::string source_;

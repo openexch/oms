@@ -11,6 +11,10 @@ CREATE TABLE IF NOT EXISTS execution_projector_checkpoint (
     last_trade_id BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Freshness for consumers on other hosts: the recorded journal end this worker last observed,
+-- stamped with database time so readers compare against NOW() without trusting any host clock.
+ALTER TABLE execution_projector_checkpoint ADD COLUMN IF NOT EXISTS observed_target BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE execution_projector_checkpoint ADD COLUMN IF NOT EXISTS observed_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS execution_journal_events (
     source_identity TEXT NOT NULL,
     position BIGINT NOT NULL,
