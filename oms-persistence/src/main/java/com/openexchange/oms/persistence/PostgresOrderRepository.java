@@ -157,6 +157,20 @@ public class PostgresOrderRepository {
     }
 
     /**
+     * The same compare-and-set upsert as {@link #saveOrder} inside a caller-owned transaction.
+     * The caller advances the in-memory revision only after its COMMIT succeeds.
+     */
+    void saveInTransaction(Connection conn, OmsOrder order, long nextRevision) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(INSERT_ORDER)) {
+            bindOrderInsert(ps, order);
+            ps.setLong(35, nextRevision);
+            if (ps.executeUpdate() != 1) {
+                throw new PersistenceException("Stale order revision in journal batch: " + order.getOmsOrderId());
+            }
+        }
+    }
+
+    /**
      * Finds a single order by its OMS order ID.
      *
      * @return the order, or null if not found

@@ -59,6 +59,27 @@ public class OrderLifecycleManager {
         this.stateListener = stateListener;
     }
 
+    // Cutover mode (execution writer cutover): fills and terminals come only from the verified ME
+    // journal via onJournalTerminal/applyFill. Live egress status may still link the cluster order,
+    // accept it (PENDING_NEW -> NEW) and resolve a replace, but never changes fill quantity or ends
+    // the order: egress is unsequenced and lossy, and a second fill source would double count.
+    private volatile boolean journalAuthoritative;
+
+    public void setJournalAuthoritative(boolean journalAuthoritative) {
+        this.journalAuthoritative = journalAuthoritative;
+    }
+
+    public boolean isJournalAuthoritative() { return journalAuthoritative; }
+
+    /**
+     * A terminal status from the verified ME journal: FILLED (2), CANCELLED (3) or REJECTED (4) of the
+     * named cluster leg. Fill quantity is already exact from the journal trades that preceded it.
+     */
+    public OmsOrder onJournalTerminal(long omsOrderId, long clusterOrderId, int status) {
+        if (status < 2 || status > 4) throw new IllegalArgumentException("Not a terminal status: " + status);
+        return applyStatus(omsOrderId, clusterOrderId, status, -1, null, true);
+    }
+
     /**
      * Ledger-side effects of a cancel-and-replace (oms#67), wired by the application so the
      * lifecycle stays ledger-agnostic. Called on the thread processing the resolving event.
@@ -379,6 +400,18 @@ public class OrderLifecycleManager {
      */
     public OmsOrder onClusterOrderStatus(long omsOrderId, long clusterOrderId, int status,
                                           long remainingQty, long filledQty, String rejectReason) {
+        return applyStatus(omsOrderId, clusterOrderId, status, filledQty, rejectReason, !journalAuthoritative);
+    }
+
+    /**
+     * @param filledQty    egress-reported fill, applied as a monotonic backstop; -1 when none
+     * @param authoritative false for live egress in cutover mode: link and accept only
+     */
+    private OmsOrder applyStatus(long omsOrderId, long clusterOrderId, int status, long filledQty,
+                                 String rejectReason, boolean authoritative) {
+        if (!authoritative && status == 1) {
+            status = 0; // PARTIALLY_FILLED without its trades: accept only, fills come from the journal
+        }
         OmsOrder order = activeOrders.get(omsOrderId);
         if (order == null) {
             order = byClusterOrderId.get(clusterOrderId);
@@ -474,9 +507,14 @@ public class OrderLifecycleManager {
             // stale/out-of-order update can carry a LOWER filledQty than reality. filledQty is driven
             // authoritatively by applyFill() from the lossless TradeExecution stream; here we only ever
             // RAISE it, never let the status stream regress the trade-derived value (the bug #9 fix).
-            long guardedFilled = Math.max(order.getFilledQty(), filledQty);
-            order.setFilledQty(guardedFilled);
-            order.setRemainingQty(Math.max(0, order.getQuantity() - guardedFilled));
+            if (authoritative && filledQty >= 0) {
+                long guardedFilled = Math.max(order.getFilledQty(), filledQty);
+                order.setFilledQty(guardedFilled);
+                order.setRemainingQty(Math.max(0, order.getQuantity() - guardedFilled));
+            }
+            if (!authoritative && status >= 2) {
+                return order; // the journal terminal ends this order
+            }
 
             switch (status) {
                 case 0: // NEW — do not regress an order already advanced by trade-driven fills

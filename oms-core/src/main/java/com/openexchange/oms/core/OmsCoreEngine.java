@@ -59,6 +59,46 @@ public class OmsCoreEngine {
         syntheticEngine.setIcebergCallback(this::submitIcebergSlice);
     }
 
+    private volatile boolean journalAuthoritative;
+
+    /** Orders touched by one journal trade, and icebergs whose display slice ran out. */
+    public record JournalTradeResult(java.util.List<OmsOrder> touched, java.util.List<Long> exhaustedIcebergSlices) {}
+
+    /** Cutover mode: fills and terminals come only from the verified ME journal. */
+    public void setJournalAuthoritative(boolean journalAuthoritative) {
+        this.journalAuthoritative = journalAuthoritative;
+        lifecycleManager.setJournalAuthoritative(journalAuthoritative);
+    }
+
+    public boolean isJournalAuthoritative() { return journalAuthoritative; }
+
+    /**
+     * Apply one journal trade to both legs. Nothing is persisted and nothing is sent: the caller
+     * commits the touched orders with its checkpoint, then refills the exhausted iceberg slices.
+     * The caller holds the orders' monitors and guarantees each trade is applied once.
+     */
+    public JournalTradeResult applyJournalTrade(long takerOrderId, long makerOrderId, long takerOmsOrderId,
+                                                long makerOmsOrderId, long quantity) {
+        java.util.List<OmsOrder> touched = new java.util.ArrayList<>(2);
+        java.util.List<Long> exhausted = new java.util.ArrayList<>(0);
+        applyJournalLeg(takerOmsOrderId, takerOrderId, quantity, touched, exhausted);
+        applyJournalLeg(makerOmsOrderId, makerOrderId, quantity, touched, exhausted);
+        return new JournalTradeResult(touched, exhausted);
+    }
+
+    private void applyJournalLeg(long omsOrderId, long clusterLegId, long quantity,
+                                 java.util.List<OmsOrder> touched, java.util.List<Long> exhausted) {
+        if (omsOrderId == 0) return;
+        OmsOrder order = lifecycleManager.applyFill(omsOrderId, clusterLegId, quantity);
+        if (order == null) return;
+        touched.add(order);
+        if (order.getOrderType() == OmsOrderType.ICEBERG) {
+            long remaining = Math.max(0, order.getSliceRemainingQty() - quantity);
+            order.setSliceRemainingQty(remaining);
+            if (remaining == 0) exhausted.add(omsOrderId);
+        }
+    }
+
     public boolean isDurableStateHealthy() { return durableStateHealthy; }
     public void markDurableStateFailed() { durableStateHealthy = false; }
 
@@ -130,6 +170,10 @@ public class OmsCoreEngine {
                                   long tradeQuantity, boolean takerIsBuy,
                                   long takerOmsOrderId, long makerOmsOrderId,
                                   long egressSeq) {
+        if (journalAuthoritative) {
+            // Cutover mode: the journal consumer applies trades once, from committed history.
+            return;
+        }
         // Settle the trade via ledger. settleTrade is idempotent on tradeId: the cluster re-delivers
         // egress to a client that reconnects across a leader switchover, so the same TradeExecution
         // can arrive more than once. `applied` is false for a duplicate.
