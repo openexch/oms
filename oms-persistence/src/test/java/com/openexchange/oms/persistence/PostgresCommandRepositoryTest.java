@@ -25,7 +25,13 @@ class PostgresCommandRepositoryTest {
         ds=new HikariDataSource(cfg);
         try(var c=ds.getConnection();var s=c.createStatement();var in=getClass().getResourceAsStream("/db/migration/V008__durable_me_commands.sql")) {
             s.execute(new String(Objects.requireNonNull(in).readAllBytes(),java.nio.charset.StandardCharsets.UTF_8));
-            s.execute("CREATE TABLE me_command_outcomes(command_id_high bigint,command_id_low bigint,canonical_payload bytea)");
+            try(var abort=getClass().getResourceAsStream("/db/migration/V009__abort_unsent_me_commands.sql")) {
+                s.execute(new String(Objects.requireNonNull(abort).readAllBytes(),java.nio.charset.StandardCharsets.UTF_8));
+            }
+            s.execute("""
+                CREATE TABLE me_command_outcomes(command_id_high bigint,command_id_low bigint,canonical_payload bytea,
+                    order_id bigint NOT NULL DEFAULT 0,status int NOT NULL DEFAULT 0,reason int NOT NULL DEFAULT 0,
+                    result int NOT NULL DEFAULT 0)""");
         }
         repo=new PostgresCommandRepository(ds);
     }
@@ -72,10 +78,51 @@ class PostgresCommandRepositoryTest {
         repo.ready(cmd);assertTrue(repo.pending(10).isEmpty()); // never re-open resolved send
         assertEquals(0,repo.resolveProjected());
     }
-    private void project(DurableOrderIntent cmd) throws Exception {
+    private void project(DurableOrderIntent cmd) throws Exception { project(cmd,0,0,0,0); }
+    private void project(DurableOrderIntent cmd,long orderId,int status,int reason,int result) throws Exception {
         byte[] wire=DurableCommandWire.encode(cmd);
-        try(var c=ds.getConnection();var p=c.prepareStatement("INSERT INTO me_command_outcomes VALUES(?,?,?)")) {
-            p.setLong(1,cmd.idHigh());p.setLong(2,cmd.idLow());p.setBytes(3,Arrays.copyOfRange(wire,8,wire.length));p.executeUpdate();
+        try(var c=ds.getConnection();var p=c.prepareStatement("""
+                INSERT INTO me_command_outcomes(command_id_high,command_id_low,canonical_payload,order_id,status,reason,result)
+                VALUES(?,?,?,?,?,?,?)""")) {
+            p.setLong(1,cmd.idHigh());p.setLong(2,cmd.idLow());p.setBytes(3,Arrays.copyOfRange(wire,8,wire.length));
+            p.setLong(4,orderId);p.setInt(5,status);p.setInt(6,reason);p.setInt(7,result);p.executeUpdate();
         }
+    }
+    @Test void abortedCommandIsNeverSendableOrReopened() {
+        var cmd=command(1,1000);repo.prepare(cmd,1);repo.ready(cmd);
+        repo.abortUnsent(cmd);
+        assertTrue(repo.pending(10).isEmpty());
+        assertTrue(repo.openCommands(Long.MIN_VALUE,Long.MIN_VALUE,10).isEmpty());
+        assertThrows(PersistenceException.class,()->repo.ready(cmd));
+        assertEquals("ABORTED",repo.prepare(cmd,1).state());
+        repo.abortUnsent(cmd); // idempotent for the same payload
+        assertThrows(PersistenceException.class,()->repo.abortUnsent(command(1,2000)));
+    }
+    @Test void resolvedCommandCannotBeAborted() throws Exception {
+        var cmd=command(1,1000);repo.prepare(cmd,1);repo.ready(cmd);project(cmd);
+        repo.resolve(cmd);
+        assertThrows(PersistenceException.class,()->repo.abortUnsent(cmd));
+    }
+    @Test void openCommandsPageByIdentityAndIncludePreparedAndReady() {
+        var a=command(1,1000);var b=new DurableOrderIntent(17,2,100,9002,0,1000,100,0,1,0,0,0);
+        var c=new DurableOrderIntent(18,1,100,9003,0,1000,100,0,1,0,0,0);
+        repo.prepare(a,1);repo.ready(a);repo.prepare(b,1);repo.prepare(c,1);repo.ready(c);
+        var first=repo.openCommands(Long.MIN_VALUE,Long.MIN_VALUE,2);
+        assertEquals(List.of(a,b),first.stream().map(PostgresCommandRepository.Entry::intent).toList());
+        assertEquals(List.of("READY","PREPARED"),first.stream().map(PostgresCommandRepository.Entry::state).toList());
+        var last=first.get(1).intent();
+        assertEquals(List.of(c),repo.openCommands(last.idHigh(),last.idLow(),2).stream().map(PostgresCommandRepository.Entry::intent).toList());
+        assertThrows(IllegalArgumentException.class,()->repo.openCommands(0,0,0));
+    }
+    @Test void projectedOutcomeCarriesCanonicalResultOnlyForExactPayload() throws Exception {
+        var cmd=command(1,1000);repo.prepare(cmd,1);repo.ready(cmd);
+        var other=new DurableOrderIntent(17,2,100,9002,0,1000,100,0,1,0,0,0);repo.prepare(other,1);repo.ready(other);
+        project(cmd,77,0,0,0);project(command(2,5000),88,4,3,1); // same identity as other, different payload
+        assertEquals(List.of(new DurableCommandStore.Outcome(cmd,77,0,0,0)),repo.projectedOutcomes(10));
+        repo.resolve(cmd);
+        assertTrue(repo.projectedOutcomes(10).isEmpty());
+        repo.resolve(cmd); // idempotent once resolved
+        assertThrows(PersistenceException.class,()->repo.resolve(other)); // no exact outcome: stays READY
+        assertEquals(List.of(other),repo.pending(10).stream().map(PostgresCommandRepository.Entry::intent).toList());
     }
 }

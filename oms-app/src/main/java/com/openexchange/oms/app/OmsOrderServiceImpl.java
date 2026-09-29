@@ -63,6 +63,13 @@ public class OmsOrderServiceImpl implements OrderService {
             .mapToObj(i -> new Object()).toArray();
     private com.openexchange.oms.persistence.PostgresOrderRequestRepository requestRepository;
 
+    private DurableCommandDispatcher durableCommands;
+
+    /** Non-null enables the durable ME command lane for plain creates. */
+    public void setDurableCommands(DurableCommandDispatcher dispatcher) {
+        this.durableCommands = dispatcher;
+    }
+
     public void setRequestRepository(com.openexchange.oms.persistence.PostgresOrderRequestRepository repository) {
         this.requestRepository = repository;
     }
@@ -368,7 +375,22 @@ public class OmsOrderServiceImpl implements OrderService {
             // matching open and would decrement one of the user's OTHER open-order slots.
             riskEngine.onOrderOpened(order.getUserId());
 
-            boolean enqueued = clusterClient.submitOrder(submission);
+            boolean enqueued;
+            if (durableCommands != null) {
+                // The ME deduplicates this identity; after a lost ack or restart the dispatcher
+                // resends the same bytes and the Archive outcome resolves the order.
+                var intent = DurableCommandDispatcher.createIntent(order, submission.getTotalPrice(),
+                        submission.getOrderType(), submission.getOrderSide());
+                try {
+                    enqueued = durableCommands.submitCreate(order, intent);
+                } catch (com.openexchange.oms.persistence.PersistenceException e) {
+                    persistenceHealthy = false;
+                    coreEngine.markDurableStateFailed();
+                    throw new IllegalStateException("Durable ME command storage unavailable; recovery required", e);
+                }
+            } else {
+                enqueued = clusterClient.submitOrder(submission);
+            }
             if (!enqueued) {
                 // Queue full — terminalize the order the cluster never saw (oms#85). Do NOT
                 // release the hold or close the slot here: the state listener performs BOTH on

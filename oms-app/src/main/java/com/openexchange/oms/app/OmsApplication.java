@@ -76,6 +76,7 @@ public class OmsApplication {
     /** The CQRS balance read-model writer (E6); set when PG is present. */
     private PgBalanceReadModelWriter balanceReadModelWriter;
     private java.util.concurrent.ScheduledExecutorService persistenceProbeScheduler;
+    private java.util.concurrent.ScheduledExecutorService durableCommandScheduler;
 
     public static void main(String[] args) {
         OmsApplication app = new OmsApplication();
@@ -419,6 +420,25 @@ public class OmsApplication {
             }
         });
 
+        // 10a. Durable ME command lane: recover open commands before the session exists, so the
+        // first connect resends them. Outcomes come from the execution projector's table.
+        DurableCommandDispatcher durableCommands = null;
+        if (config.durableMeCommands()) {
+            if (dataSource == null) throw new IllegalStateException("OMS_DURABLE_ME_COMMANDS requires Postgres");
+            final ClusterClient sender = clusterClient;
+            durableCommands = new DurableCommandDispatcher(
+                    new com.openexchange.oms.persistence.PostgresCommandRepository(dataSource),
+                    coreEngine, sender::submitOrder);
+            durableCommands.recoverAtStartup();
+            egressAdapter.setSessionSeamHook(durableCommands::requestResend);
+            durableCommandScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "oms-durable-commands"); t.setDaemon(true); return t;
+            });
+            durableCommandScheduler.scheduleWithFixedDelay(durableCommands, 100, 100,
+                    java.util.concurrent.TimeUnit.MILLISECONDS);
+            log.info("Durable ME command lane enabled");
+        }
+
         // Start polling thread (daemon)
         Thread pollingThread = new Thread(clusterClient::startPolling, "oms-cluster-poll");
         pollingThread.setDaemon(true);
@@ -449,6 +469,7 @@ public class OmsApplication {
                 balanceStore, egressAdapter, idGenerator, marketDataProvider);
         orderServiceImpl.setMeterRegistry(meterRegistry);
         orderServiceImpl.setRepositories(orderRepo, executionRepo);
+        orderServiceImpl.setDurableCommands(durableCommands);
         if (dataSource != null) orderServiceImpl.setRequestRepository(
                 new com.openexchange.oms.persistence.PostgresOrderRequestRepository(dataSource));
         final HikariDataSource probeDataSource = dataSource;
@@ -758,6 +779,7 @@ public class OmsApplication {
 
     public void stop() {
         if (persistenceProbeScheduler != null) persistenceProbeScheduler.shutdownNow();
+        if (durableCommandScheduler != null) durableCommandScheduler.shutdownNow();
         log.info("Stopping OMS Application...");
 
         if (grpcServer != null) {

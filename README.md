@@ -280,6 +280,7 @@ All configuration via environment variables with sensible defaults:
 | `OMS_AE_HOLD_TIMEOUT_MS` | `250` | Per-hold AE round-trip budget before the order is rejected |
 | `OMS_AE_ACK_TIMEOUT_MS` | `1000` | AE ack timeout for release/settle commands |
 | `OMS_AE_CONNECT_TIMEOUT_MS` | `30000` | Boot gate: max wait for the AE balance projection before FATAL |
+| `OMS_DURABLE_ME_COMMANDS` | `false` | Send plain creates as durable ME commands (see `docs/durable-order-workflows.md`); requires order schema v11 on every ME replica with its command journal, and the execution projector |
 | `OMS_POSTGRES_URL` | `jdbc:postgresql://localhost:5432/oms` | PostgreSQL URL |
 | `OMS_POSTGRES_USER` | `oms` | PostgreSQL user |
 | `OMS_POSTGRES_PASSWORD` | `oms` | PostgreSQL password |

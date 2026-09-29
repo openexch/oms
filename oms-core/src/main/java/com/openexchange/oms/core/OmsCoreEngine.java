@@ -452,6 +452,13 @@ public class OmsCoreEngine {
 
     private final java.util.Set<Long> unresolvedOrderIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /** Admission stays closed while an order's external outcome is unknown. */
+    public void markUnresolved(long omsOrderId) { unresolvedOrderIds.add(omsOrderId); }
+
+    public void clearUnresolved(long omsOrderId) { unresolvedOrderIds.remove(omsOrderId); }
+
+    public boolean isUnresolved(long omsOrderId) { return unresolvedOrderIds.contains(omsOrderId); }
+
     public int getUnresolvedOrderCount() {
         unresolvedOrderIds.removeIf(id -> lifecycleManager.getOrder(id) == null);
         return unresolvedOrderIds.size();

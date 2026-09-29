@@ -793,6 +793,59 @@ class OmsOrderServiceImplTest {
         assertTrue(orderService.queryOrders(1L, "FILLED").isEmpty());
     }
 
+
+    private DurableCommandDispatcherTest.FakeStore enableDurableLane() {
+        var repo = mock(com.openexchange.oms.persistence.PostgresOrderRepository.class);
+        doAnswer(inv -> { OmsOrder o = inv.getArgument(0); o.setStateRevision(o.getStateRevision() + 1); return null; })
+                .when(repo).saveOrder(any());
+        orderService.setRepositories(repo, null);
+        var store = new DurableCommandDispatcherTest.FakeStore();
+        orderService.setDurableCommands(new DurableCommandDispatcher(store, coreEngine, clusterClient::submitOrder));
+        return store;
+    }
+
+    @Test
+    void durableLaneSendsPlainCreatesAsTheStoredCommand() {
+        var store = enableDurableLane();
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(1000000));
+        var response = orderService.createOrder(createLimitBuyRequest(1, 1, 50000, 1));
+        assertTrue(response.isAccepted(), response.getRejectReason());
+        var captor = ArgumentCaptor.forClass(OrderSubmission.class);
+        verify(clusterClient).submitOrder(captor.capture());
+        var intent = captor.getValue().getDurableIntent();
+        assertNotNull(intent, "flagged create must use the durable command lane");
+        assertEquals(response.getOmsOrderId(), intent.omsOrderId());
+        assertEquals(0, intent.kind());
+        assertEquals(FixedPoint.fromDouble(50000), intent.price());
+        assertEquals(FixedPoint.multiply(intent.price(), intent.quantity()), intent.budget());
+        assertEquals("READY", store.state(intent));
+    }
+
+    @Test
+    void durableLaneQueueFullAbortsTheCommandBeforeRejecting() {
+        var store = enableDurableLane();
+        when(clusterClient.submitOrder(any(OrderSubmission.class))).thenReturn(false);
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(1000000));
+        var response = orderService.createOrder(createLimitBuyRequest(1, 1, 50000, 1));
+        assertFalse(response.isAccepted());
+        assertEquals("Order queue full", response.getRejectReason());
+        assertEquals(1, store.rows.size());
+        assertEquals("ABORTED", store.rows.firstEntry().getValue().state());
+    }
+
+    @Test
+    void durableLaneLeavesSyntheticOrdersOnTheLegacyPath() {
+        enableDurableLane();
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(1000000));
+        var req = createLimitBuyRequest(1, 1, 50000, 1);
+        req.setOrderType("ICEBERG");
+        req.setDisplayQuantity(FixedPoint.fromDouble(0.5));
+        assertTrue(orderService.createOrder(req).isAccepted());
+        var captor = ArgumentCaptor.forClass(OrderSubmission.class);
+        verify(clusterClient).submitOrder(captor.capture());
+        assertNull(captor.getValue().getDurableIntent());
+    }
+
     private CreateOrderRequest createLimitBuyRequest(long userId, int marketId, double price, double qty) {
         CreateOrderRequest req = new CreateOrderRequest();
         req.setUserId(userId);

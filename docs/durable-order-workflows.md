@@ -33,3 +33,30 @@ concurrently with the legacy execution writer. Per-order durable writes are stil
 synchronous; latency and duty-cycle requirements remain acceptance gates. A
 rolling downgrade to an older writer is not supported: it ignores revisions and
 would omit workflow fields.
+
+## Durable ME command lane (`OMS_DURABLE_ME_COMMANDS=true`)
+
+Plain LIMIT, MARKET and LIMIT_MAKER creates are sent as `DurableOrderCommand`
+(order schema 1/v11). The command identity is derived from the order id and the
+workflow revision at `PENDING_NEW`, so it is stable across a crash. The exact
+payload is stored in `oms_me_commands` and made `READY` before it is offered;
+the matching engine returns the original result for a repeated identity instead
+of creating a second order.
+
+- A full submission queue means the command was never offered. It becomes
+  `ABORTED` before the order is rejected and its hold released; nothing resends it.
+- At startup, open commands are recovered before the cluster session exists.
+  Their orders keep admission closed. Every connect and leader change resends
+  `READY` commands, because an offered command may not have reached the log.
+- Only the canonical outcome that the execution projector writes to
+  `me_command_outcomes` resolves a command. An applied outcome links the cluster
+  order id; admission reopens only for a resting leg, since fills come from the
+  execution stream. An engine rejection or an untouched book rejects the order.
+
+Stops, trailing stops, iceberg slices, cancels and amends still use the legacy
+commands. The engine's command ledger admits 100,000 identities without
+eviction; enabling this lane beyond that bound needs a replicated retention
+protocol. An engine without a configured command journal halts on the first
+durable command, so the flag is enabled only after every replica runs v11 with
+its journal.
+

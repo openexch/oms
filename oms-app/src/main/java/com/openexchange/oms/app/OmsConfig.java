@@ -42,7 +42,8 @@ public record OmsConfig(
     long aeAckTimeoutMs,
     long aeConnectTimeoutMs,
     String balanceFeedChannel,
-    int balanceFeedStreamId
+    int balanceFeedStreamId,
+    boolean durableMeCommands
 ) {
     public static OmsConfig loadDefaults() {
         return new OmsConfig(
@@ -70,7 +71,11 @@ public record OmsConfig(
             // (see assets' BalanceFeedRuntime), one stack-profile value for both sides.
             prop("BALANCE_FEED_CHANNEL", ""),
             intProp("BALANCE_FEED_STREAM_ID",
-                com.openexchange.oms.assets.AssetsClusterClient.DEFAULT_BALANCE_FEED_STREAM_ID)
+                com.openexchange.oms.assets.AssetsClusterClient.DEFAULT_BALANCE_FEED_STREAM_ID),
+            // Durable ME command lane for plain creates. Off by default: every ME replica must
+            // run order schema v11 with its command journal configured, and the execution
+            // projector must write me_command_outcomes into this database.
+            booleanProp("OMS_DURABLE_ME_COMMANDS", false)
         );
     }
 
@@ -92,6 +97,14 @@ public record OmsConfig(
             }
         }
         return defaultValue;
+    }
+
+    private static boolean booleanProp(String key, boolean defaultValue) {
+        String val = prop(key, null);
+        if (val == null) return defaultValue;
+        if (val.equals("true")) return true;
+        if (val.equals("false")) return false;
+        throw new IllegalArgumentException(key + " must be true or false, got: " + val);
     }
 
     private static int intProp(String key, int defaultValue) {
