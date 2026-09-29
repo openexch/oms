@@ -72,6 +72,23 @@ public class OrderLifecycleManager {
     public boolean isJournalAuthoritative() { return journalAuthoritative; }
 
     /**
+     * Cancel an order that never reached the matching engine (a dormant PENDING_TRIGGER parent). No
+     * journal terminal will ever exist for it, so this is authoritative in both modes.
+     */
+    public OmsOrder cancelUnsubmitted(long omsOrderId) {
+        OmsOrder order = activeOrders.get(omsOrderId);
+        if (order == null) return null;
+        synchronized (order) {
+            if (order.getStatus() != OmsOrderStatus.PENDING_TRIGGER || order.getClusterOrderId() != 0) {
+                return null;
+            }
+            transition(order, OmsOrderStatus.CANCELLED);
+            removeOrder(omsOrderId);
+            return order;
+        }
+    }
+
+    /**
      * A terminal status from the verified ME journal: FILLED (2), CANCELLED (3) or REJECTED (4) of the
      * named cluster leg. Fill quantity is already exact from the journal trades that preceded it.
      */

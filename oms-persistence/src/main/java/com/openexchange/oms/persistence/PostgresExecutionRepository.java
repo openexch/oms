@@ -76,6 +76,20 @@ public class PostgresExecutionRepository {
         }
     }
 
+    /** Journal-consumer startup: the C++ projector must be the execution writer. */
+    public void requireArchiveWriterOwnership() {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT owner FROM execution_writer_ownership WHERE consumer='executions'");
+             ResultSet rs = ps.executeQuery()) {
+            if (!rs.next() || !"archive".equals(rs.getString(1))) {
+                throw new PersistenceException("Journal consumer requires archive execution ownership; complete the writer handoff");
+            }
+        } catch (SQLException e) {
+            throw new PersistenceException("Execution ownership migration/verification required", e);
+        }
+    }
+
     /**
      * Persists a single execution report.
      */

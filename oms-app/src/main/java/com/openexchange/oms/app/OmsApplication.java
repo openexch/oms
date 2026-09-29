@@ -77,6 +77,7 @@ public class OmsApplication {
     private PgBalanceReadModelWriter balanceReadModelWriter;
     private java.util.concurrent.ScheduledExecutorService persistenceProbeScheduler;
     private java.util.concurrent.ScheduledExecutorService durableCommandScheduler;
+    private java.util.concurrent.ScheduledExecutorService journalConsumerScheduler;
 
     public static void main(String[] args) {
         OmsApplication app = new OmsApplication();
@@ -118,7 +119,11 @@ public class OmsApplication {
             dataSource = new HikariDataSource(hikariConfig);
             orderRepo = new PostgresOrderRepository(dataSource);
             executionRepo = new PostgresExecutionRepository(dataSource);
-            executionRepo.requireLegacyWriterOwnership();
+            if (config.journalConsumer()) {
+                executionRepo.requireArchiveWriterOwnership();
+            } else {
+                executionRepo.requireLegacyWriterOwnership();
+            }
             userRepo = new PostgresUserRepository(dataSource); // demo accounts (V002__users.sql)
             log.info("PostgreSQL persistence initialized: {}", config.postgresUrl());
         } catch (Exception e) {
@@ -327,11 +332,30 @@ public class OmsApplication {
         // BEFORE the cluster client connects so the P1.2 open-orders-snapshot
         // reconciliation trues the restored set up against cluster reality, and
         // before the HTTP server so no user traffic races the rebuild.
+        JournalOutcomeConsumer journalConsumer = null;
         if (orderRepo != null && executionRepo != null) {
             try {
+                java.util.List<com.openexchange.oms.persistence.PositionAggregate> positions;
+                if (config.journalConsumer()) {
+                    // Positions as of the consumer checkpoint: the projector's executions may be ahead.
+                    var journalStore = new com.openexchange.oms.persistence.PostgresJournalConsumerRepository(dataSource);
+                    positions = journalStore.loadPositions().entrySet().stream()
+                            .map(e -> new com.openexchange.oms.persistence.PositionAggregate(
+                                    e.getKey().userId(), e.getKey().marketId(), e.getValue()))
+                            .toList();
+                    coreEngine.setJournalAuthoritative(true);
+                    journalConsumer = new JournalOutcomeConsumer(journalStore, coreEngine, riskEngine, () -> {
+                        // Memory is ahead of Postgres; only a restart from the checkpoint is correct.
+                        System.err.println("FATAL: journal consumer batch failed; halting for recovery");
+                        Runtime.getRuntime().halt(1);
+                    });
+                } else {
+                    positions = executionRepo.aggregatePositions();
+                }
                 StartupStateRebuilder.rebuild(
-                        orderRepo.findAllOpenOrders(), executionRepo.aggregatePositions(),
+                        orderRepo.findAllOpenOrders(), positions,
                         lifecycleManager, syntheticEngine, riskEngine);
+                if (journalConsumer != null) journalConsumer.start();
             } catch (Exception e) {
                 throw new IllegalStateException("Order/position recovery failed; admission remains closed", e);
             }
@@ -439,6 +463,17 @@ public class OmsApplication {
             log.info("Durable ME command lane enabled");
         }
 
+        // 10b. Journal consumer: the only fill/terminal source in cutover mode. Its own thread;
+        // never the Aeron polling thread. Admission waits until it has caught up (barrier below).
+        if (journalConsumer != null) {
+            journalConsumerScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "oms-journal-consumer"); t.setDaemon(true); return t;
+            });
+            journalConsumerScheduler.scheduleWithFixedDelay(journalConsumer, 0, 5,
+                    java.util.concurrent.TimeUnit.MILLISECONDS);
+            log.info("Journal consumer enabled: fills and terminals come from the projector-committed journal");
+        }
+
         // Start polling thread (daemon)
         Thread pollingThread = new Thread(clusterClient::startPolling, "oms-cluster-poll");
         pollingThread.setDaemon(true);
@@ -470,6 +505,17 @@ public class OmsApplication {
         orderServiceImpl.setMeterRegistry(meterRegistry);
         orderServiceImpl.setRepositories(orderRepo, executionRepo);
         orderServiceImpl.setDurableCommands(durableCommands);
+        if (journalConsumer != null) {
+            final JournalOutcomeConsumer barrier = journalConsumer;
+            orderServiceImpl.setAdmissionGate(barrier::isCaughtUp);
+            Gauge.builder("oms_journal_consumer_caught_up", barrier, c -> c.isCaughtUp() ? 1 : 0)
+                    .description("1 when the journal consumer has applied the projector's committed history")
+                    .register(meterRegistry);
+            Gauge.builder("oms_journal_consumer_position", barrier,
+                            c -> c.checkpoint().map(cp -> (double) cp.position()).orElse(0.0))
+                    .description("Journal position the OMS has applied and committed")
+                    .register(meterRegistry);
+        }
         if (dataSource != null) orderServiceImpl.setRequestRepository(
                 new com.openexchange.oms.persistence.PostgresOrderRequestRepository(dataSource));
         final HikariDataSource probeDataSource = dataSource;
@@ -780,6 +826,7 @@ public class OmsApplication {
     public void stop() {
         if (persistenceProbeScheduler != null) persistenceProbeScheduler.shutdownNow();
         if (durableCommandScheduler != null) durableCommandScheduler.shutdownNow();
+        if (journalConsumerScheduler != null) journalConsumerScheduler.shutdownNow();
         log.info("Stopping OMS Application...");
 
         if (grpcServer != null) {

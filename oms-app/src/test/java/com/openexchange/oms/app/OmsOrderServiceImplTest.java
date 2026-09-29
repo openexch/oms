@@ -846,6 +846,44 @@ class OmsOrderServiceImplTest {
         assertNull(captor.getValue().getDurableIntent());
     }
 
+
+    @Test
+    void closedJournalBarrierClosesAdmission() {
+        orderService.setAdmissionGate(() -> false);
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(1000000));
+        assertFalse(orderService.isAdmissionReady());
+        assertThrows(IllegalStateException.class, () -> orderService.createOrder(createLimitBuyRequest(1, 1, 50000, 1)));
+        verify(clusterClient, never()).submitOrder(any(OrderSubmission.class));
+        orderService.setAdmissionGate(() -> true);
+        assertTrue(orderService.isAdmissionReady());
+    }
+
+    @Test
+    void amendIsRefusedWhileTheJournalOwnsFills() {
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(1000000));
+        var created = orderService.createOrder(createLimitBuyRequest(1, 1, 50000, 1));
+        coreEngine.getLifecycleManager().onClusterOrderStatus(created.getOmsOrderId(), 77, 0, 0, 0);
+        coreEngine.setJournalAuthoritative(true);
+        clearInvocations(clusterClient);
+        var result = orderService.updateOrder(created.getOmsOrderId(), FixedPoint.fromDouble(49000), 0);
+        assertEquals(false, result.get("accepted"));
+        verify(clusterClient, never()).submitOrder(any(OrderSubmission.class));
+    }
+
+
+    @Test
+    void dormantStopCancelsLocallyInJournalMode() {
+        coreEngine.setJournalAuthoritative(true);
+        balanceStore.deposit(1, 0, FixedPoint.fromDouble(1000000));
+        var created = orderService.createOrder(createStopTriggerBuyRequest(1, 1, "STOP_LIMIT", 1, 50900));
+        assertTrue(created.isAccepted(), created.getRejectReason());
+        OmsOrder order = coreEngine.getLifecycleManager().getOrder(created.getOmsOrderId());
+        assertEquals(OmsOrderStatus.PENDING_TRIGGER, order.getStatus());
+        assertTrue(orderService.cancelOrder(created.getOmsOrderId()).isAccepted());
+        assertEquals(OmsOrderStatus.CANCELLED, order.getStatus(), "a never-submitted stop has no journal terminal to wait for");
+        assertNull(coreEngine.getLifecycleManager().getOrder(created.getOmsOrderId()));
+    }
+
     private CreateOrderRequest createLimitBuyRequest(long userId, int marketId, double price, double qty) {
         CreateOrderRequest req = new CreateOrderRequest();
         req.setUserId(userId);

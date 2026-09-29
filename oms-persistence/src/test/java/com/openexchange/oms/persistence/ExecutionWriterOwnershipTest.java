@@ -98,4 +98,17 @@ class ExecutionWriterOwnershipTest {
         }
     }
 
+    @Test void journalConsumerStartupRequiresArchiveOwnership() throws Exception {
+        var config = new com.zaxxer.hikari.HikariConfig();
+        config.setJdbcUrl(url); config.setUsername(user); config.setSchema(schema); config.setMaximumPoolSize(1);
+        try (var ds = new com.zaxxer.hikari.HikariDataSource(config)) {
+            var repo = new PostgresExecutionRepository(ds);
+            assertThrows(PersistenceException.class, repo::requireArchiveWriterOwnership);
+            sql(db, "SELECT transition_execution_writer('legacy',1,'paused','test cutover drain')");
+            assertThrows(PersistenceException.class, repo::requireArchiveWriterOwnership);
+            sql(db, "SELECT transition_execution_writer('paused',2,'archive','test cutover activation')");
+            repo.requireArchiveWriterOwnership();
+        }
+    }
+
 }

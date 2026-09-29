@@ -43,7 +43,8 @@ public record OmsConfig(
     long aeConnectTimeoutMs,
     String balanceFeedChannel,
     int balanceFeedStreamId,
-    boolean durableMeCommands
+    boolean durableMeCommands,
+    boolean journalConsumer
 ) {
     public static OmsConfig loadDefaults() {
         return new OmsConfig(
@@ -75,7 +76,10 @@ public record OmsConfig(
             // Durable ME command lane for plain creates. Off by default: every ME replica must
             // run order schema v11 with its command journal configured, and the execution
             // projector must write me_command_outcomes into this database.
-            booleanProp("OMS_DURABLE_ME_COMMANDS", false)
+            booleanProp("OMS_DURABLE_ME_COMMANDS", false),
+            // Execution writer cutover: fills and terminals come only from the projector-committed
+            // ME journal. Requires archive execution ownership (the C++ projector writes executions).
+            booleanProp("OMS_JOURNAL_CONSUMER", false)
         );
     }
 

@@ -161,8 +161,12 @@ public final class DurableCommandDispatcher implements Runnable {
                     if (outcome.status() != STATUS_REJECTED) {
                         throw new IllegalStateException("Engine rejection without a rejected status: " + omsOrderId);
                     }
-                    OmsOrder rejected = lcm.onClusterOrderStatus(omsOrderId, outcome.orderId(), STATUS_REJECTED,
-                            0, order.getFilledQty(), OmsEgressAdapter.mapRejectReason(outcome.reason()));
+                    // A canonical outcome from the log is authoritative in both modes; in journal
+                    // mode the egress path deliberately cannot end an order.
+                    OmsOrder rejected = lcm.isJournalAuthoritative()
+                            ? lcm.onJournalTerminal(omsOrderId, outcome.orderId(), STATUS_REJECTED)
+                            : lcm.onClusterOrderStatus(omsOrderId, outcome.orderId(), STATUS_REJECTED,
+                                    0, order.getFilledQty(), OmsEgressAdapter.mapRejectReason(outcome.reason()));
                     if (rejected != null) coreEngine.persistOrderState(rejected);
                 }
                 default -> {

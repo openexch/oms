@@ -65,6 +65,13 @@ public class OmsOrderServiceImpl implements OrderService {
 
     private DurableCommandDispatcher durableCommands;
 
+    // Journal cutover barrier: the consumer has applied the projector's committed history.
+    private java.util.function.BooleanSupplier admissionGate = () -> true;
+
+    public void setAdmissionGate(java.util.function.BooleanSupplier gate) {
+        this.admissionGate = Objects.requireNonNull(gate);
+    }
+
     /** Non-null enables the durable ME command lane for plain creates. */
     public void setDurableCommands(DurableCommandDispatcher dispatcher) {
         this.durableCommands = dispatcher;
@@ -88,7 +95,8 @@ public class OmsOrderServiceImpl implements OrderService {
 
     public boolean isAdmissionReady() {
         return persistenceHealthy && persistenceAvailable.getAsBoolean() && orderRepository != null
-                && coreEngine.isDurableStateHealthy() && coreEngine.getUnresolvedOrderCount() == 0;
+                && coreEngine.isDurableStateHealthy() && coreEngine.getUnresolvedOrderCount() == 0
+                && admissionGate.getAsBoolean();
     }
 
     public void setRepositories(com.openexchange.oms.persistence.PostgresOrderRepository orderRepository,
@@ -448,7 +456,7 @@ public class OmsOrderServiceImpl implements OrderService {
             // the listener learned to release PENDING_TRIGGER terminals (oms#49).
             if (order.getStatus() == OmsOrderStatus.PENDING_TRIGGER) {
                 coreEngine.getSyntheticEngine().removeOrder(order);
-                lcm.onClusterOrderStatus(omsOrderId, 0, 3, 0, 0); // status 3 = CANCELLED
+                lcm.cancelUnsubmitted(omsOrderId); // never submitted: no ME terminal will follow
                 persistAdmission(order);
                 return CancelOrderResponse.accepted(omsOrderId);
             }
@@ -473,6 +481,11 @@ public class OmsOrderServiceImpl implements OrderService {
 
     @Override
     public Map<String, Object> updateOrder(long omsOrderId, long newPrice, long newQuantity) {
+        if (coreEngine.isJournalAuthoritative()) {
+            // The legacy amend moves an incremental hold by amount; replaying its resolution from the
+            // journal after a crash could release that amount twice. Needs the durable amend command.
+            return Map.of("accepted", false, "message", "Amend is unavailable while the journal consumer owns fills");
+        }
         if (!isAdmissionReady()) throw new IllegalStateException("Order amendment requires persistence/outcome recovery");
         OrderLifecycleManager lcm = coreEngine.getLifecycleManager();
         OmsOrder order = lcm.getOrder(omsOrderId);

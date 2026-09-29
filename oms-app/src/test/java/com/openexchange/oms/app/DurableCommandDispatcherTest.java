@@ -270,4 +270,15 @@ class DurableCommandDispatcherTest {
         }, core, s -> true);
         assertDoesNotThrow(failing::run);
     }
+
+    @Test
+    void engineRejectionTerminalizesInJournalModeToo() {
+        core.setJournalAuthoritative(true);
+        var o = pendingNew(9001);
+        var i = prepared(o, true);
+        store.outcomes.put(i.id(), new DurableCommandStore.Outcome(i, 77, 4, 1, 1));
+        dispatcher.run();
+        assertEquals(OmsOrderStatus.REJECTED, o.getStatus());
+        assertEquals("RESOLVED", store.state(i));
+    }
 }

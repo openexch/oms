@@ -60,3 +60,20 @@ protocol. An engine without a configured command journal halts on the first
 durable command, so the flag is enabled only after every replica runs v11 with
 its journal.
 
+## Journal consumer (`OMS_JOURNAL_CONSUMER=true`)
+
+The C++ execution projector is the only execution writer; the OMS starts only when
+execution ownership is `archive`. Fills and terminals come only from the events the
+projector committed, applied in journal order. Order rows, net positions
+(`oms_risk_positions`) and the consumer checkpoint commit in one transaction. A trade
+applies only as the next dense trade id; a repeat is skipped and a gap stops the
+consumer. Iceberg refills are sent after the commit. A batch that fails while memory
+is ahead of PostgreSQL halts the process for recovery from the checkpoint.
+
+Live egress still links cluster orders, accepts them and drives FOK/IOC cancels, but
+never changes fill quantity or ends an order. Admission stays closed until the
+consumer has applied the projector's committed position and has observed it within
+three seconds. A dormant stop is cancelled locally since it never reached the engine.
+Amend is refused in this mode: its incremental hold is released by amount, which a
+replay after a crash could repeat.
+
