@@ -51,8 +51,8 @@
         <cluster-kit.version>0.1.7</cluster-kit.version>
 
         <!-- Aeron (must match match-engine version) -->
+        <agrona.version>2.6.0</agrona.version>
         <aeron.version>1.53.1</aeron.version>
-        <agrona.version>2.5.0</agrona.version>
         <sbe.version>1.40.1</sbe.version>
 
         <!-- LMAX Disruptor -->
