@@ -8,7 +8,8 @@
   "agrona_sha256": "f6cb921f21e4fbcfa7a1e0654ac622ca168b8bf10ca89989cb6c0925bc8024c4",
   "postgresql_client_api": "16",
   "cpp_standard": 20,
-  "journal_schema_sha256": "7b2361ac727db3bd53f6db2a3343dbfee8adb44ba57a84e2198d1e47bd3bc848",
-  "cmake_minimum_version": "3.30",
-  "order_schema_sha256": "a28e43ed2cabac23b8a6954fba045e7b11ac0b3f866835c9d0c3cac5c49c6a50"
+  "me_journal_schema_sha256": "a7c58d87e4f1cfaa642014e4c92f46492c5fe20d36bd6b1d127dd7fa05a3541a",
+  "fixture_source_commit": "PENDING-match-rc2-s1",
+  "fixture_sha256sums_sha256": "e87a810d0ae27db504838f88d8dbf999e10095c981730c7ba84988bb841d01ae",
+  "cmake_minimum_version": "3.30"
 }

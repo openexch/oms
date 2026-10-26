@@ -106,7 +106,7 @@ void Store::apply(std::span<const Event> batch) {
             }
             query("INSERT INTO execution_journal_events(source_identity,position,template_id,payload) "
                   "VALUES($1,$2,$3,decode($4,'hex'))", {source_, n(event.position), n(j.type), payload});
-            if (j.type == 1) {
+            if (j.type == RECORD_TRADE) {
                 if (j.trade > nextTrade && j.trade - nextTrade != 1) throw std::runtime_error("Trade gap; checkpoint not advanced");
                 if (j.trade <= nextTrade) {
                     auto old = query("SELECT 1 FROM execution_journal_trades WHERE trade_id=$1 AND payload=decode($2,'hex')",
@@ -116,11 +116,13 @@ void Store::apply(std::span<const Event> batch) {
                     query("INSERT INTO execution_journal_trades(trade_id,payload) VALUES($1,decode($2,'hex'))", {n(j.trade), payload});
                     leg(j, false); leg(j, true); nextTrade = j.trade;
                 }
-            } else if (j.type == 28) {
-                // CONFLICT/CAPACITY are observations, not a new canonical outcome for the id.
-                // Preserve their complete raw event without overwriting the original result.
-                if (j.result != 2 && j.result != 3) {
-                    auto canonical = hex(std::span(event.bytes).subspan(16)); // omit header + delivery seq
+            } else if (j.type == RECORD_OUTCOME) {
+                // CONFLICT/CAPACITY/RELEASED/INVALID are observations, not a new canonical outcome
+                // for the id. Preserve their complete raw event without overwriting the original result.
+                if (j.result != 2 && j.result != 3 && j.result != 7 && j.result != 8) {
+                    // Omit header, delivery head, intent echo and ledger sample (journal.hpp).
+                    auto canonical = hex(std::span(event.bytes).subspan(OUTCOME_CANONICAL_BEGIN,
+                            OUTCOME_CANONICAL_END - OUTCOME_CANONICAL_BEGIN));
                     auto saved = query("INSERT INTO me_command_outcomes(command_id_high,command_id_low,user_id,oms_order_id,"
                         "market_id,command_kind,old_order_id,order_id,old_cancelled,status,reason,result,applied_position,"
                         "event_time_ms,source_identity,first_position,canonical_payload) "
@@ -132,6 +134,8 @@ void Store::apply(std::span<const Event> batch) {
                          n(j.timestamp),source_,n(event.position),canonical});
                     if (PQntuples(saved.get())!=1) throw std::runtime_error("Conflicting durable command outcome");
                 }
+            } else if (j.type == RECORD_RELEASE || j.type == RECORD_CONFIG) {
+                // Decoded and validated; kept only as the raw event above. No projection row in S1.
             } else {
                 // Preserve authoritative per-ME-leg terminals. An iceberg slice terminal
                 // cannot terminalize its OMS parent or authorize a financial release here.

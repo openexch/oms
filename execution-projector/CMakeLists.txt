@@ -13,17 +13,14 @@ set(OE_SBE_CLASSPATH "" CACHE STRING "Pinned sbe-tool 1.40.1 and Agrona 2.5.0 cl
 if(NOT EXISTS "${OE_AERON_SOURCE_DIR}/version.txt" OR OE_SBE_CLASSPATH STREQUAL "")
     message(FATAL_ERROR "OE_AERON_SOURCE_DIR and OE_SBE_CLASSPATH are required; see dependencies.lock")
 endif()
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/dependencies.lock" dependency_lock)
-string(JSON expected_schema_hash GET "${dependency_lock}" journal_schema_sha256)
-file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/schema/settlement-journal-schema.xml" schema_hash)
-if(NOT schema_hash STREQUAL expected_schema_hash)
-    message(FATAL_ERROR "Journal schema differs from dependencies.lock")
-endif()
-string(JSON expected_order_schema_hash GET "${dependency_lock}" order_schema_sha256)
-file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/schema/order-schema.xml" order_schema_hash)
-if(NOT order_schema_hash STREQUAL expected_order_schema_hash)
-    message(FATAL_ERROR "Order schema differs from dependencies.lock")
-endif()
+set(OE_PROJECTOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify-inputs.cmake")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/dependencies.lock"
+    "${CMAKE_CURRENT_SOURCE_DIR}/schema/me-journal-schema.xml" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/SHA256SUMS"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-trade.bin" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-terminal.bin"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-command.first.bin"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-command.retry.bin"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-release.bin" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-config.bin")
 file(STRINGS "${OE_AERON_SOURCE_DIR}/version.txt" aeron_version LIMIT_COUNT 1)
 if(NOT aeron_version STREQUAL "1.53.1")
     message(FATAL_ERROR "Unsupported Aeron version: ${aeron_version}")
@@ -66,29 +63,19 @@ target_compile_definitions(oe_archive_client PRIVATE
     AERON_VERSION_TXT="1.53.1" AERON_VERSION_MAJOR=1 AERON_VERSION_MINOR=53
     AERON_VERSION_PATCH=1 AERON_VERSION_GITSHA="release-1.53.1")
 
-add_custom_command(OUTPUT "${generated}/journal-codecs.stamp"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${generated}/journal"
+add_custom_command(OUTPUT "${generated}/mejournal-codecs.stamp"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${generated}/mejournal"
     COMMAND ${Java_JAVA_EXECUTABLE} --add-opens java.base/jdk.internal.misc=ALL-UNNAMED
-        -Dsbe.target.language=Cpp -Dsbe.target.namespace=oe.journal
-        "-Dsbe.output.dir=${generated}/journal" -Dsbe.validation.stop.on.error=true
+        -Dsbe.target.language=Cpp -Dsbe.target.namespace=oe.mejournal
+        "-Dsbe.output.dir=${generated}/mejournal" -Dsbe.validation.stop.on.error=true
         -cp "${OE_SBE_CLASSPATH}" uk.co.real_logic.sbe.SbeTool
-        "${CMAKE_CURRENT_SOURCE_DIR}/schema/settlement-journal-schema.xml"
-    COMMAND ${CMAKE_COMMAND} -E touch "${generated}/journal-codecs.stamp"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema/settlement-journal-schema.xml" VERBATIM)
-add_custom_target(oe_journal_codecs DEPENDS "${generated}/journal-codecs.stamp")
-add_custom_command(OUTPUT "${generated}/command-codecs.stamp"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${generated}/command"
-    COMMAND ${Java_JAVA_EXECUTABLE} --add-opens java.base/jdk.internal.misc=ALL-UNNAMED
-        -Dsbe.target.language=Cpp -Dsbe.target.namespace=oe.command
-        "-Dsbe.output.dir=${generated}/command" -Dsbe.validation.stop.on.error=true
-        -cp "${OE_SBE_CLASSPATH}" uk.co.real_logic.sbe.SbeTool
-        "${CMAKE_CURRENT_SOURCE_DIR}/schema/order-schema.xml"
-    COMMAND ${CMAKE_COMMAND} -E touch "${generated}/command-codecs.stamp"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema/order-schema.xml" VERBATIM)
-add_custom_target(oe_command_codecs DEPENDS "${generated}/command-codecs.stamp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/schema/me-journal-schema.xml"
+    COMMAND ${CMAKE_COMMAND} -E touch "${generated}/mejournal-codecs.stamp"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/schema/me-journal-schema.xml" VERBATIM)
+add_custom_target(oe_mejournal_codecs DEPENDS "${generated}/mejournal-codecs.stamp")
 add_library(oe_projection STATIC src/journal.cpp src/store.cpp)
-add_dependencies(oe_projection oe_journal_codecs oe_command_codecs)
-target_include_directories(oe_projection PUBLIC src PRIVATE "${generated}/journal" "${generated}/command")
+add_dependencies(oe_projection oe_mejournal_codecs)
+target_include_directories(oe_projection PUBLIC src PRIVATE "${generated}/mejournal")
 target_link_libraries(oe_projection PUBLIC PostgreSQL::PostgreSQL)
 target_compile_options(oe_projection PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(execution-projector src/main.cpp src/monitor.cpp)
@@ -99,9 +86,15 @@ enable_testing()
 
 add_executable(projector-store-test tests/store_test.cpp)
 target_link_libraries(projector-store-test PRIVATE oe_projection)
-target_compile_definitions(projector-store-test PRIVATE OE_COMMAND_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" OE_WRITER_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/../oms-persistence/src/main/resources/db/migration/V007__execution_writer_ownership.sql" OE_PROJECTOR_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/schema/projector.sql")
+target_compile_definitions(projector-store-test PRIVATE OE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" OE_WRITER_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/../oms-persistence/src/main/resources/db/migration/V007__execution_writer_ownership.sql" OE_PROJECTOR_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/schema/projector.sql")
 add_test(NAME projector-store COMMAND projector-store-test)
 set_tests_properties(projector-store PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+# Configure guard: the real inputs pass; a drifted schema hash or fixture is refused.
+add_test(NAME projector-configure-guard COMMAND ${CMAKE_COMMAND}
+    -DOE_PROJECTOR_DIR=${CMAKE_CURRENT_SOURCE_DIR} -DOE_WORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/configure-guard
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/configure_guard_test.cmake)
+set_tests_properties(projector-configure-guard PROPERTIES TIMEOUT 60)
 
 add_executable(projector-monitor-test tests/monitor_test.cpp src/monitor.cpp)
 target_include_directories(projector-monitor-test PRIVATE src)
