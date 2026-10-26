@@ -7,6 +7,8 @@ namespace oe {
 std::int64_t monotonicMs();
 struct Status {
     std::atomic<std::int64_t> committed{0}, target{0}, pollMs{0}, databaseMs{0}, queued{0};
+    // RC2 S3: duplicate journalSeqs skipped after a --rebase-source (projector_duplicate_seq_total).
+    std::atomic<std::int64_t> duplicateSeqs{0};
     std::atomic<bool> failed{false}, streamConnected{false};
     bool ready() const;
 };

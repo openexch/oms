@@ -44,6 +44,7 @@ void writeLoop(Queue& q, oe::Store& store) {
             if (batch.empty()) store.probe(); else store.apply(batch);
             store.observe(std::max(q.target.load(), store.position()));
             q.committed.store(store.position());
+            q.duplicateSeqs.store(store.duplicateSeqs());
             q.queued.fetch_sub(static_cast<std::int64_t>(batch.size()));
             q.databaseMs.store(oe::monotonicMs());
         }
@@ -55,6 +56,20 @@ void writeLoop(Queue& q, oe::Store& store) {
 
 int main(int argc, char** argv) {
     try {
+        // RC2 S3 (contract 10.5): --rebase-source <source_identity> <recording_descriptor> points the
+        // checkpoint at another recording (another member's journal, or this member's new recording
+        // after an ME restart): source and descriptor replaced, position reset to 0, last_journal_seq,
+        // me_epoch and last_trade_id kept. The next run reads the new recording from its start and
+        // skips every journalSeq already projected. Refused while a worker holds the checkpoint.
+        if (argc >= 2 && std::string(argv[1]) == "--rebase-source") {
+            if (argc != 4 || !*argv[2] || !*argv[3])
+                throw std::runtime_error("Usage: --rebase-source <source_identity> <recording_descriptor>");
+            const char* conninfo = std::getenv("OE_PROJECTOR_PG");
+            if (!conninfo || !*conninfo) throw std::runtime_error("OE_PROJECTOR_PG is required (prefer a libpq service)");
+            oe::Store::rebase(conninfo, argv[2], argv[3]);
+            std::cout << "rebased source=" << argv[2] << " position=0 (journalSeq, epoch and trade cursors kept)\n";
+            return 0;
+        }
         std::map<std::string,std::string> args;
         for (int i = 1; i < argc; i += 2) {
             if (i + 1 >= argc || !args.emplace(argv[i], argv[i + 1]).second)

@@ -16,9 +16,12 @@ or schema 1 (template 28) frame is refused loudly: the worker exits non-zero wit
 this binary decodes schemaId 4 version 1`. It never skips such a frame.
 
 The source identity and recording descriptor are pinned. A different node's
-position is never substituted for the current checkpoint. Recording rotation,
-source failover, and retention registration require a separate verified
-handoff; this executable stops if that recovery is needed.
+position is never substituted for the current checkpoint. Since RC2 S3 the
+checkpoint also carries the ME producer cursor (`last_journal_seq`, `me_epoch`),
+so a source change is an explicit `--rebase-source` (below) rather than a
+position substitution. Automatic source failover and retention registration
+still require a separate verified handoff; this executable stops if that
+recovery is needed.
 
 ## Build
 
@@ -133,8 +136,10 @@ in `dependencies.lock` and checked at configure (`cmake/verify-inputs.cmake`).
 The reader gate is exact: schemaId 4, version 1, records 1-5 (Trade, Terminal,
 CommandOutcome, CommandRelease, EngineConfig), each with its fixed block length
 and frame length, and every record arrives as one unfragmented frame of at most
-1112 bytes (CommandRelease with 48 entries). In S1 `journalSeq` and `meEpoch`
-are accepted when `>= 0`; S3 tightens `journalSeq` to dense `>= 1`.
+1112 bytes (CommandRelease with 48 entries). Since RC2 S3 every record must
+carry `journalSeq >= 1` and `meEpoch >= 1` (`Invalid journal sequence/epoch`
+otherwise): a behaviour-1 or pre-S3 ME journal is refused.
+
 
 CommandRelease and EngineConfig records are decoded, validated, kept as raw
 events and advance the checkpoint; they project no row in S1.
@@ -158,11 +163,59 @@ the pending send. This repository/transport support is not wired into production
 order admission yet: hold/workflow recovery, journal-driven lifecycle and risk
 application, and the writer-cutover freshness barrier remain prerequisites.
 
-The six binary fixtures in `tests/fixtures` (one frame per record, plus a
-lost-ack retry of the command outcome) are produced by match's test-scope
-`MeJournalFixtureDump` from the real `SettlementJournal` encoder. `SHA256SUMS`
+The six binary fixtures in `tests/fixtures` are one identity-bound behaviour-2
+producer sequence (RC2 S3): `java-config.bin` FRESH at journalSeq 1,
+`java-trade.bin` 2, `java-terminal.bin` 3, `java-command.first.bin` 4,
+`java-command.conflict.bin` 5 (a CONFLICT of the same command id; a behaviour-2
+ME never re-journals an equal duplicate, so the retry fixture is gone) and
+`java-release.bin` 6, all at meEpoch `0x123456789ABCDEF1`. They are produced by
+match's test-scope `MeJournalFixtureDump` from the real `SettlementJournal`
+encoder. `SHA256SUMS`
 lists them, its own hash is pinned as `fixture_sha256sums_sha256`, and
 `fixture_source_commit` names the match commit that commits them. The store test
 verifies decoding, the schema gate, atomic failure, dedupe, payload conflict, and
 absence of financial side effects; `projector-configure-guard` proves that a
 drifted schema or fixture fails configure.
+
+## Producer cursor (RC2 S3)
+
+The ME journal of a behaviour-2 ME is one dense sequence: `journalSeq` 1 is the
+EngineConfig FRESH record, every later record is the previous one plus one, and
+every record carries the same `meEpoch` (the genesis id). The checkpoint row
+stores `last_journal_seq` and `me_epoch` and advances them in the same
+transaction as `position`. Entries at or below the position cursor keep the
+byte-equality dedupe. Past it, first matching rule wins:
+
+- no cursor yet (`last_journal_seq = 0`): the entry must be EngineConfig FRESH at
+  `journalSeq` 1; it binds `me_epoch`;
+- another `meEpoch`: `Journal epoch mismatch; checkpoint not advanced`;
+- `journalSeq <= last_journal_seq`: after a rebase and up to the
+  `last_journal_seq` the rebase kept (`rebase_ceiling`), an already projected
+  record: a trade must be byte-identical to the projected one (`Conflicting
+  repeated trade` otherwise), anything else is skipped with no row and counted
+  as `projector_duplicate_seq_total`; on one recording it is `Journal sequence
+  regression; checkpoint not advanced`;
+- `last_journal_seq + 1`: applied;
+- anything else: `Journal sequence gap; checkpoint not advanced`.
+
+### Rebase runbook
+
+Every ME restart opens a new journal recording, and a member killed right after
+a snapshot can miss a contiguous seq range that the other members have. In both
+cases the worker halts (`Replay stalled or recording stopped`, or a gap after a
+re-point). The remedy is a rebase onto a recording that holds the next seq:
+
+1. Stop the worker (the rebase is refused while a worker holds the checkpoint).
+2. Pick the recording: the restarted member's new recording, or another member
+   whose journal has the range. Start the worker once against it with any new
+   `--source` value; it refuses with `Source/recording fence mismatch` and prints
+   that recording's `descriptor`.
+3. `OE_PROJECTOR_PG=... execution-projector --rebase-source <source_identity> <recording_descriptor>`
+   with a source identity never used before (one per member and recording, for
+   example `node1-rec7`). It replaces source and descriptor, resets `position`
+   to 0 and keeps `last_journal_seq`, `me_epoch` and `last_trade_id`.
+4. Start the worker with that `--source` and `--recording`. It replays the new
+   recording from its start, skips every seq already projected, and applies the
+   first new one. A gap means the chosen recording does not hold the next seq:
+   choose another member. When no member holds it (two members lost the same
+   range), recovery is a dual genesis.

@@ -64,24 +64,20 @@ string(JSON lock SET "${lock}" fixture_source_commit "\"main\"")
 file(WRITE "${dir}/dependencies.lock" "${lock}")
 expect_refusal(configureRefusesNonShaFixtureSource "${dir}" "fixture_source_commit is not a match commit sha")
 
-# The PENDING placeholder is tolerated only while the lock itself still carries it. Once the lock
-# names the signed match commit, the placeholder branch in verify-inputs.cmake must be deleted;
-# this case then requires configure to refuse PENDING.
+# The lock names the signed match commit (RC2 S3 fec9a0e): every placeholder, old or new, fails
+# configure, and so does a lock whose pin is not a sha.
 file(READ "${OE_PROJECTOR_DIR}/dependencies.lock" lock)
 string(JSON pinned GET "${lock}" fixture_source_commit)
-fresh_copy(pending dir)
-file(READ "${dir}/dependencies.lock" lock)
-string(JSON lock SET "${lock}" fixture_source_commit "\"PENDING-match-rc2-s1\"")
-file(WRITE "${dir}/dependencies.lock" "${lock}")
-if(pinned STREQUAL "PENDING-match-rc2-s1")
-    run_verify("${dir}" code out)
-    if(NOT code EQUAL 0 OR NOT out MATCHES "fixture_source_commit is the placeholder PENDING-match-rc2-s1")
-        message(FATAL_ERROR "configureRefusesPendingFixtureSource: placeholder not reported: ${out}")
-    endif()
-    message(STATUS "PENDING configureRefusesPendingFixtureSource (lock still carries the placeholder)")
-else()
-    expect_refusal(configureRefusesPendingFixtureSource "${dir}" "fixture_source_commit is not a match commit sha")
+if(NOT pinned MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "configureRefusesPendingFixtureSource: the real lock is not pinned to a sha: ${pinned}")
 endif()
+foreach(placeholder PENDING-match-rc2-s3 PENDING-match-rc2-s1)
+    fresh_copy(pending dir)
+    file(READ "${dir}/dependencies.lock" lock)
+    string(JSON lock SET "${lock}" fixture_source_commit "\"${placeholder}\"")
+    file(WRITE "${dir}/dependencies.lock" "${lock}")
+    expect_refusal(configureRefusesPendingFixtureSource "${dir}" "fixture_source_commit is not a match commit sha")
+endforeach()
 
 file(REMOVE_RECURSE "${OE_WORK_DIR}")
 message(STATUS "PASS configure guard")

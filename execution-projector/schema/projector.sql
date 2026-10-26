@@ -15,6 +15,14 @@ CREATE TABLE IF NOT EXISTS execution_projector_checkpoint (
 -- stamped with database time so readers compare against NOW() without trusting any host clock.
 ALTER TABLE execution_projector_checkpoint ADD COLUMN IF NOT EXISTS observed_target BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE execution_projector_checkpoint ADD COLUMN IF NOT EXISTS observed_at TIMESTAMPTZ;
+-- RC2 S3: the producer cursor. last_journal_seq is the last applied ME journalSeq (dense from the
+-- FRESH record at 1), me_epoch the ME epoch it belongs to; both advance in the same transaction as
+-- position. rebase_ceiling is the last_journal_seq at the latest --rebase-source: past the position
+-- cursor, a journalSeq at or below it is a duplicate of an already projected record (skipped), any
+-- other journalSeq at or below last_journal_seq is a regression. It is cleared by the first new seq.
+ALTER TABLE execution_projector_checkpoint ADD COLUMN IF NOT EXISTS last_journal_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE execution_projector_checkpoint ADD COLUMN IF NOT EXISTS me_epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE execution_projector_checkpoint ADD COLUMN IF NOT EXISTS rebase_ceiling BIGINT NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS execution_journal_events (
     source_identity TEXT NOT NULL,
     position BIGINT NOT NULL,

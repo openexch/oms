@@ -3,11 +3,12 @@
 #include <utility>
 
 namespace oe {
-namespace { std::string n(std::int64_t v) { return std::to_string(v); } }
-Result Store::query(const char* sql, const std::vector<std::string>& values) {
+namespace {
+std::string n(std::int64_t v) { return std::to_string(v); }
+Result exec(PGconn* db, const char* sql, const std::vector<std::string>& values) {
     std::vector<const char*> args; args.reserve(values.size());
     for (const auto& s : values) args.push_back(s.c_str());
-    Result r(PQexecParams(db_, sql, static_cast<int>(args.size()), nullptr, args.data(), nullptr, nullptr, 0));
+    Result r(PQexecParams(db, sql, static_cast<int>(args.size()), nullptr, args.data(), nullptr, nullptr, 0));
     if (!r || (PQresultStatus(r.get()) != PGRES_COMMAND_OK && PQresultStatus(r.get()) != PGRES_TUPLES_OK)) {
         // Do not print connection strings or row values. SQLSTATE suffices for diagnosis.
         const char* state = r ? PQresultErrorField(r.get(), PG_DIAG_SQLSTATE) : nullptr;
@@ -15,34 +16,82 @@ Result Store::query(const char* sql, const std::vector<std::string>& values) {
     }
     return r;
 }
-Store::Store(const std::string& conninfo, std::string source, std::string descriptor) : source_(std::move(source)) {
-    if (source_.empty() || descriptor.empty()) throw std::runtime_error("Source identity and descriptor required");
+// The archive writer's connection: bounded timeouts, the advisory lock that excludes a second
+// worker (and a rebase while a worker runs), and the archive ownership epoch pinned in the session.
+PGconn* openWriter(const std::string& conninfo, std::int64_t& epoch) {
     const char* keys[] = {"dbname", "connect_timeout", "tcp_user_timeout", "keepalives_idle", "keepalives_interval", "keepalives_count", nullptr};
     const char* values[] = {conninfo.c_str(), "5", "5000", "5", "1", "3", nullptr};
-    db_ = PQconnectdbParams(keys, values, 1);
+    PGconn* db = PQconnectdbParams(keys, values, 1);
     try {
-        if (!db_ || PQstatus(db_) != CONNECTION_OK) throw std::runtime_error("Projection database unavailable");
-        query("SET statement_timeout='5s'"); query("SET lock_timeout='2s'");
-        auto lock = query("SELECT pg_try_advisory_lock(1751474543, 1702390115)");
+        if (!db || PQstatus(db) != CONNECTION_OK) throw std::runtime_error("Projection database unavailable");
+        exec(db, "SET statement_timeout='5s'", {}); exec(db, "SET lock_timeout='2s'", {});
+        auto lock = exec(db, "SELECT pg_try_advisory_lock(1751474543, 1702390115)", {});
         if (std::string(PQgetvalue(lock.get(), 0, 0)) != "t") throw std::runtime_error("Execution writer already active");
-        auto owner = query("SELECT epoch FROM execution_writer_ownership WHERE consumer='executions' AND owner='archive'");
+        auto owner = exec(db, "SELECT epoch FROM execution_writer_ownership WHERE consumer='executions' AND owner='archive'", {});
         if (PQntuples(owner.get()) != 1) throw std::runtime_error("Execution writer ownership is not archive");
-        writerEpoch_ = std::stoll(PQgetvalue(owner.get(), 0, 0));
-        query("SELECT set_config('oe.execution_writer','archive',false), "
-              "set_config('oe.execution_writer_epoch',$1,false)", {n(writerEpoch_)});
+        epoch = std::stoll(PQgetvalue(owner.get(), 0, 0));
+        exec(db, "SELECT set_config('oe.execution_writer','archive',false), "
+                 "set_config('oe.execution_writer_epoch',$1,false)", {n(epoch)});
+    } catch (...) { PQfinish(db); throw; }
+    return db;
+}
+}
+Result Store::query(const char* sql, const std::vector<std::string>& values) { return exec(db_, sql, values); }
+Store::Store(const std::string& conninfo, std::string source, std::string descriptor) : source_(std::move(source)) {
+    if (source_.empty() || descriptor.empty()) throw std::runtime_error("Source identity and descriptor required");
+    db_ = openWriter(conninfo, writerEpoch_);
+    try {
         // Constructor checkpoint creation also needs the ownership row lock.
         query("BEGIN"); checkOwnership(true);
         query("INSERT INTO execution_projector_checkpoint(consumer,source_identity,recording_descriptor,position) "
               "VALUES ('executions',$1,$2,0) ON CONFLICT(consumer) DO NOTHING", {source_, descriptor});
-        auto r = query("SELECT source_identity,recording_descriptor,position,last_trade_id "
-                       "FROM execution_projector_checkpoint WHERE consumer='executions'");
+        auto r = query("SELECT source_identity,recording_descriptor,position,last_trade_id,last_journal_seq,me_epoch,"
+                       "rebase_ceiling FROM execution_projector_checkpoint WHERE consumer='executions'");
         if (PQntuples(r.get()) != 1 || source_ != PQgetvalue(r.get(), 0, 0) || descriptor != PQgetvalue(r.get(), 0, 1))
-            throw std::runtime_error("Source/recording fence mismatch; explicit recovery required");
+            // The descriptor is the archive's recording identity (ids and channel), never a secret:
+            // the operator needs it for --rebase-source.
+            throw std::runtime_error("Source/recording fence mismatch; explicit recovery required (this run: source="
+                    + source_ + " descriptor=" + descriptor + "; see --rebase-source)");
         position_ = std::stoll(PQgetvalue(r.get(), 0, 2)); trade_ = std::stoll(PQgetvalue(r.get(), 0, 3));
+        seq_ = std::stoll(PQgetvalue(r.get(), 0, 4)); epoch_ = std::stoll(PQgetvalue(r.get(), 0, 5));
+        ceiling_ = std::stoll(PQgetvalue(r.get(), 0, 6));
         query("COMMIT");
     } catch (...) { PQfinish(db_); db_ = nullptr; throw; }
 }
 Store::~Store() { if (db_) PQfinish(db_); }
+
+void Store::rebase(const std::string& conninfo, const std::string& source, const std::string& descriptor) {
+    if (source.empty() || descriptor.empty()) throw std::runtime_error("Source identity and descriptor required");
+    std::int64_t epoch{};
+    // openWriter takes the worker's advisory lock: a running worker makes the rebase fail here.
+    PGconn* db = openWriter(conninfo, epoch);
+    try {
+        exec(db, "BEGIN", {});
+        auto owner = exec(db, "SELECT epoch FROM execution_writer_ownership WHERE consumer='executions' "
+                              "AND owner='archive' AND epoch=$1 FOR SHARE", {n(epoch)});
+        if (PQntuples(owner.get()) != 1) throw std::runtime_error("Execution writer owner/epoch changed; recovery required");
+        auto r = exec(db, "SELECT source_identity,last_journal_seq FROM execution_projector_checkpoint "
+                          "WHERE consumer='executions' FOR UPDATE", {});
+        if (PQntuples(r.get()) != 1) throw std::runtime_error("Rebase refused: no checkpoint to rebase");
+        const std::int64_t last = std::stoll(PQgetvalue(r.get(), 0, 1));
+        if (last < 1) throw std::runtime_error("Rebase refused: the checkpoint has no journalSeq cursor yet");
+        // execution_journal_events is keyed by (source_identity, position) and the new recording's
+        // positions restart at 0: the new source identity must be one never projected before.
+        auto used = exec(db, "SELECT 1 FROM execution_journal_events WHERE source_identity=$1 LIMIT 1", {source});
+        if (source == PQgetvalue(r.get(), 0, 0) || PQntuples(used.get()) != 0)
+            throw std::runtime_error("Rebase refused: source identity " + source + " already has journal rows");
+        exec(db, "UPDATE execution_projector_checkpoint SET source_identity=$1,recording_descriptor=$2,position=0,"
+                 "rebase_ceiling=last_journal_seq,observed_target=0,updated_at=NOW() WHERE consumer='executions'",
+             {source, descriptor});
+        exec(db, "COMMIT", {});
+    } catch (...) {
+        auto error = std::current_exception();
+        try { exec(db, "ROLLBACK", {}); } catch (...) {}
+        PQfinish(db);
+        std::rethrow_exception(error);
+    }
+    PQfinish(db);
+}
 
 void Store::checkOwnership(bool lock) {
     auto owner = query(lock
@@ -89,7 +138,8 @@ void Store::apply(std::span<const Event> batch) {
     if (batch.empty()) return;
     if (batch.size() > 256) throw std::runtime_error("Projection batch exceeds bound");
     query("BEGIN");
-    auto nextPosition = position_, nextTrade = trade_;
+    auto nextPosition = position_, nextTrade = trade_, nextSeq = seq_, nextEpoch = epoch_, nextCeiling = ceiling_;
+    auto duplicates = duplicates_;
     try {
         checkOwnership(true);
         auto fence = query("SELECT position FROM execution_projector_checkpoint WHERE consumer='executions' FOR UPDATE");
@@ -104,6 +154,30 @@ void Store::apply(std::span<const Event> batch) {
                 if (PQntuples(old.get()) != 1) throw std::runtime_error("Replay payload/position conflict");
                 continue;
             }
+            // RC2 S3 (contract 10.4): past the position cursor the producer cursor decides; first
+            // matching rule wins. Every refusal leaves the whole batch and its checkpoint unwritten.
+            if (nextSeq == 0) {
+                if (j.journalSeq != 1 || j.type != RECORD_CONFIG || j.decision != 0 /* FRESH */)
+                    throw std::runtime_error("First journal record must be EngineConfig FRESH at journalSeq 1; "
+                                             "checkpoint not advanced");
+                nextEpoch = j.meEpoch;
+            } else if (j.meEpoch != nextEpoch) {
+                throw std::runtime_error("Journal epoch mismatch; checkpoint not advanced");
+            } else if (j.journalSeq <= nextSeq) {
+                // Only a rebased source replays seqs already projected; on one producer recording a
+                // seq at or below the cursor at a new position cannot occur.
+                if (j.journalSeq > nextCeiling) throw std::runtime_error("Journal sequence regression; checkpoint not advanced");
+                if (j.type == RECORD_TRADE) {
+                    auto old = query("SELECT 1 FROM execution_journal_trades WHERE trade_id=$1 AND payload=decode($2,'hex')",
+                                     {n(j.trade), payload});
+                    if (PQntuples(old.get()) != 1) throw std::runtime_error("Conflicting repeated trade");
+                }
+                ++duplicates; nextPosition = event.position;
+                continue; // already projected: no raw event, no projection row
+            } else if (j.journalSeq != nextSeq + 1) {
+                throw std::runtime_error("Journal sequence gap; checkpoint not advanced");
+            }
+            nextSeq = j.journalSeq; nextCeiling = 0;
             query("INSERT INTO execution_journal_events(source_identity,position,template_id,payload) "
                   "VALUES($1,$2,$3,decode($4,'hex'))", {source_, n(event.position), n(j.type), payload});
             if (j.type == RECORD_TRADE) {
@@ -146,10 +220,12 @@ void Store::apply(std::span<const Event> batch) {
             }
             nextPosition = event.position;
         }
-        query("UPDATE execution_projector_checkpoint SET position=$1,last_trade_id=$2,updated_at=NOW() "
-              "WHERE consumer='executions'", {n(nextPosition), n(nextTrade)});
+        query("UPDATE execution_projector_checkpoint SET position=$1,last_trade_id=$2,last_journal_seq=$3,me_epoch=$4,"
+              "rebase_ceiling=$5,updated_at=NOW() WHERE consumer='executions'",
+              {n(nextPosition), n(nextTrade), n(nextSeq), n(nextEpoch), n(nextCeiling)});
         query("COMMIT");
-        position_ = nextPosition; trade_ = nextTrade;
+        position_ = nextPosition; trade_ = nextTrade; seq_ = nextSeq; epoch_ = nextEpoch; ceiling_ = nextCeiling;
+        duplicates_ = duplicates;
     } catch (...) {
         // Unknown COMMIT outcome terminates this worker. On restart PostgreSQL's
         // committed cursor is authoritative; never re-use speculative in-memory state.

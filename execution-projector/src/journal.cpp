@@ -141,8 +141,11 @@ Journal decode(std::span<const std::uint8_t> b) {
         break;
     }
     }
-    // S1: journalSeq and meEpoch are placeholders (0) until S3/S2 mint them; S3 tightens to dense >= 1.
-    if (j.journalSeq < 0 || j.meEpoch < 0 || j.egressSeq < 0 || j.timestamp < 0)
+    // RC2 S3 (contract 10.1): every record of a behaviour-2 ME carries journalSeq >= 1 and
+    // meEpoch >= 1 (the bound genesis); 0 is a behaviour-1 or pre-S3 producer, refused loudly.
+    // Density and the single epoch are cursor rules (store.cpp), not frame rules.
+    if (j.journalSeq < 1 || j.meEpoch < 1) fail("Invalid journal sequence/epoch");
+    if (j.egressSeq < 0 || j.timestamp < 0)
         fail("Invalid journal identity");
     return j;
 }

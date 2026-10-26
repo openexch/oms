@@ -9,7 +9,7 @@
   "postgresql_client_api": "16",
   "cpp_standard": 20,
   "me_journal_schema_sha256": "a7c58d87e4f1cfaa642014e4c92f46492c5fe20d36bd6b1d127dd7fa05a3541a",
-  "fixture_source_commit": "PENDING-match-rc2-s1",
-  "fixture_sha256sums_sha256": "e87a810d0ae27db504838f88d8dbf999e10095c981730c7ba84988bb841d01ae",
+  "fixture_source_commit": "fec9a0e978d40743b05396b35e0cf5c6db22e831",
+  "fixture_sha256sums_sha256": "127739bfb6c0b5da5d0e8cf5b5b52706e8c58ce075d8bad33ca25e696f3da5c4",
   "cmake_minimum_version": "3.30"
 }

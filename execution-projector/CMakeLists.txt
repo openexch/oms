@@ -19,7 +19,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_
     "${CMAKE_CURRENT_SOURCE_DIR}/schema/me-journal-schema.xml" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/SHA256SUMS"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-trade.bin" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-terminal.bin"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-command.first.bin"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-command.retry.bin"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-command.conflict.bin"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-release.bin" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/java-config.bin")
 file(STRINGS "${OE_AERON_SOURCE_DIR}/version.txt" aeron_version LIMIT_COUNT 1)
 if(NOT aeron_version STREQUAL "1.53.1")

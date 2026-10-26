@@ -55,7 +55,8 @@ Monitor::Monitor(Status& state, int port) {
                     "\nexecution_projector_target " + std::to_string(target) +
                     "\nexecution_projector_lag_bytes " + std::to_string(std::max<std::int64_t>(0, target-committed)) +
                     "\nexecution_projector_queued " + std::to_string(state.queued.load()) +
-                    "\nexecution_projector_failed " + std::to_string(state.failed.load()) + "\n";
+                    "\nexecution_projector_failed " + std::to_string(state.failed.load()) +
+                    "\nprojector_duplicate_seq_total " + std::to_string(state.duplicateSeqs.load()) + "\n";
             } else { code = 404; body = "Not found\n"; }
             auto response = "HTTP/1.1 " + std::to_string(code) + (code == 200 ? " OK\r\n" : " Unavailable\r\n") +
                 "Connection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;

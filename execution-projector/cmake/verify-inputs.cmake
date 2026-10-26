@@ -18,10 +18,8 @@ endif()
 
 # The fixtures are produced by match's MeJournalFixtureDump at fixture_source_commit.
 string(JSON oe_commit GET "${oe_lock}" fixture_source_commit)
-if(oe_commit STREQUAL "PENDING-match-rc2-s1")
-    message(WARNING "fixture_source_commit is the placeholder PENDING-match-rc2-s1; "
-        "replace it with the signed match commit that commits the fixtures")
-elseif(NOT oe_commit MATCHES "^[0-9a-f]+$")
+# No placeholder is tolerated: anything but a commit sha fails configure.
+if(NOT oe_commit MATCHES "^[0-9a-f]+$")
     message(FATAL_ERROR "fixture_source_commit is not a match commit sha: ${oe_commit}")
 else()
     string(LENGTH "${oe_commit}" oe_commit_length)
@@ -49,7 +47,7 @@ foreach(oe_line IN LISTS oe_sums)
     endif()
     list(APPEND oe_names "${oe_name}")
 endforeach()
-set(oe_required java-command.first.bin java-command.retry.bin java-config.bin java-release.bin
+set(oe_required java-command.conflict.bin java-command.first.bin java-config.bin java-release.bin
     java-terminal.bin java-trade.bin)
 if(NOT oe_names STREQUAL oe_required)
     message(FATAL_ERROR "Fixture SHA256SUMS must list exactly: ${oe_required}")
