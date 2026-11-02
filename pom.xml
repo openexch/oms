@@ -65,7 +65,7 @@
         <jackson.version>2.22.3</jackson.version>
 
         <!-- Redis -->
-        <lettuce.version>7.6.0.RELEASE</lettuce.version>
+        <lettuce.version>7.9.0.RELEASE</lettuce.version>
 
         <!-- PostgreSQL -->
         <postgresql.version>42.7.13</postgresql.version>
